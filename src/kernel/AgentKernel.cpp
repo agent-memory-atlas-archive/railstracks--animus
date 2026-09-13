@@ -679,7 +679,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                             if (dueForReview.empty()) {
                                 ALOG_WARNING("scheduler", "skipping review: no observations due for layer "
                                           << layerName << " agent=" << reviewAgentId);
-                                return;
+                                return "skipped:review_nothing_due";
                             }
                         }
                     }
@@ -696,7 +696,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                     // Skip intake if there's no new data to process for any known agent
                     if (m_consolidation && !m_consolidation->HasAnyPendingIntakeData()) {
                         ALOG_WARNING("scheduler", "skipping intake: no pending data");
-                        return;
+                        return "skipped:no_pending_intake";
                     }
                     sessionSubtype = "intake";
                     std::string layerHint;
@@ -795,7 +795,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                     if (m_sessionReportStore &&
                         !m_sessionReportStore->HasSessionsNeedingReport(agentId)) {
                         ALOG_DEBUG("scheduler", "skipping session_report: no sessions need updating");
-                        return;
+                        return "skipped:no_sessions_needing_report";
                     }
                     sessionSubtype = "session_report";
 
@@ -814,7 +814,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                 } else {
                     // Unknown consolidation message — skip
                     ALOG_DEBUG("scheduler", "unknown consolidation message: " << message);
-                    return;
+                    return "skipped:unknown_message";
                 }
 
                 // Create a consolidation session for intake or review
@@ -907,7 +907,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                             });
                     }
                 }
-                return;
+                return "dispatched:consolidation";
             }
 
             // Gallivanting sessions get a fresh session each trigger so
@@ -933,7 +933,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
 
             SessionKey key{ connector, "" };
             auto session = m_sessionManager->GetOrCreate(key);
-            if (!session) return;
+            if (!session) return "error:session_create_failed";
 
             if (session->AgentId().empty()) {
                 session->SetAgentId(agentId);
@@ -1072,6 +1072,8 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                         }
                     }
                 });
+
+            return "dispatched:event";
         });
         m_tools.Register(std::make_unique<ScheduleTool>(m_scheduler));
 
