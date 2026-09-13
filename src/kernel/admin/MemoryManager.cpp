@@ -1284,7 +1284,11 @@ MemoryManager::OperationResult MemoryManager::SqlPutLayerPerspective(
     p.current_valence = (*body).get("current_valence", "").asString();
     p.future_perspective = (*body).get("future_perspective", "").asString();
     p.future_valence = (*body).get("future_valence", "").asString();
-    store->SetPerspective(p);
+    if (!store->SetPerspective(p)) {
+        out.httpStatusCode = 500;
+        out.body = Json::Value("perspective write not confirmed");
+        return out;
+    }
     out.httpStatusCode = 200;
     out.body = Json::Value("ok");
     return out;

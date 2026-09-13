@@ -146,7 +146,12 @@ public:
 
     // ---- Perspectives ----
     std::optional<LayerPerspective> GetPerspective(int64_t layer_id);
-    LayerPerspective SetPerspective(const LayerPerspective& p);
+    // Upsert all three perspective slots atomically. Returns the written
+    // state on confirmed write (RETURNING receipt), nullopt if the write was
+    // not confirmed — callers MUST propagate failure instead of assuming
+    // success (#70 finding 3: regenerated perspectives reported success while
+    // the row never changed).
+    std::optional<LayerPerspective> SetPerspective(const LayerPerspective& p);
 
     // ---- Mutations (append-only) ----
     void LogMutation(const MemoryMutation& m);

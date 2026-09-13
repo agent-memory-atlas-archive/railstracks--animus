@@ -1099,7 +1099,7 @@ std::optional<LayerPerspective> MemoryStore::GetPerspective(int64_t layer_id) {
     return result;
 }
 
-LayerPerspective MemoryStore::SetPerspective(const LayerPerspective& p) {
+std::optional<LayerPerspective> MemoryStore::SetPerspective(const LayerPerspective& p) {
     auto now = NowUnixMs();
 
     auto stmt = m_store->Prepare(
@@ -1109,7 +1109,7 @@ LayerPerspective MemoryStore::SetPerspective(const LayerPerspective& p) {
         "VALUES (?,?,?,?,?,?,?,?) "
         "ON CONFLICT(layer_id) DO UPDATE SET retrospective=?, retrospective_valence=?, "
         "current_perspective=?, current_valence=?, future_perspective=?, future_valence=?, "
-        "updated_at_unix_ms=?");
+        "updated_at_unix_ms=? RETURNING id");
     if (!stmt) return {};
 
     stmt->BindInt64(1, p.layer_id);
@@ -1129,10 +1129,14 @@ LayerPerspective MemoryStore::SetPerspective(const LayerPerspective& p) {
     stmt->BindText(14, p.future_valence);
     stmt->BindInt64(15, now);
 
-    stmt->ExecDML();
-    if (!DidWriteRows(stmt.get())) {
-        ALOG_WARNING("memory", "upsert perspective failed: " << m_store->ErrMsg());
-        return {};
+    // #76 pattern: the RETURNING row is the write receipt. Store-global row
+    // counts (DidWriteRows/Changes) race with concurrent DML on pooled
+    // connections — committed upserts reported as failures and vice versa.
+    if (!stmt->Step()) {
+        ALOG_WARNING("memory", "upsert perspective failed (no RETURNING row): "
+                  << " err=" << m_store->ErrMsg()
+                  << " layer_id=" << p.layer_id);
+        return std::nullopt;
     }
 
     // Log mutation
@@ -1144,7 +1148,9 @@ LayerPerspective MemoryStore::SetPerspective(const LayerPerspective& p) {
     m.unix_ms = now;
     LogMutation(m);
 
-    return GetPerspective(p.layer_id).value_or(LayerPerspective{});
+    LayerPerspective written = p;
+    written.updated_at_unix_ms = now;
+    return written;
 }
 
 // ============================================================================

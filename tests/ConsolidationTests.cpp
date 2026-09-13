@@ -3,6 +3,14 @@
 #include "animus_kernel/MemoryStore.h"
 #include "animus_kernel/admin/DiaryManager.h"
 #include "animus_kernel/SqliteDataStore.h"
+#include "animus_kernel/DefaultSessionRouter.h"
+#include "animus_kernel/SessionManager.h"
+#include "animus_kernel/SessionReportStore.h"
+#include "animus_kernel/SqliteSessionStore.h"
+#include "animus_kernel/AgentStore.h"
+#include "animus_kernel/OntologyStore.h"
+#include "animus_kernel/MemoryFileStore.h"
+#include "animus_kernel/tools/ConsolidationTool.h"
 
 #include <chrono>
 #include <cstdio>
@@ -541,8 +549,226 @@ int TestPipelineRunLog() {
 // Main
 // ============================================================================
 
+// ============================================================================
+// #70 finding 3: perspective writes must be receipt-verified — no
+// unconditional success when the upsert is not confirmed.
+// ============================================================================
+
+int TestPerspectiveReceiptHonesty() {
+    std::cerr << "  [#70] Perspective receipt honesty...\n";
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    MemoryStore memStore(&dataStore);
+
+    MemoryLayer layer;
+    layer.name = "day";
+    layer.agent_id = "agent1";
+    layer.horizon = "1 day";
+    layer.sort_order = 0;
+    layer.evaluation_interval_seconds = 3600;
+    layer.cron_expr = "0 * * * *";
+    layer.token_budget = 4096;
+    layer.enabled = true;
+    layer.created_at_unix_ms = 1000000;
+    layer.updated_at_unix_ms = 1000000;
+    Assert(memStore.CreateLayer(layer).id > 0, "CreateLayer should succeed");
+    auto layers = memStore.ListLayersForAgent("agent1");
+    Assert(!layers.empty(), "layer should be visible to its agent");
+
+    ontology::OntologyStore ontologyStore(&dataStore);
+    memory::MemoryFileStore fileStore(&dataStore);
+    AgentStore agentStore(&dataStore);
+    SessionReportStore reportStore(&dataStore);
+    SessionManager sessions(
+        std::make_unique<SqliteSessionStore>(&dataStore),
+        std::make_unique<DefaultSessionRouter>());
+    ConsolidationTool tool(&memStore, &ontologyStore, &sessions,
+                           &fileStore, &agentStore, &reportStore, nullptr);
+
+    // Happy path: write via the tool, verify the row actually changed.
+    {
+        ToolCall call;
+        call.id = "p70a";
+        call.arguments =
+            R"({"action":"perspective:generate","__agent_id":"agent1",)"
+            R"("__session_key":"consolidation:intake:agent1",)"
+            R"("params":{"layer":"day","pov":"current","text":"fresh current text 70a"}})";
+        auto result = tool.Execute(call);
+        Assert(result.success, "perspective:generate should succeed: " + result.error);
+        auto persp = memStore.GetPerspective(layers[0].id);
+        Assert(persp.has_value() &&
+                   persp->current_perspective.find("70a") != std::string::npos,
+               "perspective row should contain the written text");
+    }
+
+    // Failure path: make the write fail, the tool must NOT report success.
+    {
+        auto drop = dataStore.Prepare("DROP TABLE layer_perspectives");
+        Assert(drop && drop->ExecDML(), "drop layer_perspectives for failure injection");
+
+        ToolCall call;
+        call.id = "p70b";
+        call.arguments =
+            R"({"action":"perspective:generate","__agent_id":"agent1",)"
+            R"("__session_key":"consolidation:intake:agent1",)"
+            R"("params":{"layer":"day","pov":"future","text":"should never land"}})";
+        auto result = tool.Execute(call);
+        Assert(!result.success,
+               "perspective:generate must fail when the write is not confirmed");
+        Assert(result.error.find("not confirmed") != std::string::npos,
+               "failure error should name the unconfirmed write");
+    }
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
+int TestPipelinePerspectiveFailurePropagates() {
+    std::cerr << "  [#70] Pipeline perspective failure propagates...\n";
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    MemoryStore memStore(&dataStore);
+
+    MemoryLayer layer;
+    layer.name = "day";
+    layer.agent_id = "agent1";
+    layer.horizon = "1 day";
+    layer.sort_order = 0;
+    layer.evaluation_interval_seconds = 3600;
+    layer.cron_expr = "0 * * * *";
+    layer.token_budget = 4096;
+    layer.enabled = true;
+    layer.created_at_unix_ms = 1000000;
+    layer.updated_at_unix_ms = 1000000;
+    Assert(memStore.CreateLayer(layer).id > 0, "CreateLayer should succeed");
+    auto layers = memStore.ListLayersForAgent("agent1");
+    Assert(!layers.empty(), "layer should be visible to its agent");
+
+    memory::Observation obs;
+    obs.layer_id = layers[0].id;
+    obs.agent_id = "agent1";
+    obs.text = "seed observation so perspective revision is not skipped";
+    memStore.CreateObservationForAgent("agent1", obs);
+
+    auto cb = [](const std::string&, const std::string&, const std::string&) -> std::string {
+        return R"({"retrospective":"r","current":"c","future":"f"})";
+    };
+    ConsolidationPipeline pipeline(&dataStore, &memStore, nullptr, nullptr,
+                                   nullptr, nullptr, cb);
+
+    auto drop = dataStore.Prepare("DROP TABLE layer_perspectives");
+    Assert(drop && drop->ExecDML(), "drop layer_perspectives for failure injection");
+
+    std::string err;
+    Assert(!pipeline.RunPerspectiveRevision("agent1", "day", &err),
+           "pipeline perspective revision must fail when write is not confirmed");
+    Assert(err.find("not confirmed") != std::string::npos,
+           "pipeline error should name the unconfirmed write: " + err);
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
+// ============================================================================
+// #70 finding 5: fetch_pending byte budget — batches must stay under the
+// downstream tool-result cap, per-turn truncation must be explicit with a
+// pointer to the full text, unconsumed turns must remain pending.
+// ============================================================================
+
+int TestFetchPendingByteBudget() {
+    std::cerr << "  [#70] fetch_pending byte budget...\n";
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    MemoryStore memStore(&dataStore);
+    ontology::OntologyStore ontologyStore(&dataStore);
+    memory::MemoryFileStore fileStore(&dataStore);
+    AgentStore agentStore(&dataStore);
+    SessionReportStore reportStore(&dataStore);
+    SessionManager sessions(
+        std::make_unique<SqliteSessionStore>(&dataStore),
+        std::make_unique<DefaultSessionRouter>());
+    ConsolidationTool tool(&memStore, &ontologyStore, &sessions,
+                           &fileStore, &agentStore, &reportStore, nullptr);
+
+    // One normal session with 30 turns of 3KB each = 90KB — far over the
+    // 24KB default budget, well under the 50-turn limit.
+    auto session = sessions.GetOrCreate(SessionKey{"rss", "feed:pulls", ""});
+    session->SetAgentId("agent1");
+    for (int i = 0; i < 30; ++i) {
+        SessionTurn turn;
+        turn.role = "user";
+        turn.content = "payload-" + std::to_string(i) + "-" + std::string(3000, 'x');
+        turn.unix_ms = static_cast<std::uint64_t>(1000 + i);
+        session->AddTurn(std::move(turn));
+    }
+    sessions.GetStore().FlushSession(session->Id());
+
+    ToolCall call;
+    call.id = "f70";
+    call.arguments =
+        R"({"action":"fetch_pending","__agent_id":"agent1",)"
+        R"("__session_key":"consolidation:intake:agent1","params":{}})";
+    auto result = tool.Execute(call);
+    Assert(result.success, "fetch_pending should succeed: " + result.error);
+
+    Json::Value root;
+    Json::CharReaderBuilder rb;
+    std::string errs;
+    std::istringstream output(result.output);
+    Assert(Json::parseFromStream(rb, output, &root, &errs),
+           "fetch_pending output should be valid JSON: " + errs);
+    Assert(root["total"].asInt() == 30, "total should report all 30 pending turns");
+    Assert(root["turns"].size() > 0 && root["turns"].size() < 30,
+           "byte budget should emit a strict subset of pending turns");
+    Assert(root["has_more"].asBool(), "has_more should be true when turns remain");
+    Assert(root["bytes"].asUInt64() <= 30000, "emitted bytes should respect the budget");
+    Assert(!root["turns"][0]["turn_id"].isNull(),
+           "turns must carry turn_id for truncation pointers");
+
+    // A single oversized turn is truncated to the per-turn cap with a pointer.
+    {
+        auto big = sessions.GetOrCreate(SessionKey{"rss", "feed:bigone", ""});
+        big->SetAgentId("agent1");
+        SessionTurn turn;
+        turn.role = "user";
+        turn.content = std::string(10000, 'y');
+        turn.unix_ms = 2000;
+        big->AddTurn(std::move(turn));
+        sessions.GetStore().FlushSession(big->Id());
+        big->MarkTerminated();
+        sessions.GetStore().FlushSession(big->Id());
+
+        ToolCall bigCall;
+        bigCall.id = "f70b";
+        bigCall.arguments =
+            R"({"action":"fetch_pending","__agent_id":"agent1",)"
+            R"("__session_key":"consolidation:intake:agent1","params":{"limit":1}})";
+        auto bigResult = tool.Execute(bigCall);
+        Assert(bigResult.success, "fetch_pending (oversized single turn) should succeed");
+        Json::Value bigRoot;
+        std::istringstream bigOutput(bigResult.output);
+        Assert(Json::parseFromStream(rb, bigOutput, &bigRoot, &errs),
+               "oversized-turn output should be valid JSON");
+        const auto& t0 = bigRoot["turns"][0];
+        Assert(t0["truncated"].asBool(), "oversized turn should be flagged truncated");
+        Assert(t0["content"].asString().size() == 2048,
+               "oversized turn content should be cut to the per-turn cap");
+        Assert(t0["note"].asString().find("sessions:history") != std::string::npos,
+               "truncation note should point at the sessions tool for full text");
+    }
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
 int main() {
     std::cerr << "\n=== Consolidation Pipeline Tests ===\n\n";
+    // #70 tests run first: the pre-existing intake-test crash below kills the
+    // process before later tests can run (see ctest baseline).
+    std::cerr << "-- #70: Receipt honesty & fetch budget --\n";
+    TestPerspectiveReceiptHonesty();
+    TestPipelinePerspectiveFailurePropagates();
+    TestFetchPendingByteBudget();
 
     // ConsolidationStore tests
     std::cerr << "-- ConsolidationStore --\n";
@@ -564,6 +790,7 @@ int main() {
     std::cerr << "\n-- Pipeline: Stats & Logging --\n";
     TestPipelineStats();
     TestPipelineRunLog();
+
 
     std::cerr << "\n";
     if (g_failures == 0) {

@@ -339,6 +339,16 @@ ToolResult ConsolidationTool::HandleFetchPending(const std::string& arguments, c
     int limit = params.get("limit", 50).asInt();
     if (limit <= 0) limit = 50;
 
+    // #70 finding 5: byte-budgeted batches. Tool results are capped at
+    // ~75k chars downstream (ChainRunner maxToolResultChars); a batch of
+    // large turns (RSS pulls) used to hit that mid-turn — the tail turned
+    // into unreadable truncated JSON. Cap the batch server-side and truncate
+    // individual turn payloads with an explicit pointer to the full text.
+    static constexpr int kMaxPerTurnChars = 2048;
+    int maxBytes = params.get("max_bytes", 24000).asInt();
+    if (maxBytes < kMaxPerTurnChars) maxBytes = kMaxPerTurnChars;
+    if (maxBytes > 60000) maxBytes = 60000;
+
     // For session reporting, bypass intake-processed logic entirely.
     // Use a cross-table query that finds turns from non-consolidation sessions
     // newer than their last report (or all turns if no report exists).
@@ -368,18 +378,50 @@ ToolResult ConsolidationTool::HandleFetchPending(const std::string& arguments, c
     // Diary-to-observation is handled by IntakeFromDiary in the
     // LLM-callback path. Surfacing diary entries here creates a
     // recursion loop (memories of memories).
+    //
+    // Byte budget: keep appending turns until the budget is spent. At least
+    // one turn is always returned so the cycle makes progress. Turns left
+    // out stay pending (nothing is marked processed here) and reappear on
+    // the next call — the natural pagination loop.
     Json::Value root(Json::objectValue);
     root["total"] = static_cast<Json::Int>(pending.size());
 
     Json::Value turns(Json::arrayValue);
+    std::size_t usedBytes = 0;
+    std::size_t emitted = 0;
     for (const auto& t : pending) {
+        if (emitted > 0 && usedBytes + t.content.size() > static_cast<std::size_t>(maxBytes))
+            break;
+
         Json::Value turn(Json::objectValue);
         turn["session_id"] = static_cast<Json::Int64>(t.session_id);
+        turn["turn_id"] = static_cast<Json::Int64>(t.turn_id);
         turn["role"] = t.role;
-        turn["content"] = t.content;
+        if (t.content.size() > kMaxPerTurnChars) {
+            turn["content"] = t.content.substr(0, kMaxPerTurnChars);
+            turn["truncated"] = true;
+            turn["note"] = "content truncated to " + std::to_string(kMaxPerTurnChars) +
+                           " chars; full text via sessions:history / sessions:search " +
+                           "(session " + std::to_string(t.session_id) +
+                           ", turn " + std::to_string(t.turn_id) + ")";
+            usedBytes += static_cast<std::size_t>(kMaxPerTurnChars);
+        } else {
+            turn["content"] = t.content;
+            turn["truncated"] = false;
+            usedBytes += t.content.size();
+        }
         turns.append(turn);
+        ++emitted;
     }
     root["turns"] = turns;
+    root["returned"] = static_cast<Json::Int>(emitted);
+    root["bytes"] = static_cast<Json::UInt64>(usedBytes);
+    root["has_more"] = (emitted < pending.size());
+    if (pending.size() == static_cast<std::size_t>(limit)) {
+        root["note"] = "batch filled the turn limit (" + std::to_string(limit) +
+                       ") — more turns may be pending; call fetch_pending again " +
+                       "after this batch is consolidated";
+    }
 
     Json::FastWriter writer;
     result.output = writer.write(root);
@@ -911,7 +953,12 @@ ToolResult ConsolidationTool::HandlePerspectiveGenerate(const std::string& argum
         return result;
     }
 
-    m_memoryStore->SetPerspective(p);
+    if (!m_memoryStore->SetPerspective(p)) {
+        result.success = false;
+        result.error = "Failed to persist perspective for layer '" + layerName +
+                       "' — write not confirmed. Do not report the perspective as updated.";
+        return result;
+    }
 
     result.success = true;
     result.output = "{\"generated\":true}";
