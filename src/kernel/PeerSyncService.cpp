@@ -2,6 +2,7 @@
 #include "animus_kernel/Log.h"
 
 #include <chrono>
+#include <map>
 #include <sstream>
 
 namespace animus::kernel {
@@ -146,6 +147,23 @@ bool PeerSyncService::Handshake(PeerState& p, std::string* error) {
         }
     }
     p.nodeId = peerNode;
+
+    // Anti-entropy fields (optional: tolerated absent so older peers and
+    // minimal fakes stay pullable — the heal check just won't run).
+    p.peerMaxOutboxId = -1;
+    p.peerDigests.clear();
+    if (body.isMember("max_outbox_id") && body["max_outbox_id"].isNumeric()) {
+        p.peerMaxOutboxId = body["max_outbox_id"].asInt64();
+    }
+    if (body.isMember("digests") && body["digests"].isArray()) {
+        for (const auto& d : body["digests"]) {
+            if (d.isMember("table") && d["table"].isString()
+                    && d.isMember("count") && d["count"].isNumeric()) {
+                p.peerDigests.emplace_back(d["table"].asString(),
+                                           d["count"].asInt64());
+            }
+        }
+    }
     return true;
 }
 
@@ -215,12 +233,16 @@ int PeerSyncService::SyncOnce() {
         std::string error;
         bool ok = true;
 
-        if (p.nodeId == 0) {
-            ok = Handshake(p, &error);
-            if (ok) {
-                // Adopt any persisted cursor from a previous run.
-                p.cursor = m_store->GetPeerCursor(static_cast<int64_t>(p.nodeId));
-            }
+        // Handshake runs every pass (not just first connect): one cheap
+        // GET that refreshes the peer's anti-entropy digests and catches
+        // protocol/config flips without a restart.
+        const bool freshLearn = (p.nodeId == 0);
+        ok = Handshake(p, &error);
+        if (ok && freshLearn && p.nodeId != 0) {
+            // Adopt any persisted cursor from a previous run (a wiped or
+            // first-time node persists nothing and starts at 0 = the
+            // initial full sync).
+            p.cursor = m_store->GetPeerCursor(static_cast<int64_t>(p.nodeId));
         }
 
         int applied = 0;
@@ -236,6 +258,48 @@ int PeerSyncService::SyncOnce() {
             p.lastError.clear();
             totalApplied += applied;
             p.appliedTotal += static_cast<uint64_t>(applied > 0 ? applied : 0);
+
+            // Anti-entropy heal (P1d): fully consumed the peer's outbox,
+            // yet its handshake digests still report rows we don't have?
+            // The outbox can't explain the gap - classic case is a datadir
+            // restored from a partial backup holding a stale cursor past
+            // rows that vanished locally. Cure: replay from cursor 0.
+            // Every record applies idempotently under LWW, so a full
+            // replay is always safe; one reset heals every table.
+            if (!p.peerDigests.empty() && p.cursor > 0
+                    && p.peerMaxOutboxId >= 0
+                    && p.cursor >= p.peerMaxOutboxId) {
+                auto ours = m_store->TableDigests();
+                std::map<std::string, int64_t> oursByName;
+                for (const auto& d : ours) oursByName.emplace(d.table, d.count);
+                std::vector<std::string> shortTables;
+                for (const auto& [table, peerCount] : p.peerDigests) {
+                    auto it = oursByName.find(table);
+                    if (it != oursByName.end() && it->second < peerCount) {
+                        shortTables.push_back(table);
+                    }
+                }
+                if (!shortTables.empty()) {
+                    // The version stamps for these tables outlived their
+                    // rows and would tie-skip the replay forever - forget
+                    // them so the replay can re-apply (rows that still
+                    // exist just get re-stamped identically).
+                    std::string names;
+                    for (const auto& t : shortTables) {
+                        m_store->ClearTableVersions(t);
+                        names += (names.empty() ? "" : ", ") + t;
+                    }
+                    ALOG_WARNING("sync", "anti-entropy: tables short on "
+                        "rows (" << names << ") with outbox fully consumed"
+                        << " - clearing stale version stamps and replaying"
+                        << " from cursor 0");
+                    p.cursor = 0;
+                    m_store->SetPeerCursor(
+                        static_cast<int64_t>(p.nodeId), 0);
+                    p.healTotal++;
+                    p.lastHealMs = NowMs();
+                }
+            }
         } else {
             p.consecutiveFailures++;
             p.lastError = error;
@@ -286,6 +350,8 @@ Json::Value PeerSyncService::StatusJson() const {
         j["consecutive_failures"] = p.consecutiveFailures;
         j["pulled_total"] = Json::UInt64(p.pulledTotal);
         j["applied_total"] = Json::UInt64(p.appliedTotal);
+        j["heal_total"] = Json::UInt64(p.healTotal);
+        if (p.lastHealMs > 0) j["last_heal_ms"] = Json::Int64(p.lastHealMs);
         if (!p.lastError.empty()) j["last_error"] = p.lastError;
         peers.append(j);
     }

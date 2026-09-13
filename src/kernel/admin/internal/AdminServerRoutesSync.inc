@@ -36,6 +36,18 @@
             }
             out["tables"] = tables;
             out["max_outbox_id"] = Json::Int64(srv->m_syncStore->MaxOutboxId());
+            // Anti-entropy: per-table digests let a puller detect divergence
+            // the outbox can't explain (restored datadir with stale cursor).
+            Json::Value digests(Json::arrayValue);
+            for (const auto& d : srv->m_syncStore->TableDigests()) {
+                Json::Value j(Json::objectValue);
+                j["table"] = d.table;
+                j["count"] = Json::Int64(d.count);
+                j["max_id"] = Json::Int64(d.maxId);
+                j["sum_last_ms"] = Json::Int64(d.sumLastMs);
+                digests.append(j);
+            }
+            out["digests"] = digests;
             callback(drogon::HttpResponse::newHttpJsonResponse(out));
         },
         {drogon::Get});
@@ -120,6 +132,18 @@
             out["node_id"] = Json::UInt64(srv->m_syncStore->LocalNodeId());
             out["protocol"] = PeerSyncService::kProtocol;
             out["max_outbox_id"] = Json::Int64(srv->m_syncStore->MaxOutboxId());
+            // Local digests for operator eyeballing / debugging heal
+            // decisions: same shape the handshake reports to peers.
+            Json::Value digests(Json::arrayValue);
+            for (const auto& d : srv->m_syncStore->TableDigests()) {
+                Json::Value j(Json::objectValue);
+                j["table"] = d.table;
+                j["count"] = Json::Int64(d.count);
+                j["max_id"] = Json::Int64(d.maxId);
+                j["sum_last_ms"] = Json::Int64(d.sumLastMs);
+                digests.append(j);
+            }
+            out["digests"] = digests;
             if (srv->m_peerSyncService) {
                 out["peer_sync"] = srv->m_peerSyncService->StatusJson();
             } else {
