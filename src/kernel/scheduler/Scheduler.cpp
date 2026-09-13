@@ -479,7 +479,8 @@ void Scheduler::ProcessDueSchedules() {
         const bool claimed = m_runStore.TryClaim(
             runUuid, schedule.id, schedule.agent_id, window,
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
+                std::chrono::system_clock::now().time_since_epoch()).count(),
+            m_nodeId);
 
         std::string outcome = "no_callback";
         if (claimed && m_fireCallback) {

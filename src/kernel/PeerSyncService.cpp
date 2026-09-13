@@ -205,7 +205,7 @@ int PeerSyncService::PullFromPeer(PeerState& p, std::string* error) {
             rec.outbox_id = r["outbox_id"].asInt64();
             rec.origin_node = r["origin_node"].asInt64();
             rec.table_name = r["table_name"].asString();
-            rec.row_id = r["row_id"].asInt64();
+            rec.row_key = r["row_id"].asString();
             rec.op = r["op"].asString();
             rec.payload = r["payload"].asString();
             rec.unix_ms = r["unix_ms"].asInt64();

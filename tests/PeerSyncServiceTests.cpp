@@ -199,7 +199,7 @@ std::string OutboxJson(SyncStore& from, int64_t since, int64_t limit,
         out += "{\"outbox_id\":" + std::to_string(r.outbox_id) +
                ",\"origin_node\":" + std::to_string(r.origin_node) +
                ",\"table_name\":\"" + r.table_name + "\"" +
-               ",\"row_id\":" + std::to_string(r.row_id) +
+               ",\"row_id\":\"" + r.row_key + "\"" +
                ",\"op\":\"" + r.op + "\"" +
                ",\"payload\":\"" + esc + "\"" +
                ",\"unix_ms\":" + std::to_string(r.unix_ms) + "}";

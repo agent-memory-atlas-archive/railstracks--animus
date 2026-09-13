@@ -22,7 +22,7 @@ namespace animus::kernel {
 // node-federation design (#78): analysis tasks worst-case write twice and
 // merge; here the common case is they fire once per window, provably.
 //
-// node_id is '' until node identity lands (P1a); triggered_by is 'schedule'
+// node_id: claiming node's identity (P2a — filled from kernel config;
 // until manual/failover triggers exist (P2).
 // ============================================================================
 
@@ -51,7 +51,8 @@ public:
     // finished by this node, a past life, or a peer).
     bool TryClaim(const std::string& runUuid, const std::string& scheduleId,
                   const std::string& agentId, const std::string& scheduledFor,
-                  int64_t startedAtUnixMs);
+                  int64_t startedAtUnixMs,
+                  const std::string& nodeId = "");
 
     // Record the dispatch outcome. Returns false if the uuid is unknown.
     bool Finish(const std::string& runUuid, const std::string& outcome,

@@ -38,7 +38,7 @@ std::string SqliteNowMs() {
 // unrelated rows.
 std::string SqliteMatchCond(const std::string& table, const std::string& rowExpr) {
     return "(SELECT apply_table FROM sync_control) = '" + table + "' "
-           "AND (SELECT apply_row_id FROM sync_control) = " + rowExpr + " "
+           "AND (SELECT apply_row_id FROM sync_control) = CAST(" + rowExpr + " AS TEXT) "
            "AND (SELECT apply_origin FROM sync_control) IS NOT NULL";
 }
 
@@ -66,7 +66,7 @@ bool SyncStore::EnsureSchema(std::string* error) {
         CREATE TABLE IF NOT EXISTS sync_control (
             node_id INTEGER PRIMARY KEY,
             apply_table TEXT,
-            apply_row_id INTEGER,
+            apply_row_id TEXT,
             apply_origin INTEGER,
             apply_ms INTEGER
         );
@@ -76,7 +76,7 @@ bool SyncStore::EnsureSchema(std::string* error) {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             origin_node INTEGER NOT NULL,
             table_name TEXT NOT NULL,
-            row_id INTEGER NOT NULL,
+            row_id TEXT NOT NULL,
             op TEXT NOT NULL,
             payload TEXT NOT NULL,
             unix_ms INTEGER NOT NULL
@@ -85,7 +85,7 @@ bool SyncStore::EnsureSchema(std::string* error) {
     CreateTable(m_store, R"(
         CREATE TABLE IF NOT EXISTS sync_row_versions (
             table_name TEXT NOT NULL,
-            row_id INTEGER NOT NULL,
+            row_id TEXT NOT NULL,
             last_ms INTEGER NOT NULL,
             last_node INTEGER NOT NULL,
             PRIMARY KEY (table_name, row_id)
@@ -122,7 +122,7 @@ DECLARE
     origin BIGINT;
 BEGIN
     SELECT * INTO ctl FROM sync_control;
-    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = NEW.id
+    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = NEW.id::text
        AND ctl.apply_origin IS NOT NULL THEN
         ms := ctl.apply_ms;
         origin := ctl.apply_origin;
@@ -131,11 +131,11 @@ BEGIN
         origin := ctl.node_id;
     END IF;
     INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node)
-        VALUES (TG_TABLE_NAME, NEW.id, ms, origin)
+        VALUES (TG_TABLE_NAME, NEW.id::text, ms, origin)
         ON CONFLICT (table_name, row_id) DO UPDATE SET
             last_ms = EXCLUDED.last_ms, last_node = EXCLUDED.last_node;
     INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms)
-        VALUES (origin, TG_TABLE_NAME, NEW.id, 'upsert', to_jsonb(NEW)::text, ms);
+        VALUES (origin, TG_TABLE_NAME, NEW.id::text, 'upsert', to_jsonb(NEW)::text, ms);
     RETURN NEW;
 END $$ LANGUAGE plpgsql;)");
         m_store->Exec(R"(
@@ -146,7 +146,7 @@ DECLARE
     origin BIGINT;
 BEGIN
     SELECT * INTO ctl FROM sync_control;
-    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = OLD.id
+    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = OLD.id::text
        AND ctl.apply_origin IS NOT NULL THEN
         ms := ctl.apply_ms;
         origin := ctl.apply_origin;
@@ -155,11 +155,11 @@ BEGIN
         origin := ctl.node_id;
     END IF;
     INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node)
-        VALUES (TG_TABLE_NAME, OLD.id, ms, origin)
+        VALUES (TG_TABLE_NAME, OLD.id::text, ms, origin)
         ON CONFLICT (table_name, row_id) DO UPDATE SET
             last_ms = EXCLUDED.last_ms, last_node = EXCLUDED.last_node;
     INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms)
-        VALUES (origin, TG_TABLE_NAME, OLD.id, 'delete',
+        VALUES (origin, TG_TABLE_NAME, OLD.id::text, 'delete',
                 json_build_object('id', OLD.id)::text, ms);
     RETURN OLD;
 END $$ LANGUAGE plpgsql;)");
@@ -189,6 +189,73 @@ std::vector<std::string> SyncStore::ReadTableColumns(const std::string& table) {
         auto q = m_store->Prepare("PRAGMA table_info(" + table + ")");
         if (!q) return cols;
         while (q->Step()) cols.push_back(q->ColumnText(1));
+
+    // --- P2a migration: row-id columns INTEGER -> TEXT ---------------------
+    // schedules (TEXT primary keys) and task_runs joined the synced set;
+    // the sync layer's row identity is now TEXT uniformly (int ids are
+    // stringified at capture). SQLite can't ALTER a column type, so the
+    // tables are rebuilt via create-copy-swap. PG uses ALTER TYPE.
+    {
+        const bool isPgNow = m_store->Dialect() == DataStoreDialect::PostgreSQL;
+        if (isPgNow) {
+            m_store->Exec("ALTER TABLE sync_outbox ALTER COLUMN row_id TYPE TEXT");
+            m_store->Exec("ALTER TABLE sync_row_versions ALTER COLUMN row_id TYPE TEXT");
+            m_store->Exec("ALTER TABLE sync_control ALTER COLUMN apply_row_id TYPE TEXT");
+        } else {
+            std::string migErr;
+            auto probe = m_store->Prepare(
+                "SELECT type FROM pragma_table_info('sync_outbox') "
+                "WHERE name = 'row_id'");
+            const bool needMigrate = [&]() {
+                if (!probe) return false;
+                if (!probe->Step()) return false;
+                return probe->ColumnText(0) != "TEXT";
+            }();
+            if (needMigrate) {
+                if (RebuildSqliteTableWide(m_store, R"SQL(
+                    CREATE TABLE sync_outbox (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        origin_node INTEGER NOT NULL,
+                        table_name TEXT NOT NULL,
+                        row_id TEXT NOT NULL,
+                        op TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        unix_ms INTEGER NOT NULL
+                    ))SQL", "sync_outbox", &migErr)) {
+                    ALOG_INFO("sync", "migrated sync_outbox.row_id INTEGER -> TEXT");
+                } else {
+                    ALOG_WARNING("sync", "sync_outbox row_id migration failed: "
+                                 << migErr);
+                }
+                if (RebuildSqliteTableWide(m_store, R"SQL(
+                    CREATE TABLE sync_row_versions (
+                        table_name TEXT NOT NULL,
+                        row_id TEXT NOT NULL,
+                        last_ms INTEGER NOT NULL,
+                        last_node INTEGER NOT NULL,
+                        PRIMARY KEY (table_name, row_id)
+                    ))SQL", "sync_row_versions", &migErr)) {
+                    ALOG_INFO("sync", "migrated sync_row_versions.row_id INTEGER -> TEXT");
+                } else {
+                    ALOG_WARNING("sync", "sync_row_versions row_id migration failed: "
+                                 << migErr);
+                }
+                // sync_control holds a single identity row, re-inserted below;
+                // drop+recreate is the safe rebuild.
+                m_store->Exec("DROP TABLE IF EXISTS sync_control");
+                m_store->Exec(R"SQL(
+                    CREATE TABLE sync_control (
+                        node_id INTEGER PRIMARY KEY,
+                        apply_table TEXT,
+                        apply_row_id TEXT,
+                        apply_origin INTEGER,
+                        apply_ms INTEGER
+                    ))SQL");
+                ALOG_INFO("sync", "migrated sync_control.apply_row_id INTEGER -> TEXT");
+            }
+        }
+    }
+
     } else {
         auto q = m_store->Prepare(
             "SELECT column_name FROM information_schema.columns "
@@ -233,11 +300,11 @@ bool SyncStore::InstallTriggersFor(const std::string& table, std::string* error)
         const std::string outboxInsert =
             "INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms) "
             "SELECT " + SqliteStampOrigin(table, "NEW.id") + ", '" + table +
-            "', NEW.id, 'upsert', " + payload + ", " +
+            "', CAST(NEW.id AS TEXT), 'upsert', " + payload + ", " +
             SqliteStampMs(table, "NEW.id") + "; ";
         const std::string versionUpsert =
             "INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node) "
-            "SELECT '" + table + "', NEW.id, "
+            "SELECT '" + table + "', CAST(NEW.id AS TEXT), "
             "(SELECT unix_ms FROM sync_outbox WHERE id = last_insert_rowid()), " +
             SqliteStampOrigin(table, "NEW.id") + " WHERE NEW.id IS NOT NULL "
             "ON CONFLICT (table_name, row_id) DO UPDATE SET "
@@ -245,11 +312,11 @@ bool SyncStore::InstallTriggersFor(const std::string& table, std::string* error)
         const std::string outboxInsertDel =
             "INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms) "
             "SELECT " + SqliteStampOrigin(table, "OLD.id") + ", '" + table +
-            "', OLD.id, 'delete', json_object('id', OLD.id), " +
+            "', CAST(OLD.id AS TEXT), 'delete', json_object('id', OLD.id), " +
             SqliteStampMs(table, "OLD.id") + "; ";
         const std::string versionUpsertDel =
             "INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node) "
-            "SELECT '" + table + "', OLD.id, "
+            "SELECT '" + table + "', CAST(OLD.id AS TEXT), "
             "(SELECT unix_ms FROM sync_outbox WHERE id = last_insert_rowid()), " +
             SqliteStampOrigin(table, "OLD.id") + " WHERE OLD.id IS NOT NULL "
             "ON CONFLICT (table_name, row_id) DO UPDATE SET "
@@ -305,7 +372,7 @@ std::vector<OutboxRecord> SyncStore::FetchOutboxSince(int64_t sinceOutboxId, int
         r.outbox_id = q->ColumnInt64(0);
         r.origin_node = q->ColumnInt64(1);
         r.table_name = q->ColumnText(2);
-        r.row_id = q->ColumnInt64(3);
+        r.row_key = q->ColumnText(3);
         r.op = q->ColumnText(4);
         r.payload = q->ColumnText(5);
         r.unix_ms = q->ColumnInt64(6);
@@ -400,7 +467,7 @@ bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
             "WHERE table_name = ? AND row_id = ?");
         if (q) {
             q->BindText(1, rec.table_name);
-            q->BindInt64(2, rec.row_id);
+            q->BindText(2, rec.row_key);
             if (q->Step()) {
                 localMs = q->ColumnInt64(0);
                 localNode = q->ColumnInt64(1);
@@ -410,7 +477,7 @@ bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
     const std::pair<int64_t, int64_t> incoming(rec.unix_ms, rec.origin_node);
     const std::pair<int64_t, int64_t> local(localMs, localNode);
     if (incoming <= local) {
-        ALOG_DEBUG("sync", "skip " << rec.table_name << "/" << rec.row_id
+        ALOG_DEBUG("sync", "skip " << rec.table_name << "/" << rec.row_key
                    << " — stale/echo (in " << rec.unix_ms << "/" << rec.origin_node
                    << " vs local " << localMs << "/" << localNode << ")");
         return false;   // stale, echo, or exact tie — all safe to skip
@@ -424,7 +491,7 @@ bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
             "apply_origin = ?, apply_ms = ?");
         if (q) {
             q->BindText(1, rec.table_name);
-            q->BindInt64(2, rec.row_id);
+            q->BindText(2, rec.row_key);
             q->BindInt64(3, rec.origin_node);
             q->BindInt64(4, rec.unix_ms);
             q->ExecDML();
@@ -438,14 +505,14 @@ bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
         if (q) q->ExecDML();
     }
     if (!ok) ALOG_WARNING("sync", "apply FAILED for " << rec.table_name
-                          << "/" << rec.row_id << ": " << m_store->ErrMsg());
+                          << "/" << rec.row_key << ": " << m_store->ErrMsg());
     return ok;
 }
 
 bool SyncStore::ApplyDelete(const OutboxRecord& rec) {
     auto q = m_store->Prepare("DELETE FROM " + rec.table_name + " WHERE id = ?");
     if (!q) return false;
-    q->BindInt64(1, rec.row_id);
+    q->BindText(1, rec.row_key);
     return q->ExecDML();
 }
 
@@ -456,7 +523,7 @@ bool SyncStore::ApplyUpsert(const OutboxRecord& rec) {
     std::istringstream ss(rec.payload);
     if (!Json::parseFromStream(rb, ss, &root, &parseErr)) {
         ALOG_WARNING("sync", "payload parse failed for " << rec.table_name
-                     << "/" << rec.row_id << ": " << parseErr);
+                     << "/" << rec.row_key << ": " << parseErr);
         return false;
     }
     if (!root.isObject() || !root.isMember("id")) {
@@ -501,6 +568,48 @@ bool SyncStore::ApplyUpsert(const OutboxRecord& rec) {
         else q->BindText(idx, v.asString());
     }
     return q->ExecDML();
+}
+
+
+// SQLite can't ALTER COLUMN types; rebuild via create-copy-swap. The DDL
+// string creates the NEW shape under a temp name; rows are copied (SQLite's
+// implicit int->text coercion handles the row-id widening); the old table
+// is dropped and the new one renamed into place. Preserves rows; loses
+// nothing else (indexes on these tables are recreated by callers/DDL).
+bool SyncStore::RebuildSqliteTableWide(IDataStore* store, const std::string& ddl,
+                                       const std::string& table, std::string* error) {
+    const std::string tmp = table + "__p2a_tmp";
+    // Rewrite the DDL's table name into the temp name.
+    std::string tmpDdl = ddl;
+    const size_t nameAt = tmpDdl.find(table);
+    if (nameAt == std::string::npos) {
+        if (error) *error = "ddl does not name the table";
+        return false;
+    }
+    tmpDdl.replace(nameAt, table.size(), tmp);
+
+    if (!store->Exec("DROP TABLE IF EXISTS " + tmp)) {
+        if (error) *error = "drop tmp failed: " + store->ErrMsg();
+        return false;
+    }
+    if (!store->Exec(tmpDdl)) {
+        if (error) *error = "create tmp failed: " + store->ErrMsg();
+        return false;
+    }
+    if (!store->Exec("INSERT INTO " + tmp + " SELECT * FROM " + table)) {
+        if (error) *error = "copy rows failed: " + store->ErrMsg();
+        store->Exec("DROP TABLE IF EXISTS " + tmp);
+        return false;
+    }
+    if (!store->Exec("DROP TABLE " + table)) {
+        if (error) *error = "drop old failed: " + store->ErrMsg();
+        return false;
+    }
+    if (!store->Exec("ALTER TABLE " + tmp + " RENAME TO " + table)) {
+        if (error) *error = "rename failed: " + store->ErrMsg();
+        return false;
+    }
+    return true;
 }
 
 } // namespace animus::kernel

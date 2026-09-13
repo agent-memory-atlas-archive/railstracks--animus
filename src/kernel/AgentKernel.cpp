@@ -382,6 +382,19 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         m_diaryStore = new DiaryStore(m_dataStore);
         m_adminServer->SetDiaryStore(m_diaryStore);
 
+        // --- #78 P2a: scheduler tables join the replication set ----------
+        // schedules/task_runs schemas must exist BEFORE SyncStore installs
+        // triggers (install is live-schema-read at boot; a missing table is
+        // skipped). The Scheduler object itself is constructed later (its
+        // FireCallback captures this kernel), so pre-create the schemas via
+        // lightweight store objects here — ScheduleStore/TaskRunStore ctors
+        // are pure schema-ensurers on the shared IDataStore.
+        {
+            ScheduleStore schedulePre(m_dataStore);
+            TaskRunStore taskRunPre(m_dataStore);
+            taskRunPre.EnsureSchema();   // TaskRunStore ctor does NOT ensure
+        }
+
         // --- #78 P1a: node-scoped id ranges (federation identity) ---
         // After ALL agent-global stores exist (tables + sequences created),
         // seed this node's id range so every agent-global insert allocates
@@ -657,6 +670,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
 
         // --- Scheduler (cron-like, fires IncomingEvent → session pipeline) ---
         m_scheduler = new Scheduler(m_dataStore);
+        m_scheduler->SetNodeId(std::to_string(m_config.node.id));
         m_adminServer->SetScheduler(m_scheduler);
         m_scheduler->SetFireCallback([this](const IncomingEvent& event) {
             const std::string agentId = event.metadata.count("agent_id")

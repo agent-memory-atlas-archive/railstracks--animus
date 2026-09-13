@@ -45,6 +45,9 @@ public:
 
     // Configuration
     void SetPollIntervalMs(uint32_t ms);
+    // #78 P2a: identity recorded on every task_run claim row (who ran it).
+    // Empty = single-node/legacy (stays '').
+    void SetNodeId(const std::string& id) { m_nodeId = id; }
     void SetMaxSchedulesPerAgent(uint32_t limit);
     void SetFireCallback(FireCallback cb);
 
@@ -80,6 +83,7 @@ private:
     std::mutex m_configMutex;
     uint32_t m_pollIntervalMs{30000};
     uint32_t m_maxSchedulesPerAgent{50};
+    std::string m_nodeId;
 };
 
 } // namespace animus::kernel
