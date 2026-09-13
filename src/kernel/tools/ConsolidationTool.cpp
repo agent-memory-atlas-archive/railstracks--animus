@@ -57,12 +57,14 @@ ToolDefinition ConsolidationTool::GetDefinition() const {
         "action", "string",
         "The consolidation action to perform: "
         "create, fetch_pending, review, promote, merge, revise, retire, tag, history, "
-        "perspective:generate, perspective:review, ontology:upsert, sessions:report, "
+        "perspective:generate, perspective:review, ontology:upsert, ontology:list, "
+        "ontology:get, ontology:delete, sessions:report, "
         "memory_file:fetch_pending, memory_file:mark_processed, summary",
         true,
         "",
         {"create", "fetch_pending", "review", "promote", "merge", "revise", "retire", "tag", "history",
-         "perspective:generate", "perspective:review", "ontology:upsert", "sessions:report",
+         "perspective:generate", "perspective:review", "ontology:upsert", "ontology:list",
+         "ontology:get", "ontology:delete", "sessions:report",
          "memory_file:fetch_pending", "memory_file:mark_processed", "summary"}
     });
 
@@ -117,30 +119,35 @@ ToolResult ConsolidationTool::Execute(const ToolCall& call) {
     // Action whitelist per session type
     static const std::set<std::string> intakeActions = {
         "fetch_pending", "create", "ontology:upsert",
+        "ontology:list", "ontology:get",
         "perspective:generate", "summary",
         "memory_file:fetch_pending", "memory_file:mark_processed"
     };
     static const std::set<std::string> reviewActions = {
         "review", "promote", "merge", "revise", "retire", "tag",
-        "history", "perspective:review", "perspective:generate", "summary"
+        "history", "perspective:review", "perspective:generate", "summary",
+        "ontology:list", "ontology:get", "ontology:delete"
     };
     static const std::set<std::string> sessionReportActions = {
-        "fetch_pending", "sessions:report", "summary"
+        "fetch_pending", "sessions:report", "summary",
+        "ontology:list", "ontology:get"
     };
 
     if (isIntake && intakeActions.find(action) == intakeActions.end()) {
         result.success = false;
         result.error = "Action '" + action + "' is not available in intake sessions. "
                       "Intake actions: fetch_pending, create, ontology:upsert, "
-                      "perspective:generate, memory_file:fetch_pending, "
-                      "memory_file:mark_processed, summary.";
+                      "ontology:list, ontology:get, perspective:generate, "
+                      "memory_file:fetch_pending, memory_file:mark_processed, summary. "
+                      "ontology:delete requires a review session.";
         return result;
     }
     if (isReview && reviewActions.find(action) == reviewActions.end()) {
         result.success = false;
         result.error = "Action '" + action + "' is not available in review sessions. "
                       "Review actions: review, promote, merge, revise, retire, "
-                      "tag, history, perspective:review, perspective:generate, summary.";
+                      "tag, history, perspective:review, perspective:generate, summary, "
+                      "ontology:list, ontology:get, ontology:delete.";
         return result;
     }
     if (isSessionReport && sessionReportActions.find(action) == sessionReportActions.end()) {
@@ -176,6 +183,12 @@ ToolResult ConsolidationTool::Execute(const ToolCall& call) {
         return HandleSummary(call.arguments, agentId, isIntake);
     } else if (action == "ontology:upsert") {
         return HandleOntologyUpsert(call.arguments, agentId);
+    } else if (action == "ontology:list") {
+        return HandleOntologyList(call.arguments, agentId);
+    } else if (action == "ontology:get") {
+        return HandleOntologyGet(call.arguments, agentId);
+    } else if (action == "ontology:delete") {
+        return HandleOntologyDelete(call.arguments, agentId);
     } else if (action == "memory_file:fetch_pending") {
         return HandleMemoryFileFetch(call.arguments, agentId);
     } else if (action == "memory_file:mark_processed") {
@@ -1047,7 +1060,7 @@ ToolResult ConsolidationTool::HandleOntologyUpsert(const std::string& arguments,
     // falling back to top-level keys for direct callers.
     const auto params = args.get("params", Json::objectValue);
     const std::string rootCategory = params.get("root_category",
-        args.get("root_category", "concept")).asString();
+        args.get("root_category", "")).asString();
     const std::string path = params.get("path",
         args.get("path", "")).asString();
     // agentId comes from ChainRunner-injected __agent_id, not params
@@ -1060,6 +1073,16 @@ ToolResult ConsolidationTool::HandleOntologyUpsert(const std::string& arguments,
         return result;
     }
 
+    if (rootCategory.empty()) {
+        // #70 finding 4: the old default was the singular "concept" — an
+        // INVALID value the model never sent. When params dropped the field
+        // (nesting mismatch, truncated payloads), the call failed blaming a
+        // value the caller didn't provide. Require it explicitly instead.
+        result.success = false;
+        result.error = "root_category is required. Valid: persons, concepts, "
+                       "procedures, events, locations, organizations, projects";
+        return result;
+    }
     auto category = ontology::OntologyStore::RootCategoryFromString(rootCategory);
     if (!category.has_value()) {
         result.success = false;
@@ -1125,6 +1148,246 @@ ToolResult ConsolidationTool::HandleOntologyUpsert(const std::string& arguments,
         out["properties_set"] = upsertedProps;
     }
 
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    result.success = true;
+    result.output = Json::writeString(wb, out);
+    return result;
+}
+
+// ============================================================================
+// #70 finding 1: ontology curation verbs. The store layer had full read and
+// delete capability; the tool never exposed it — junk entities were
+// enumerable via memory search but unreachable for curation ("Unknown
+// action"). Reads are available in every session type (and live sessions,
+// which bypass these gates); deletes are review+live only, agent-scoped,
+// and require an explicit motivation (logged as an ontology mutation).
+// ============================================================================
+
+ToolResult ConsolidationTool::HandleOntologyList(const std::string& arguments, const std::string& agentId) {
+    ToolResult result;
+    if (!m_ontologyStore) {
+        result.success = false;
+        result.error = "ontology store not available";
+        return result;
+    }
+
+    Json::Value args;
+    Json::CharReaderBuilder rb;
+    std::istringstream stream(arguments);
+    std::string parseErr;
+    if (!Json::parseFromStream(rb, stream, &args, &parseErr)) {
+        result.success = false;
+        result.error = "Failed to parse arguments: " + parseErr;
+        return result;
+    }
+    const auto params = args.get("params", Json::objectValue);
+
+    std::optional<ontology::RootCategory> category;
+    const std::string categoryStr = params.get("category", "").asString();
+    if (!categoryStr.empty()) {
+        category = ontology::OntologyStore::RootCategoryFromString(categoryStr);
+        if (!category.has_value()) {
+            result.success = false;
+            result.error = "Invalid category: " + categoryStr +
+                ". Valid: persons, concepts, procedures, events, locations, organizations, projects";
+            return result;
+        }
+    }
+
+    const int64_t parentId = params.get("parent_id", 0).asInt64();
+    const std::string nameContains = params.get("name_contains", "").asString();
+    int limit = params.get("limit", 50).asInt();
+    if (limit < 1) limit = 50;
+    if (limit > 200) limit = 200;
+    const int offset = std::max(0, params.get("offset", 0).asInt());
+
+    std::vector<ontology::OntologyEntity> entities =
+        (parentId > 0) ? m_ontologyStore->ListChildren(parentId, agentId)
+                       : m_ontologyStore->ListEntities(category, agentId);
+
+    // Optional case-insensitive name/path filter (applied before pagination
+    // so offset/limit describe the filtered set).
+    std::vector<ontology::OntologyEntity> filtered;
+    if (nameContains.empty()) {
+        filtered = std::move(entities);
+    } else {
+        std::string needle;
+        for (char c : nameContains)
+            needle += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (auto& e : entities) {
+            std::string hay;
+            for (char c : e.name + "/" + e.full_path)
+                hay += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (hay.find(needle) != std::string::npos)
+                filtered.push_back(std::move(e));
+        }
+    }
+
+    const int total = static_cast<int>(filtered.size());
+    Json::Value arr(Json::arrayValue);
+    int emitted = 0;
+    for (int i = offset; i < total && emitted < limit; ++i, ++emitted) {
+        const auto& e = filtered[static_cast<size_t>(i)];
+        Json::Value obj(Json::objectValue);
+        obj["id"] = static_cast<Json::Int64>(e.id);
+        obj["name"] = e.name;
+        obj["full_path"] = e.full_path;
+        obj["root_category"] = ontology::OntologyStore::RootCategoryToString(e.root_category);
+        obj["parent_id"] = e.parent_id.has_value()
+            ? Json::Value(static_cast<Json::Int64>(*e.parent_id)) : Json::Value();
+        obj["updated_at_unix_ms"] = static_cast<Json::Int64>(e.updated_at_unix_ms);
+        arr.append(obj);
+    }
+
+    Json::Value out(Json::objectValue);
+    out["count"] = emitted;
+    out["total"] = total;
+    out["entities"] = arr;
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    result.success = true;
+    result.output = Json::writeString(wb, out);
+    return result;
+}
+
+ToolResult ConsolidationTool::HandleOntologyGet(const std::string& arguments, const std::string& agentId) {
+    ToolResult result;
+    if (!m_ontologyStore) {
+        result.success = false;
+        result.error = "ontology store not available";
+        return result;
+    }
+
+    Json::Value args;
+    Json::CharReaderBuilder rb;
+    std::istringstream stream(arguments);
+    std::string parseErr;
+    if (!Json::parseFromStream(rb, stream, &args, &parseErr)) {
+        result.success = false;
+        result.error = "Failed to parse arguments: " + parseErr;
+        return result;
+    }
+    const auto params = args.get("params", Json::objectValue);
+
+    std::optional<ontology::OntologyEntity> entity;
+    const int64_t id = params.get("id", 0).asInt64();
+    if (id > 0) {
+        entity = m_ontologyStore->GetEntity(id);
+    } else {
+        const std::string path = params.get("path", "").asString();
+        const std::string categoryStr = params.get("root_category", "").asString();
+        if (!path.empty() && !categoryStr.empty()) {
+            auto category = ontology::OntologyStore::RootCategoryFromString(categoryStr);
+            if (!category.has_value()) {
+                result.success = false;
+                result.error = "Invalid root_category: " + categoryStr;
+                return result;
+            }
+            // Stored full_path INCLUDES the category prefix
+            // ("persons/JunkTarget"), matching what ontology:list returns.
+            entity = m_ontologyStore->FindByPath(*category, path);
+        }
+    }
+
+    if (!entity.has_value()) {
+        result.success = false;
+        result.error = "entity not found (provide id, or path + root_category)";
+        return result;
+    }
+    if (entity->agent_id != agentId) {
+        result.success = false;
+        result.error = "entity does not belong to this agent";
+        return result;
+    }
+
+    Json::Value out(Json::objectValue);
+    out["id"] = static_cast<Json::Int64>(entity->id);
+    out["name"] = entity->name;
+    out["full_path"] = entity->full_path;
+    out["root_category"] = ontology::OntologyStore::RootCategoryToString(entity->root_category);
+    out["parent_id"] = entity->parent_id.has_value()
+        ? Json::Value(static_cast<Json::Int64>(*entity->parent_id)) : Json::Value();
+    out["agent_id"] = entity->agent_id;
+    out["created_at_unix_ms"] = static_cast<Json::Int64>(entity->created_at_unix_ms);
+    out["updated_at_unix_ms"] = static_cast<Json::Int64>(entity->updated_at_unix_ms);
+
+    Json::Value props(Json::arrayValue);
+    for (const auto& p : m_ontologyStore->ListProperties(entity->id)) {
+        Json::Value obj(Json::objectValue);
+        obj["id"] = static_cast<Json::Int64>(p.id);
+        obj["key"] = p.key;
+        obj["value"] = p.value;
+        obj["value_type"] = ontology::OntologyStore::PropertyTypeToString(p.value_type);
+        obj["memory_state"] = static_cast<int>(p.memory_state);
+        props.append(obj);
+    }
+    out["properties"] = props;
+    out["property_count"] = static_cast<Json::Int>(props.size());
+
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    result.success = true;
+    result.output = Json::writeString(wb, out);
+    return result;
+}
+
+ToolResult ConsolidationTool::HandleOntologyDelete(const std::string& arguments, const std::string& agentId) {
+    ToolResult result;
+    if (!m_ontologyStore) {
+        result.success = false;
+        result.error = "ontology store not available";
+        return result;
+    }
+
+    Json::Value args;
+    Json::CharReaderBuilder rb;
+    std::istringstream stream(arguments);
+    std::string parseErr;
+    if (!Json::parseFromStream(rb, stream, &args, &parseErr)) {
+        result.success = false;
+        result.error = "Failed to parse arguments: " + parseErr;
+        return result;
+    }
+    const auto params = args.get("params", Json::objectValue);
+
+    const int64_t id = params.get("id", 0).asInt64();
+    if (id <= 0) {
+        result.success = false;
+        result.error = "id is required for ontology:delete";
+        return result;
+    }
+    const std::string motivation = params.get("motivation", "").asString();
+    if (motivation.empty()) {
+        result.success = false;
+        result.error = "motivation is required for ontology:delete — curation "
+                       "decisions are logged; state why this entity is being removed";
+        return result;
+    }
+
+    auto entity = m_ontologyStore->GetEntity(id);
+    if (!entity.has_value()) {
+        result.success = false;
+        result.error = "entity not found: " + std::to_string(id);
+        return result;
+    }
+    if (entity->agent_id != agentId) {
+        result.success = false;
+        result.error = "entity does not belong to this agent";
+        return result;
+    }
+
+    if (!m_ontologyStore->DeleteEntity(id, motivation)) {
+        result.success = false;
+        result.error = "delete failed for entity " + std::to_string(id) +
+                       " (children may exist — delete or move them first)";
+        return result;
+    }
+
+    Json::Value out(Json::objectValue);
+    out["deleted"] = true;
+    out["id"] = static_cast<Json::Int64>(id);
+    out["motivation"] = motivation;
     Json::StreamWriterBuilder wb;
     wb["indentation"] = "";
     result.success = true;
