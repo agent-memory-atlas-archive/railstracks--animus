@@ -14,6 +14,15 @@ enum class PromptLogLevel;
 
 // KernelConfig is the host-facing configuration surface for bootstrapping the kernel.
 struct KernelConfig {
+    // #78 node federation. id 0 = single-node deployment (default): no
+    // id-range seeding, no federation behavior. Valid federation ids are
+    // [1, 2^20); each node allocates agent-global row ids from
+    // [id << 40, (id+1) << 40) so multi-master inserts never collide.
+    struct NodeConfig {
+        std::uint64_t id{0};
+        std::vector<std::string> peers;  // peer admin endpoints (P1c transport)
+    };
+
     struct AdminServerConfig {
         bool enabled{true};
         std::string host{"127.0.0.1"};
@@ -26,7 +35,9 @@ struct KernelConfig {
         std::size_t clientMaxBodySize{1024 * 1024 * 1024};  // 1GB
     };
 
-    struct AgentModelConfig {
+        NodeConfig node;
+
+struct AgentModelConfig {
         std::string provider{"openai"};
         std::string modelId{"gpt-4.1-mini"};
         std::uint32_t contextWindow{128000};

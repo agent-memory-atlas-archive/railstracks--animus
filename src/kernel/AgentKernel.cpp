@@ -1,3 +1,4 @@
+#include "animus_kernel/IdRanges.h"
 #include "animus_kernel/AgentKernel.h"
 #include "animus_kernel/Log.h"
 
@@ -376,6 +377,19 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         // --- Diary store (SQLite-backed, per-agent private diary) ---
         m_diaryStore = new DiaryStore(m_dataStore);
         m_adminServer->SetDiaryStore(m_diaryStore);
+
+        // --- #78 P1a: node-scoped id ranges (federation identity) ---
+        // After ALL agent-global stores exist (tables + sequences created),
+        // seed this node's id range so every agent-global insert allocates
+        // from [nodeId<<40, (nodeId+1)<<40). Raise-only; 0 = no-op.
+        if (m_config.node.id > 0) {
+            std::string idRangeError;
+            const int seededTables = SeedAgentGlobalIdRanges(
+                m_dataStore, m_config.node.id, &idRangeError);
+            if (seededTables < 0) {
+                ALOG_ERROR("kernel", "id-range seeding failed: " << idRangeError);
+            }
+        }
         m_tools.Register(std::make_unique<DiaryTool>(&m_adminServer->GetDiaryManager()));
 
         // --- Agent Self-Management Tool (view/update own settings) ---
