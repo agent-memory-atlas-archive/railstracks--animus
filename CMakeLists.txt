@@ -373,6 +373,7 @@ add_library(animus_kernel
   src/kernel/scheduler/Scheduler.cpp
   src/kernel/scheduler/TaskRunStore.cpp
   src/kernel/data/IdRanges.cpp
+  src/kernel/data/SyncStore.cpp
   src/kernel/social/SocialEventPoller.cpp
   src/kernel/social/TelegramBotApi.cpp
   src/kernel/ChannelManager.cpp
@@ -642,6 +643,32 @@ if(ANIMUS_BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
     )
     add_test(NAME PgIdRangeSmoke COMMAND animus_pg_id_smoke)
+
+    add_executable(animus_outbox_sync_tests
+      tests/OutboxSyncTests.cpp
+    )
+    target_link_libraries(animus_outbox_sync_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_outbox_sync_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_outbox_sync_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME OutboxSyncTests COMMAND animus_outbox_sync_tests)
+
+    add_executable(animus_pg_sync_smoke
+      tests/PgSyncSmoke.cpp
+    )
+    target_link_libraries(animus_pg_sync_smoke PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_pg_sync_smoke PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_pg_sync_smoke PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME PgSyncSmoke COMMAND animus_pg_sync_smoke)
 
     add_executable(animus_consolidation_tests
       tests/ConsolidationTests.cpp

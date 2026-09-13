@@ -1,4 +1,5 @@
 #include "animus_kernel/IdRanges.h"
+#include "animus_kernel/SyncStore.h"
 #include "animus_kernel/AgentKernel.h"
 #include "animus_kernel/Log.h"
 
@@ -161,6 +162,7 @@ AgentKernel::~AgentKernel() {
     delete m_projectStore; m_projectStore = nullptr;
     delete m_dataStore; m_dataStore = nullptr;
     delete m_providerThrottle; m_providerThrottle = nullptr;
+    delete m_syncStore; m_syncStore = nullptr;
     delete m_scheduler; m_scheduler = nullptr;
     delete m_sessionNotesStore; m_sessionNotesStore = nullptr;
     delete m_channelContextStore; m_channelContextStore = nullptr;
@@ -388,6 +390,19 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                 m_dataStore, m_config.node.id, &idRangeError);
             if (seededTables < 0) {
                 ALOG_ERROR("kernel", "id-range seeding failed: " << idRangeError);
+            }
+        }
+
+        // --- #78 P1b: replication outbox + LWW apply (agent-global tables) ---
+        // Trigger-based change capture for every agent-global table. Installed
+        // on every node (single-node nodes simply accumulate an unpulled
+        // outbox — schema stays uniform and federation-ready).
+        m_syncStore = new SyncStore(m_dataStore, m_config.node.id);
+        {
+            std::string syncErr;
+            if (!m_syncStore->EnsureSchema(&syncErr)) {
+                ALOG_WARNING("kernel", "sync store init failed (single-node "
+                             "operation continues): " << syncErr);
             }
         }
         m_tools.Register(std::make_unique<DiaryTool>(&m_adminServer->GetDiaryManager()));
