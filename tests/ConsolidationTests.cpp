@@ -761,12 +761,170 @@ int TestFetchPendingByteBudget() {
     return 0;
 }
 
+// ============================================================================
+// #70 finding 1: ontology curation verbs — list/get/delete exposed at the
+// tool layer (reads available everywhere; delete agent-scoped, motivation
+// mandatory, mutation-logged). Plus finding 4 regression: missing
+// root_category must be a clear required-error, never a silent invalid
+// default.
+// ============================================================================
+
+int TestOntologyCurationVerbs() {
+    std::cerr << "  [#70] Ontology curation verbs...\n";
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    MemoryStore memStore(&dataStore);
+    SessionManager sessions(
+        std::make_unique<SqliteSessionStore>(&dataStore),
+        std::make_unique<DefaultSessionRouter>());
+    ontology::OntologyStore ontologyStore(&dataStore);
+    memory::MemoryFileStore fileStore(&dataStore);
+    AgentStore agentStore(&dataStore);
+    SessionReportStore reportStore(&dataStore);
+    ConsolidationTool tool(&memStore, &ontologyStore, &sessions,
+                           &fileStore, &agentStore, &reportStore, nullptr);
+
+    const std::string intakeKey = "\"__session_key\":\"consolidation:intake:agent1\"";
+    const std::string reviewKey = "\"__session_key\":\"consolidation:review:agent1\"";
+
+    // Seed two entities with properties via the upsert verb itself.
+    {
+        ToolCall call;
+        call.id = "o70a";
+        call.arguments =
+            "{\"action\":\"ontology:upsert\",\"__agent_id\":\"agent1\"," + intakeKey + ","
+            "\"params\":{\"root_category\":\"persons\",\"path\":\"persons/JunkTarget\","
+            "\"properties\":{\"origin\":{\"value\":\"rss-noise\"}}}}";
+        auto result = tool.Execute(call);
+        Assert(result.success, "upsert JunkTarget should succeed: " + result.error);
+    }
+    {
+        ToolCall call;
+        call.id = "o70b";
+        call.arguments =
+            "{\"action\":\"ontology:upsert\",\"__agent_id\":\"agent1\"," + intakeKey + ","
+            "\"params\":{\"root_category\":\"concepts\",\"path\":\"concepts/KeepIdea\"}}";
+        auto result = tool.Execute(call);
+        Assert(result.success, "upsert KeepIdea should succeed: " + result.error);
+    }
+
+    // F4 regression: missing root_category names the requirement — never a
+    // phantom "Invalid root_category: concept" the caller never sent.
+    {
+        ToolCall call;
+        call.id = "o70f4";
+        call.arguments =
+            "{\"action\":\"ontology:upsert\",\"__agent_id\":\"agent1\"," + intakeKey + ","
+            "\"params\":{\"path\":\"persons/NoCategory\"}}";
+        auto result = tool.Execute(call);
+        Assert(!result.success, "upsert without root_category should fail");
+        Assert(result.error.find("root_category is required") != std::string::npos,
+               "missing root_category should name the requirement: " + result.error);
+    }
+
+    // list: category-filtered, case-insensitive name filter.
+    {
+        ToolCall call;
+        call.id = "o70l";
+        call.arguments =
+            "{\"action\":\"ontology:list\",\"__agent_id\":\"agent1\"," + intakeKey + ","
+            "\"params\":{\"category\":\"persons\",\"name_contains\":\"junk\"}}";
+        auto result = tool.Execute(call);
+        Assert(result.success, "ontology:list should succeed: " + result.error);
+        Assert(result.output.find("JunkTarget") != std::string::npos,
+               "list should find JunkTarget via case-insensitive filter");
+        Assert(result.output.find("KeepIdea") == std::string::npos,
+               "category filter should exclude other roots");
+    }
+
+    // get by id: entity + properties.
+    {
+        ToolCall call;
+        call.id = "o70g";
+        call.arguments =
+            "{\"action\":\"ontology:get\",\"__agent_id\":\"agent1\"," + intakeKey + ","
+            "\"params\":{\"root_category\":\"persons\",\"path\":\"persons/JunkTarget\"}}";
+        auto result = tool.Execute(call);
+        Assert(result.success, "ontology:get should succeed: " + result.error);
+        Assert(result.output.find("rss-noise") != std::string::npos,
+               "get should return the seeded property");
+    }
+
+    // delete: motivation mandatory, agent-scoped, effective.
+    {
+        ToolCall noMotivation;
+        noMotivation.id = "o70d1";
+        noMotivation.arguments =
+            "{\"action\":\"ontology:delete\",\"__agent_id\":\"agent1\"," + reviewKey + ","
+            "\"params\":{\"path\":\"persons/JunkTarget\"}}";
+        // id required for delete — path-only should be rejected
+        auto r1 = tool.Execute(noMotivation);
+        Assert(!r1.success && r1.error.find("id is required") != std::string::npos,
+               "delete without id should name the requirement");
+
+        // find the id via list
+        ToolCall listCall;
+        listCall.id = "o70l2";
+        listCall.arguments =
+            "{\"action\":\"ontology:list\",\"__agent_id\":\"agent1\"," + intakeKey + ","
+            "\"params\":{\"name_contains\":\"JunkTarget\"}}";
+        auto listResult = tool.Execute(listCall);
+        Assert(listResult.success && listResult.output.find("\"id\":") != std::string::npos,
+               "list for delete should expose ids");
+
+        // extract id from the JSON (first entity)
+        Json::Value root;
+        Json::CharReaderBuilder rb;
+        std::string errs;
+        std::istringstream ls(listResult.output);
+        Assert(Json::parseFromStream(rb, ls, &root, &errs), "list output valid JSON");
+        const int64_t junkId = root["entities"][0]["id"].asInt64();
+
+        ToolCall foreign;
+        foreign.id = "o70d2";
+        foreign.arguments =
+            "{\"action\":\"ontology:delete\",\"__agent_id\":\"sable\"," + reviewKey + ","
+            "\"params\":{\"id\":" + std::to_string(junkId) + ",\"motivation\":\"sweep\"}}";
+        auto r2 = tool.Execute(foreign);
+        Assert(!r2.success && r2.error.find("does not belong") != std::string::npos,
+               "foreign agent must not delete another agent's entity");
+
+        ToolCall unmotivated;
+        unmotivated.id = "o70d3";
+        unmotivated.arguments =
+            "{\"action\":\"ontology:delete\",\"__agent_id\":\"agent1\"," + reviewKey + ","
+            "\"params\":{\"id\":" + std::to_string(junkId) + "}}";
+        auto r3 = tool.Execute(unmotivated);
+        Assert(!r3.success && r3.error.find("motivation is required") != std::string::npos,
+               "delete without motivation must be rejected");
+
+        ToolCall good;
+        good.id = "o70d4";
+        good.arguments =
+            "{\"action\":\"ontology:delete\",\"__agent_id\":\"agent1\"," + reviewKey + ","
+            "\"params\":{\"id\":" + std::to_string(junkId) +
+            ",\"motivation\":\"rss-noise cleanup (#70)\"}}";
+        auto r4 = tool.Execute(good);
+        Assert(r4.success, "motivated delete by owning agent should succeed: " + r4.error);
+
+        // gone from listing
+        auto afterList = tool.Execute(listCall);
+        Assert(afterList.success &&
+               afterList.output.find("JunkTarget") == std::string::npos,
+               "deleted entity must vanish from listings");
+    }
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
 int main() {
     std::cerr << "\n=== Consolidation Pipeline Tests ===\n\n";
     // #70 tests run first: the pre-existing intake-test crash below kills the
     // process before later tests can run (see ctest baseline).
     std::cerr << "-- #70: Receipt honesty & fetch budget --\n";
     TestPerspectiveReceiptHonesty();
+    TestOntologyCurationVerbs();
     TestPipelinePerspectiveFailurePropagates();
     TestFetchPendingByteBudget();
 
