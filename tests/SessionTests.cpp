@@ -3,8 +3,19 @@
 #include <string>
 #include <vector>
 
+#include <filesystem>
+#include <memory>
+
+#include <json/json.h>
+
 #include "animus_kernel/ConversationCompactor.h"
 #include "animus_kernel/DefaultSessionRouter.h"
+#include "animus_kernel/SessionNotesStore.h"
+#include "animus_kernel/SessionTagsStore.h"
+#include "animus_kernel/tools/SessionsTool.h"
+#include "animus_kernel/SessionManager.h"
+#include "animus_kernel/SqliteDataStore.h"
+#include "animus_kernel/SqliteSessionStore.h"
 #include "animus_kernel/InMemorySessionStore.h"
 #include "animus_kernel/SessionRoutingRule.h"
 #include "animus_kernel/SessionManager.h"
@@ -288,6 +299,210 @@ int TestSummaryProvenance() {
 
 } // namespace
 
+// ============================================================================
+// #77: sessions:history / sessions:search DB fallback — terminated and
+// persisted sessions must stay reachable; numeric ids and conversation ids
+// must resolve; search must be newest-first across sessions.
+// ============================================================================
+
+namespace {
+
+Json::Value ParseJsonOr(const std::string& text, int& failures) {
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errs;
+    std::istringstream stream(text);
+    if (!Json::parseFromStream(builder, stream, &root, &errs)) {
+        ++failures;
+        std::cerr << "[json] parse failed: " << errs << "\n";
+    }
+    return root;
+}
+
+std::string HistoryArgs(const std::string& agentId,
+                        const std::string& sessionKey) {
+    return "{\"action\":\"history\",\"__agent_id\":\"" + agentId +
+           "\",\"session_key\":\"" + sessionKey + "\"}";
+}
+
+std::string SearchArgs(const std::string& agentId, const std::string& query) {
+    return "{\"action\":\"search\",\"__agent_id\":\"" + agentId +
+           "\",\"query\":\"" + query + "\"}";
+}
+
+} // namespace
+
+int TestSessionsToolHistoryFallback() {
+    namespace fs = std::filesystem;
+    const std::string dbPath = "/tmp/animus_session_tests_77.db";
+    std::error_code ec;
+    fs::remove(dbPath, ec);
+
+    SqliteDataStore dataStore(dbPath);
+    SessionNotesStore notesStore(&dataStore);
+    SessionTagsStore tagsStore(&dataStore);
+    SessionManager manager(
+        std::make_unique<SqliteSessionStore>(&dataStore),
+        std::make_unique<DefaultSessionRouter>());
+    SessionsTool tool(&manager, &notesStore, &tagsStore, nullptr);
+
+    auto session = manager.GetOrCreate(
+        SessionKey{"scheduled", "daily_marketclose:buffett:1770000000", ""});
+    session->SetAgentId("buffett");
+    SessionTurn turn;
+    turn.role = "assistant";
+    turn.content = "ORCL close assessment: defensive flip confirmed";
+    turn.unix_ms = 1770000000000ULL;
+    session->AddTurn(std::move(turn));
+    manager.GetStore().FlushSession(session->Id());
+    session->MarkTerminated();
+    manager.GetStore().FlushSession(session->Id());
+
+    int failures = 0;
+
+    // 1. "session_<id>" — the exact form that failed in production (#77).
+    {
+        ToolCall call;
+        call.id = "t-by-id";
+        call.arguments = HistoryArgs(
+            "buffett", "session_" + std::to_string(session->Id()));
+        auto result = tool.Execute(call);
+        if (!result.success)
+            return Fail(1, "history by session_<id> should succeed");
+        auto body = ParseJsonOr(result.output, failures);
+        if (body["source"].asString() != "database")
+            return Fail(2, "history by id should be database-sourced");
+        if (!body["terminated"].asBool())
+            return Fail(3, "terminated session should report terminated=true");
+        if (body["messages"].size() != 1 ||
+            body["messages"][0]["content"].asString().find("ORCL") ==
+                std::string::npos)
+            return Fail(4, "history by id should return persisted content");
+    }
+
+    // 2. Conversation id form.
+    {
+        ToolCall call;
+        call.id = "t-by-conv";
+        call.arguments = HistoryArgs(
+            "buffett", "daily_marketclose:buffett:1770000000");
+        auto result = tool.Execute(call);
+        if (!result.success)
+            return Fail(5, "history by conversation id should succeed");
+        auto body = ParseJsonOr(result.output, failures);
+        if (body["source"].asString() != "database")
+            return Fail(6, "conversation-id lookup should be database-sourced");
+    }
+
+    // 3. Full key string — still resolved (live registry match).
+    {
+        ToolCall call;
+        call.id = "t-by-key";
+        call.arguments = HistoryArgs(
+            "buffett", "scheduled|daily_marketclose:buffett:1770000000|");
+        auto result = tool.Execute(call);
+        if (!result.success)
+            return Fail(7, "history by key string should succeed");
+        auto body = ParseJsonOr(result.output, failures);
+        if (body["terminated"].asBool() != true)
+            return Fail(8, "key-string history should still see termination");
+    }
+
+    // 4. Ownership enforced on the fallback path.
+    {
+        ToolCall call;
+        call.id = "t-foreign";
+        call.arguments = HistoryArgs(
+            "sable", "session_" + std::to_string(session->Id()));
+        auto result = tool.Execute(call);
+        if (result.success)
+            return Fail(9, "foreign agent must not read another agent's session");
+    }
+
+    // 5. Unknown key — error names the accepted formats.
+    {
+        ToolCall call;
+        call.id = "t-unknown";
+        call.arguments = HistoryArgs("buffett", "no|such|session");
+        auto result = tool.Execute(call);
+        if (result.success) return Fail(10, "unknown session must fail");
+        if (result.error.find("accepted") == std::string::npos)
+            return Fail(11, "error should list accepted formats");
+    }
+
+    if (failures) return Fail(12, "json parse failures in history asserts");
+    return 0;
+}
+
+int TestSessionsToolSearchRecency() {
+    namespace fs = std::filesystem;
+    const std::string dbPath = "/tmp/animus_session_tests_77b.db";
+    std::error_code ec;
+    fs::remove(dbPath, ec);
+
+    SqliteDataStore dataStore(dbPath);
+    SessionNotesStore notesStore(&dataStore);
+    SessionTagsStore tagsStore(&dataStore);
+    SessionManager manager(
+        std::make_unique<SqliteSessionStore>(&dataStore),
+        std::make_unique<DefaultSessionRouter>());
+    SessionsTool tool(&manager, &notesStore, &tagsStore, nullptr);
+
+    struct Seed {
+        const char* connector;
+        const char* conversation;
+        std::uint64_t lastActive;
+        const char* content;
+    };
+    const Seed seeds[] = {
+        {"scheduled", "older:run", 1000000, "needleword in the older run"},
+        {"scheduled", "newer:run", 2000000, "needleword in the newer run"},
+        {"scheduled", "foreign:agent", 3000000, "needleword owned by someone else"},
+    };
+    for (const auto& s : seeds) {
+        auto session = manager.GetOrCreate(SessionKey{s.connector, s.conversation, ""});
+        session->SetAgentId(std::string(s.conversation) == "foreign:agent"
+                                ? "sable" : "buffett");
+        session->SetLastActiveUnixMs(s.lastActive);
+        SessionTurn turn;
+        turn.role = "assistant";
+        turn.content = s.content;
+        turn.unix_ms = s.lastActive;
+        session->AddTurn(std::move(turn));
+        manager.GetStore().FlushSession(session->Id());
+        session->MarkTerminated();
+        manager.GetStore().FlushSession(session->Id());
+    }
+
+    // Case-insensitive query across terminated sessions, agent-scoped,
+    // newest match first.
+    ToolCall call;
+    call.id = "t-search";
+    call.arguments = SearchArgs("buffett", "NEEDLEWORD");
+    auto result = tool.Execute(call);
+    if (!result.success) return Fail(1, "search should succeed");
+
+    int failures = 0;
+    auto body = ParseJsonOr(result.output, failures);
+    const auto& results = body["results"];
+    if (body.isMember("results") ? results.size() != 2 : true) {
+        // Fallback: some result shapes use different keys; inspect items.
+    }
+    // Locate the items array regardless of key name.
+    Json::Value items;
+    if (body.isMember("results")) items = body["results"];
+    else if (body.isMember("matches")) items = body["matches"];
+    else items = body["messages"];
+    if (items.size() != 2)
+        return Fail(2, "search should find exactly the agent's two matches");
+    if (items[0]["content"].asString().find("newer") == std::string::npos)
+        return Fail(3, "newest match must be returned first");
+    if (items[1]["content"].asString().find("older") == std::string::npos)
+        return Fail(4, "second match should be the older session");
+    if (failures) return Fail(5, "json parse failures in search asserts");
+    return 0;
+}
+
 int main() {
     if (const int rc = TestSessionRoutingAndAccess(); rc != 0) {
         return rc;
@@ -302,6 +517,14 @@ int main() {
     }
 
     if (const int rc = TestSummaryProvenance(); rc != 0) {
+        return rc;
+    }
+
+    if (const int rc = TestSessionsToolHistoryFallback(); rc != 0) {
+        return rc;
+    }
+
+    if (const int rc = TestSessionsToolSearchRecency(); rc != 0) {
         return rc;
     }
 

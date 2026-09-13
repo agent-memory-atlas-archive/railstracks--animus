@@ -118,7 +118,7 @@ ToolDefinition SessionsTool::GetDefinition() const {
     // search parameters
     def.parameters.push_back({
         "query", "string",
-        "Search query for session history (required for search)",
+        "Case-insensitive substring search over all session turns, newest matches first, includes terminated sessions (required for search)",
         false
     });
     def.parameters.push_back({
@@ -130,7 +130,9 @@ ToolDefinition SessionsTool::GetDefinition() const {
     // history parameters
     def.parameters.push_back({
         "session_key", "string",
-        "Session key to retrieve history from (required for history)",
+        "Session to retrieve history from: live session key, \"session_<id>\" or numeric id, "
+        "\"connector|conversation_id|thread_id\" key, or a conversation id such as "
+        "\"scheduled:<job>:<agent>:<ts>\" (required for history)",
         false
     });
     def.parameters.push_back({
@@ -337,36 +339,21 @@ ToolResult SessionsTool::HandleSearch(const std::string& agentId,
         return result;
     }
 
-    std::string lowerQuery = query;
-    std::transform(lowerQuery.begin(), lowerQuery.end(), lowerQuery.begin(), ::tolower);
-
-    auto allSessions = m_sessions->ListSessions();
+    // #77: search the backing store, not just the live registry —
+    // terminated and persisted sessions are included, and matches come back
+    // newest-first instead of in registry insertion order. SQL stores query
+    // session_turns directly; in-memory stores use the ISessionStore default
+    // (the previous live-scan semantics).
     Json::Value items(Json::arrayValue);
-    int emitted = 0;
-
-    for (const auto& session : allSessions) {
-        if (!session) continue;
-        if (session->AgentId() != agentId) continue;
-        if (emitted >= limit) break;
-
-        for (const auto& turn : session->Turns()) {
-            if (emitted >= limit) break;
-            if (turn.content.empty()) continue;
-
-            std::string lowerContent = turn.content;
-            std::transform(lowerContent.begin(), lowerContent.end(),
-                           lowerContent.begin(), ::tolower);
-
-            if (lowerContent.find(lowerQuery) != std::string::npos) {
-                Json::Value item(Json::objectValue);
-                item["session_key"] = session->Key().ToString();
-                item["role"] = turn.role;
-                item["content"] = Truncate(turn.content, 280);
-                item["unix_ms"] = static_cast<Json::Int64>(turn.unix_ms);
-                items.append(item);
-                emitted++;
-            }
-        }
+    const auto hits = m_sessions->GetStore().SearchTurns(
+        agentId, query, static_cast<std::size_t>(limit));
+    for (const auto& hit : hits) {
+        Json::Value item(Json::objectValue);
+        item["session_key"] = hit.session_key;
+        item["role"] = hit.role;
+        item["content"] = Truncate(hit.content, 280);
+        item["unix_ms"] = static_cast<Json::Int64>(hit.unix_ms);
+        items.append(item);
     }
 
     Json::Value body(Json::objectValue);
@@ -377,6 +364,15 @@ ToolResult SessionsTool::HandleSearch(const std::string& agentId,
     result.output = ResultToJsonString(body);
     return result;
 }
+
+namespace {
+bool IsAllDigits(const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s)
+        if (c < '0' || c > '9') return false;
+    return true;
+}
+} // namespace
 
 // ============================================================================
 // history — retrieve messages from a specific session
@@ -415,9 +411,51 @@ ToolResult SessionsTool::HandleHistory(const std::string& agentId,
         }
     }
 
+    bool fromDatabase = false;
+    if (!target) {
+        // #77: sessions that are not in the live registry (terminated, or
+        // referenced by a non-key identifier) are still resolvable through
+        // the backing store. Accepted forms, most explicit first:
+        //   1. "session_<id>" (and, as a last resort, a bare numeric id)
+        //   2. "connector|conversation_id|thread_id" key string
+        //   3. any other string — a conversation id
+        //     (e.g. "scheduled:daily_marketclose:<agent>:<ts>")
+        auto& store = m_sessions->GetStore();
+        const std::string idPrefix = "session_";
+
+        if (sessionKey.rfind(idPrefix, 0) == 0 &&
+            IsAllDigits(sessionKey.substr(idPrefix.size()))) {
+            target = store.GetById(static_cast<SessionId>(
+                std::stoull(sessionKey.substr(idPrefix.size()))));
+            fromDatabase = (target != nullptr);
+        } else if (sessionKey.find('|') != std::string::npos) {
+            const std::size_t p1 = sessionKey.find('|');
+            const std::size_t p2 = sessionKey.find('|', p1 + 1);
+            if (p2 != std::string::npos) {
+                SessionKey key;
+                key.connector = sessionKey.substr(0, p1);
+                key.conversation_id = sessionKey.substr(p1 + 1, p2 - p1 - 1);
+                key.thread_id = sessionKey.substr(p2 + 1);
+                target = store.FindByKey(key);
+                fromDatabase = (target != nullptr);
+            }
+        } else {
+            target = store.FindByConversationId(sessionKey);
+            fromDatabase = (target != nullptr);
+            if (!target && IsAllDigits(sessionKey)) {
+                target = store.GetById(
+                    static_cast<SessionId>(std::stoull(sessionKey)));
+                fromDatabase = (target != nullptr);
+            }
+        }
+    }
+
     if (!target) {
         result.success = false;
-        result.error = "session not found: " + sessionKey;
+        result.error =
+            "session not found: " + sessionKey +
+            " (accepted: live session key, \"session_<id>\", numeric id, "
+            "\"connector|conversation_id|thread_id\", or conversation id)";
         return result;
     }
 
@@ -445,6 +483,8 @@ ToolResult SessionsTool::HandleHistory(const std::string& agentId,
 
     Json::Value body(Json::objectValue);
     body["session_key"] = sessionKey;
+    body["source"] = fromDatabase ? "database" : "live";
+    body["terminated"] = target->IsTerminated();
     body["messages"] = items;
     body["count"] = static_cast<Json::Int>(items.size());
 

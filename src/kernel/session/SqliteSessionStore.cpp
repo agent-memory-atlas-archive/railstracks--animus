@@ -730,6 +730,92 @@ std::shared_ptr<Session> SqliteSessionStore::GetById(SessionId id) {
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// #77: persisted-session fallback reads
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<Session> SqliteSessionStore::FindByKey(const SessionKey& key) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    SessionId id = 0;
+    {
+        auto stmt = m_store->Prepare(
+            "SELECT id FROM sessions "
+            "WHERE connector = ? AND conversation_id = ? AND thread_id = ? "
+            "ORDER BY last_active_unix_ms DESC LIMIT 1");
+        if (!stmt) return nullptr;
+        stmt->BindText(1, key.connector);
+        stmt->BindText(2, key.conversation_id);
+        stmt->BindText(3, key.thread_id);
+        if (!stmt->Step()) return nullptr;
+        id = static_cast<SessionId>(stmt->ColumnInt64(0));
+    }
+
+    auto session = LoadFromDbById(id);
+    if (session) m_entries.push_back({session});
+    return session;
+}
+
+std::shared_ptr<Session> SqliteSessionStore::FindByConversationId(
+        const std::string& conversationId) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    SessionId id = 0;
+    {
+        auto stmt = m_store->Prepare(
+            "SELECT id FROM sessions WHERE conversation_id = ? "
+            "ORDER BY last_active_unix_ms DESC LIMIT 1");
+        if (!stmt) return nullptr;
+        stmt->BindText(1, conversationId);
+        if (!stmt->Step()) return nullptr;
+        id = static_cast<SessionId>(stmt->ColumnInt64(0));
+    }
+
+    auto session = LoadFromDbById(id);
+    if (session) m_entries.push_back({session});
+    return session;
+}
+
+std::vector<ISessionStore::TurnHit> SqliteSessionStore::SearchTurns(
+        const std::string& agentId,
+        const std::string& needle,
+        std::size_t limit) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    std::vector<TurnHit> hits;
+    if (needle.empty()) return hits;
+
+    // LOWER() on both sides keeps this case-insensitive on every dialect
+    // (PostgreSQL LIKE is case-sensitive; SQLite LIKE is not). Raw-table
+    // scan sees compacted turns too — deliberately: for recovery searches,
+    // forensic completeness beats prompt-visibility purity.
+    auto stmt = m_store->Prepare(
+        "SELECT t.session_id, s.connector, s.conversation_id, s.thread_id, "
+        "       t.role, t.content, t.unix_ms "
+        "FROM session_turns t JOIN sessions s ON s.id = t.session_id "
+        "WHERE s.agent_id = ? AND LOWER(t.content) LIKE LOWER(?) "
+        "ORDER BY t.id DESC LIMIT ?");
+    if (!stmt) return hits;
+    stmt->BindText(1, agentId);
+    stmt->BindText(2, "%" + needle + "%");
+    stmt->BindInt(3, static_cast<int>(limit));
+
+    while (stmt->Step()) {
+        TurnHit hit;
+        hit.session_id = static_cast<SessionId>(stmt->ColumnInt64(0));
+        SessionKey key;
+        key.connector = stmt->ColumnText(1);
+        key.conversation_id = stmt->ColumnText(2);
+        key.thread_id = stmt->ColumnText(3);
+        hit.session_key = key.ToString();
+        hit.role = stmt->ColumnText(4);
+        hit.content = stmt->ColumnText(5);
+        hit.unix_ms = static_cast<std::uint64_t>(stmt->ColumnInt64(6));
+        hits.push_back(std::move(hit));
+    }
+    return hits;
+}
+
 std::shared_ptr<Session> SqliteSessionStore::LoadFromDbById(SessionId id) {
     auto stmt = m_store->Prepare(
         "SELECT id, connector, conversation_id, thread_id, provider_id, summary, "

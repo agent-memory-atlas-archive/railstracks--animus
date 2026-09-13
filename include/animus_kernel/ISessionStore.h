@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -107,6 +108,84 @@ public:
         int limit) {
         // Default: no-op (stores that don't implement this return empty)
         return {};
+    }
+
+    // ------------------------------------------------------------------
+    // #77: persisted-session fallback reads.
+    // History/search previously only consulted the live registry; sessions
+    // that exist only in the backing store were unreachable ("data appears
+    // lost" while sitting in the sessions/session_turns tables).
+    // ------------------------------------------------------------------
+
+    // Resolve a session by full key or by bare conversation id (e.g.
+    // "scheduled:daily_marketclose:<agent>:<ts>"). Most recently active
+    // match wins when several sessions share a conversation id. SQL stores
+    // query the sessions table directly (like ListPaginated); the default
+    // scans live sessions, which keeps in-memory stores correct.
+    virtual std::shared_ptr<Session> FindByKey(const SessionKey& key) {
+        for (auto& s : List()) {
+            const auto& k = s->Key();
+            if (k.connector == key.connector &&
+                k.conversation_id == key.conversation_id &&
+                k.thread_id == key.thread_id)
+                return s;
+        }
+        return nullptr;
+    }
+    virtual std::shared_ptr<Session> FindByConversationId(
+            const std::string& conversationId) {
+        std::shared_ptr<Session> best;
+        for (auto& s : List()) {
+            if (s->Key().conversation_id != conversationId) continue;
+            if (!best || s->LastActiveUnixMs() > best->LastActiveUnixMs())
+                best = s;
+        }
+        return best;
+    }
+
+    // Turn-level content search across all sessions for one agent
+    // (case-insensitive substring), newest matches first. SQL stores query
+    // session_turns joined with sessions; the default reproduces the
+    // previous live-registry scan for stores without tables.
+    struct TurnHit {
+        SessionId session_id{0};
+        std::string session_key;
+        std::string role;
+        std::string content;
+        std::uint64_t unix_ms{0};
+    };
+    virtual std::vector<TurnHit> SearchTurns(const std::string& agentId,
+                                             const std::string& needle,
+                                             std::size_t limit) {
+        std::vector<TurnHit> hits;
+        if (needle.empty()) return hits;
+        std::string lowerNeedle;
+        lowerNeedle.reserve(needle.size());
+        for (char c : needle)
+            lowerNeedle += static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c)));
+        for (auto& s : List()) {
+            if (s->AgentId() != agentId) continue;
+            for (const auto& t : s->Turns()) {
+                if (t.content.empty()) continue;
+                std::string lowerContent;
+                lowerContent.reserve(t.content.size());
+                for (char c : t.content)
+                    lowerContent += static_cast<char>(
+                        std::tolower(static_cast<unsigned char>(c)));
+                if (lowerContent.find(lowerNeedle) == std::string::npos)
+                    continue;
+                TurnHit hit;
+                hit.session_id = s->Id();
+                hit.session_key = s->Key().ToString();
+                hit.role = t.role;
+                hit.content = t.content;
+                hit.unix_ms = t.unix_ms;
+                hits.push_back(std::move(hit));
+                if (hits.size() >= limit) return hits;
+            }
+        }
+        return hits;
     }
 
     // Mark specific turns as processed by turn_id
