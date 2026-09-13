@@ -1,4 +1,8 @@
 #include "animus_kernel/admin/DiaryManager.h"
+#include "animus_kernel/MemoryFileStore.h"
+#include "animus_kernel/MemorySearch.h"
+#include "animus_kernel/MemoryStore.h"
+#include "animus_kernel/OntologyStore.h"
 #include "animus_kernel/admin/AiDiaryFormat.h"
 #include "animus_kernel/SqliteDataStore.h"
 #include "animus_kernel/tools/DiaryTool.h"
@@ -712,6 +716,92 @@ int TestStoreSearchByAgentPagination() {
 
 } // anonymous namespace
 
+
+// ============================================================================
+// #71: diary search must match memory search semantics — token/FTS matching
+// (case-insensitive, OR across words, stop-word removal, ranked) instead of
+// literal case-sensitive LIKE.
+// ============================================================================
+
+int TestSearchTokenMatching() {
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    memory::MemoryStore memoryStore(&dataStore);
+    ontology::OntologyStore ontologyStore(&dataStore);
+    memory::MemoryFileStore memoryFileStore(&dataStore);
+    DiaryStore diaryStore(&dataStore);
+
+    struct { std::string id; std::string content; int64_t ts; } seed[] = {
+        {"d71_1", "OPERATIONAL LESSONS from the week", 1000},
+        {"d71_2", "calibration calibration calibration run summary", 2000},
+        {"d71_3", "calibration note for the antenna", 3000},
+        {"d71_4", "unrelated filler content about trucks", 4000},
+    };
+    for (const auto& s : seed) {
+        DiaryEntry entry;
+        entry.id = s.id;
+        entry.agent_id = "agent1";
+        entry.timestamp_unix_ms = s.ts;
+        entry.layer = "core";
+        entry.content = s.content;
+        entry.tags_json = "[]";
+        entry.session_id = "sess71";
+        auto created = diaryStore.Create(entry);
+        Assert(created.id == s.id, "create " + s.id);
+    }
+
+    // Constructing MemorySearch creates the diary FTS schema + triggers and
+    // backfills entries written before it existed (#81 docsize backfill).
+    memory::MemorySearch search(&memoryStore, &ontologyStore, &memoryFileStore, &diaryStore);
+
+    // Case-insensitive token match: upper-case content, lower-case query.
+    auto upper = diaryStore.SearchByAgent("agent1", "operational", 20, 0);
+    Assert(upper.size() == 1, "case-insensitive token match finds entry");
+    if (!upper.empty())
+        Assert(upper[0].content.find("OPERATIONAL") != std::string::npos,
+               "case-insensitive token match returns the right entry");
+
+    // Multi-word OR: phrase absent verbatim, entry still found (the #71 report).
+    auto multi = diaryStore.SearchByAgent("agent1", "operational lesson", 20, 0);
+    Assert(multi.size() == 1, "multi-word OR finds entry whose words appear separately");
+
+    // Ranking: denser match first (bm25), not just chronological.
+    auto ranked = diaryStore.SearchByAgent("agent1", "calibration", 20, 0);
+    Assert(ranked.size() == 2, "both calibration entries found");
+    if (ranked.size() == 2)
+        Assert(ranked[0].content.find("run summary") != std::string::npos,
+               "relevance-ranked: denser match ranks first");
+
+    // Stop-word-only query: falls back to LIKE (old semantics), no error.
+    auto stop = diaryStore.SearchByAgent("agent1", "the of", 20, 0);
+    Assert(stop.empty(), "stop-word-only query returns no rows without error");
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
+int TestSearchFallsBackWithoutFtsSchema() {
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    DiaryStore diaryStore(&dataStore);   // no MemorySearch: no FTS schema
+
+    DiaryEntry entry;
+    entry.id = "d71_fb";
+    entry.agent_id = "a1";
+    entry.timestamp_unix_ms = 5000;
+    entry.layer = "core";
+    entry.content = "Fallback literal topic before FTS schema exists";
+    entry.tags_json = "[]";
+    entry.session_id = "sess_fb";
+    Assert(diaryStore.Create(entry).id == "d71_fb", "create fallback entry");
+
+    auto hits = diaryStore.SearchByAgent("a1", "topic", 20, 0);
+    Assert(hits.size() == 1, "search works before FTS schema exists (LIKE fallback)");
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
 int main() {
     int total = 0;
     int failed = 0;
@@ -748,6 +838,8 @@ int main() {
     RUN(TestDiaryToolListAction);
     RUN(TestStoreListByAgentPagination);
     RUN(TestStoreSearchByAgentPagination);
+    RUN(TestSearchTokenMatching);
+    RUN(TestSearchFallsBackWithoutFtsSchema);
 
     #undef RUN
 

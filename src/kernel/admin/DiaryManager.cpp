@@ -1,6 +1,7 @@
 
 #include "animus_kernel/SchemaHelpers.h"
 #include "animus_kernel/admin/DiaryManager.h"
+#include "animus_kernel/SearchQueryText.h"
 #include "animus_kernel/IDataStore.h"
 
 #include <chrono>
@@ -185,12 +186,79 @@ std::vector<DiaryEntry> DiaryStore::ListByAgent(
     return entries;
 }
 
+namespace {
+
+// Shared row reader for diary search result shapes (column order must match
+// the SELECT lists in SearchByAgent).
+DiaryEntry ReadDiaryEntryRow(IStatement* stmt) {
+    DiaryEntry entry;
+    entry.id = stmt->ColumnText(0);
+    entry.agent_id = stmt->ColumnText(1);
+    entry.timestamp_unix_ms = stmt->ColumnInt64(2);
+    entry.layer = stmt->ColumnText(3);
+    entry.content = stmt->ColumnText(4);
+    entry.tags_json = stmt->ColumnText(5);
+    entry.session_id = stmt->ColumnText(6);
+    return entry;
+}
+
+} // namespace
+
 std::vector<DiaryEntry> DiaryStore::SearchByAgent(
         const std::string& agentId,
         const std::string& query,
         int limit,
         int offset) {
-    // LIKE-based search for v1. FTS5 can replace this for better performance.
+    // #71: token search with memory-search semantics — words OR-matched with
+    // stop-word removal, case-insensitive, ranked by relevance — via the
+    // diary full-text index (tsvector on PostgreSQL, FTS5 on SQLite).
+    // LIKE remains the fallback for degenerate queries (no indexable tokens)
+    // and for stores where the FTS schema has not been created yet.
+    const auto terms = memory::TokenizeSearchTerms(query);
+    if (!terms.empty()) {
+        if (m_store->Dialect() == DataStoreDialect::PostgreSQL) {
+            const std::string tsQuery = memory::PgTsQueryFromNaturalLanguage(query);
+            // ts_rank: higher is better.
+            auto stmt = m_store->Prepare(
+                "SELECT e.entry_id, e.agent_id, e.timestamp_unix_ms, e.layer, e.content, e.tags, e.session_id "
+                "FROM diary_entries e "
+                "WHERE e.agent_id = ? AND e.search_vector @@ to_tsquery('english', ?) "
+                "ORDER BY ts_rank(e.search_vector, to_tsquery('english', ?)) DESC, "
+                "e.timestamp_unix_ms DESC LIMIT ? OFFSET ?");
+            if (stmt) {
+                stmt->BindText(1, agentId);
+                stmt->BindText(2, tsQuery);
+                stmt->BindText(3, tsQuery);
+                stmt->BindInt(4, limit);
+                stmt->BindInt(5, offset);
+                std::vector<DiaryEntry> entries;
+                while (stmt->Step()) entries.push_back(ReadDiaryEntryRow(stmt.get()));
+                stmt->Finalize();
+                return entries;
+            }
+        } else {
+            const std::string ftsQuery = memory::FtsQueryFromNaturalLanguage(query);
+            // FTS5 bm25: lower (more negative) is better.
+            auto stmt = m_store->Prepare(
+                "SELECT e.entry_id, e.agent_id, e.timestamp_unix_ms, e.layer, e.content, e.tags, e.session_id "
+                "FROM diary_entries_fts "
+                "JOIN diary_entries e ON e.id = diary_entries_fts.rowid "
+                "WHERE diary_entries_fts MATCH ? AND e.agent_id = ? "
+                "ORDER BY bm25(diary_entries_fts), e.timestamp_unix_ms DESC LIMIT ? OFFSET ?");
+            if (stmt) {
+                stmt->BindText(1, ftsQuery);
+                stmt->BindText(2, agentId);
+                stmt->BindInt(3, limit);
+                stmt->BindInt(4, offset);
+                std::vector<DiaryEntry> entries;
+                while (stmt->Step()) entries.push_back(ReadDiaryEntryRow(stmt.get()));
+                stmt->Finalize();
+                return entries;
+            }
+        }
+    }
+
+    // LIKE fallback (previous v1 behavior).
     std::string sql =
         "SELECT entry_id, agent_id, timestamp_unix_ms, layer, content, tags, session_id "
         "FROM diary_entries WHERE agent_id = ? AND content LIKE ? "
@@ -205,17 +273,7 @@ std::vector<DiaryEntry> DiaryStore::SearchByAgent(
     stmt->BindInt(4, offset);
 
     std::vector<DiaryEntry> entries;
-    while (stmt->Step()) {
-        DiaryEntry entry;
-        entry.id = stmt->ColumnText(0);
-        entry.agent_id = stmt->ColumnText(1);
-        entry.timestamp_unix_ms = stmt->ColumnInt64(2);
-        entry.layer = stmt->ColumnText(3);
-        entry.content = stmt->ColumnText(4);
-        entry.tags_json = stmt->ColumnText(5);
-        entry.session_id = stmt->ColumnText(6);
-        entries.push_back(std::move(entry));
-    }
+    while (stmt->Step()) entries.push_back(ReadDiaryEntryRow(stmt.get()));
     stmt->Finalize();
     return entries;
 }
