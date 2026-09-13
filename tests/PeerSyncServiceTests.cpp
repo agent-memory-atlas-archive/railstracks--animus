@@ -217,6 +217,20 @@ int64_t CountRows(IDataStore* store, const std::string& table) {
     return q->ColumnInt64(0);
 }
 
+std::string DigestsJson(SyncStore& from) {
+    std::string out = "\"digests\":[";
+    bool first = true;
+    for (const auto& d : from.TableDigests()) {
+        if (!first) out += ",";
+        first = false;
+        out += "{\"table\":\"" + d.table + "\""
+             + ",\"count\":" + std::to_string(d.count)
+             + ",\"max_id\":" + std::to_string(d.maxId)
+             + ",\"sum_last_ms\":" + std::to_string(d.sumLastMs) + "}";
+    }
+    return out + "]";
+}
+
 int64_t WriteMemory(memory::MemoryStore& m, const std::string& agent,
                     const std::string& text) {
     memory::Observation o;
@@ -458,6 +472,124 @@ int main() {
             }
         }
         Assert(saw5, "repeat pulls from node 5 counted");
+    }
+
+    // ------------------------------------------------------------------
+    std::cout << "[digests] TableDigests reflects row counts\n";
+    {
+        Node a(1, "digests");
+        WriteMemory(a.memory, "ag", "digest probe one");
+        WriteMemory(a.memory, "ag", "digest probe two");
+        const int64_t obsRows = CountRows(&a.dataStore, "observations");
+        Assert(obsRows == 2, "two observations written");
+        bool found = false;
+        for (const auto& d : a.sync.TableDigests()) {
+            if (d.table == "observations") {
+                found = d.count == 2 && d.maxId > 0;
+            }
+        }
+        Assert(found, "digest for observations reports count 2 + max_id");
+    }
+
+    // ------------------------------------------------------------------
+    std::cout << "[no-spurious-heal] steady state never resets the cursor\n";
+    {
+        Node a(1, "steady");
+        Node b(2, "steady-b");
+        WriteMemory(b.memory, "ag", "steady state row");
+        const int64_t bMax = b.sync.MaxOutboxId();
+        Assert(bMax > 0, "B published");
+
+        FakePeer peer([&](const std::string& path, const std::string&) {
+            if (path.rfind("/api/v1/sync/handshake", 0) == 0) {
+                return std::string("{\"protocol\":1,\"node_id\":2,"
+                    "\"tables\":[\"observations\"],\"max_outbox_id\":"
+                    + std::to_string(b.sync.MaxOutboxId())
+                    + "," + DigestsJson(b.sync) + "}");
+            }
+            if (path.rfind("/api/v1/sync/outbox", 0) == 0) {
+                size_t s = path.find("since=");
+                int64_t since = s == std::string::npos
+                    ? 0 : std::strtoll(path.c_str() + s + 6, nullptr, 10);
+                return OutboxJson(b.sync, since, 500, nullptr);
+            }
+            return std::string("{} not found");
+        });
+
+        PeerSyncService svc(&a.sync, { peer.Url() }, "");
+        svc.SyncOnce();   // full sync
+        svc.SyncOnce();   // idle pass — nothing new
+        svc.SyncOnce();   // idle pass
+        Json::Value st = svc.StatusJson();
+        const Json::Value& p = st["peers"][0];
+        Assert(p["state"].asString() == "healthy", "peer healthy");
+        Assert(p.get("heal_total", 0).asUInt64() == 0,
+               "no heal in steady state");
+        Assert(p["cursor"].asInt64() == bMax,
+               "cursor parked at peer's max");
+        Assert(CountRows(&a.dataStore, "observations")
+               == CountRows(&b.dataStore, "observations"),
+               "counts converged");
+    }
+
+    // ------------------------------------------------------------------
+    std::cout << "[anti-entropy-heal] partial restore detected + replayed\n";
+    {
+        Node a(1, "heal");
+        Node b(2, "heal-b");
+        WriteMemory(b.memory, "ag", "heal row one");
+        WriteMemory(b.memory, "ag", "heal row two");
+        WriteMemory(b.memory, "ag", "heal row three");
+        Assert(b.sync.MaxOutboxId() > 0, "B published");
+
+        FakePeer peer([&](const std::string& path, const std::string&) {
+            if (path.rfind("/api/v1/sync/handshake", 0) == 0) {
+                return std::string("{\"protocol\":1,\"node_id\":2,"
+                    "\"tables\":[\"observations\"],\"max_outbox_id\":"
+                    + std::to_string(b.sync.MaxOutboxId())
+                    + "," + DigestsJson(b.sync) + "}");
+            }
+            if (path.rfind("/api/v1/sync/outbox", 0) == 0) {
+                size_t s = path.find("since=");
+                int64_t since = s == std::string::npos
+                    ? 0 : std::strtoll(path.c_str() + s + 6, nullptr, 10);
+                return OutboxJson(b.sync, since, 500, nullptr);
+            }
+            return std::string("{} not found");
+        });
+
+        PeerSyncService svc(&a.sync, { peer.Url() }, "");
+        svc.SyncOnce();   // full sync: cursor parks at B's max
+        Assert(CountRows(&a.dataStore, "observations") == 3,
+               "three rows synced initially");
+
+        // Simulate the partial-restore disaster: rows vanish locally
+        // while the persisted cursor survives PAST every record that
+        // could rebuild them (backup predates the rows but sync_control
+        // was restored from a later snapshot).
+        Assert(a.dataStore.Exec("DELETE FROM observations"),
+               "rows wiped (restore)");
+        Assert(CountRows(&a.dataStore, "observations") == 0, "table empty");
+
+        // Pass 2: pull finds nothing new; heal check fires at pass end.
+        svc.SyncOnce();
+        // Pass 3: replay from cursor 0 rebuilds the table.
+        svc.SyncOnce();
+
+        Json::Value st = svc.StatusJson();
+        const Json::Value& p = st["peers"][0];
+        Assert(p.get("heal_total", 0).asUInt64() == 1, "exactly one heal");
+        Assert(p.isMember("last_heal_ms"), "heal timestamp reported");
+        Assert(CountRows(&a.dataStore, "observations") == 3,
+               "table rebuilt via full replay");
+        Assert(p["cursor"].asInt64() == b.sync.MaxOutboxId(),
+               "cursor parked again after replay");
+
+        // And it does NOT loop: an idle pass after healing stays put.
+        svc.SyncOnce();
+        Json::Value st2 = svc.StatusJson();
+        Assert(st2["peers"][0].get("heal_total", 0).asUInt64() == 1,
+               "no repeated heal after convergence");
     }
 
     if (g_failures == 0) {

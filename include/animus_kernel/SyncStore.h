@@ -52,6 +52,25 @@ public:
     int64_t MaxOutboxId();
 
     // Per-peer pull cursors (the peer's progress through OUR outbox).
+    // Per-table digest over the agent-global tables for anti-entropy:
+    // row count + max id from the table itself, sum of version stamps from
+    // sync_row_versions. Used by the handshake to let peers detect
+    // divergence the outbox alone can't explain (e.g. a datadir restored
+    // from a partial backup carries a stale cursor past missing rows).
+    struct TableDigest {
+        std::string table;
+        int64_t count{0};
+        int64_t maxId{0};
+        int64_t sumLastMs{0};
+    };
+    std::vector<TableDigest> TableDigests();
+
+    // Anti-entropy support: drop the version stamps for one table so a
+    // full outbox replay can re-apply rows whose stamps survived the
+    // disappearance of the rows themselves (partial-restore corruption —
+    // stamps claim knowledge the table no longer has).
+    void ClearTableVersions(const std::string& table);
+
     int64_t GetPeerCursor(int64_t peerNode);   // 0 = from the beginning
     bool SetPeerCursor(int64_t peerNode, int64_t outboxId);
 

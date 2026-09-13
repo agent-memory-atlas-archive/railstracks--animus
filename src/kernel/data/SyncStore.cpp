@@ -320,6 +320,43 @@ int64_t SyncStore::MaxOutboxId() {
     return q->ColumnInt64(0);
 }
 
+std::vector<SyncStore::TableDigest> SyncStore::TableDigests() {
+    std::vector<TableDigest> out;
+    if (!m_store) return out;
+    for (const auto& table : AgentGlobalTables()) {
+        // Table may not exist yet on a partially-initialized database
+        // (stores create their tables lazily per subsystem); skip those —
+        // a peer comparing digests only heals on tables present on both.
+        auto q1 = m_store->Prepare(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM " + table);
+        if (!q1 || !q1->Step()) continue;  // table absent on this database
+        TableDigest d;
+        d.table = table;
+        d.count = q1->ColumnInt64(0);
+        d.maxId = q1->ColumnInt64(1);
+        // Version-stamp sum is a coarse drift signal for operators; the
+        // actionable heal rule uses counts only.
+        auto q2 = m_store->Prepare(
+            "SELECT COALESCE(SUM(last_ms), 0) FROM sync_row_versions "
+            "WHERE table_name = ?");
+        if (q2) {
+            q2->BindText(1, table);
+            if (q2->Step()) d.sumLastMs = q2->ColumnInt64(0);
+        }
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+void SyncStore::ClearTableVersions(const std::string& table) {
+    if (!m_store) return;
+    auto q = m_store->Prepare(
+        "DELETE FROM sync_row_versions WHERE table_name = ?");
+    if (!q) return;
+    q->BindText(1, table);
+    q->Step();
+}
+
 int64_t SyncStore::GetPeerCursor(int64_t peerNode) {
     auto q = m_store->Prepare(
         "SELECT last_outbox_id FROM sync_peer_state WHERE peer_node = ?");

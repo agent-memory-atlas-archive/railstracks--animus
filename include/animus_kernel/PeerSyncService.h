@@ -84,6 +84,13 @@ private:
         uint64_t appliedTotal{0};
         uint64_t pulledTotal{0};
         std::string lastError;
+        // Anti-entropy (P1d): digests as reported by the peer's latest
+        // handshake, plus its outbox high-water mark. Empty digests =
+        // peer predates them (or a minimal fake peer) — no heal checks.
+        int64_t peerMaxOutboxId{-1};
+        std::vector<std::pair<std::string, int64_t>> peerDigests;
+        uint64_t healTotal{0};
+        int64_t lastHealMs{0};
     };
 
     struct IncomingPull {
