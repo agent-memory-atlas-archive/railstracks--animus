@@ -1,5 +1,6 @@
 #include "animus_kernel/IdRanges.h"
 #include "animus_kernel/SyncStore.h"
+#include "animus_kernel/PeerSyncService.h"
 #include "animus_kernel/AgentKernel.h"
 #include "animus_kernel/Log.h"
 
@@ -162,6 +163,7 @@ AgentKernel::~AgentKernel() {
     delete m_projectStore; m_projectStore = nullptr;
     delete m_dataStore; m_dataStore = nullptr;
     delete m_providerThrottle; m_providerThrottle = nullptr;
+    delete m_peerSyncService; m_peerSyncService = nullptr;
     delete m_syncStore; m_syncStore = nullptr;
     delete m_scheduler; m_scheduler = nullptr;
     delete m_sessionNotesStore; m_sessionNotesStore = nullptr;
@@ -404,6 +406,19 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                 ALOG_WARNING("kernel", "sync store init failed (single-node "
                              "operation continues): " << syncErr);
             }
+        }
+
+        // --- #78 P1c: federation transport (pull loop + sync API) ---
+        // Admin routes expose the outbox/handshake/status on every node;
+        // the pull loop runs only when peers are configured.
+        m_adminServer->SetSyncStore(m_syncStore);
+        if (m_config.node.id > 0 && !m_config.node.peers.empty()) {
+            m_peerSyncService = new PeerSyncService(
+                m_syncStore, m_config.node.peers, m_config.node.syncToken);
+            m_adminServer->SetPeerSyncService(m_peerSyncService);
+        } else {
+            ALOG_INFO("kernel", "node federation: no peers configured — "
+                      "sync API serves, pull loop idle");
         }
         m_tools.Register(std::make_unique<DiaryTool>(&m_adminServer->GetDiaryManager()));
 
@@ -1214,6 +1229,16 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             }
         }
 
+        // Start the federation pull loop after the admin API is accepting
+        // (peers may immediately pull our outbox) and after the scheduler,
+        // so a flood of first-sync applies can't delay schedule startup.
+        if (m_peerSyncService) {
+            std::string syncErr;
+            if (!m_peerSyncService->Start(&syncErr)) {
+                ALOG_WARNING("kernel", "peer sync start failed: " << syncErr);
+            }
+        }
+
         // Provider throttle — concurrency limiter per provider
         m_providerThrottle = new ProviderThrottle(
             [this](const std::string& id) -> int {
@@ -1988,6 +2013,10 @@ void AgentKernel::Stop() {
 
     if (m_channelManager) {
         m_channelManager->Shutdown();
+    }
+
+    if (m_peerSyncService) {
+        m_peerSyncService->Stop();
     }
 
     if (m_scheduler) {

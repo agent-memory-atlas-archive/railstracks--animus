@@ -37,6 +37,7 @@
 #include "kernel/admin/AdminUiResources.h"
 #include "kernel/admin/internal/AdminServerInternals.h"
 #include "animus_kernel/SessionManager.h"
+#include "animus_kernel/PeerSyncService.h"  // kProtocol for sync routes
 #include <optional>
 
 namespace animus::kernel {
@@ -1489,6 +1490,7 @@ void AdminServer::RegisterHandlersOnce() {
         RegisterRoutesAuth();
         RegisterRoutesDiffusion();
         RegisterRoutesSops();
+        RegisterRoutesSync();
     });
 }
 

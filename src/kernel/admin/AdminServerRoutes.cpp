@@ -1,4 +1,7 @@
 #include "animus_kernel/AdminServer.h"
+#include <cstdlib>
+#include "animus_kernel/PeerSyncService.h"
+#include "animus_kernel/SyncStore.h"
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/api/ApiRuntime.h"
 #include "animus_kernel/api/RegistryClient.h"
@@ -96,6 +99,10 @@ void AdminServer::RegisterRoutesDiffusion() {
 
 void AdminServer::RegisterRoutesSops() {
 #include "kernel/admin/internal/AdminServerRoutesSops.inc"
+}
+
+void AdminServer::RegisterRoutesSync() {
+#include "kernel/admin/internal/AdminServerRoutesSync.inc"
 }
 
 } // namespace animus::kernel

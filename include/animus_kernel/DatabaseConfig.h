@@ -24,6 +24,7 @@ struct DatabaseConfig {
     // #78 node federation identity (db.json "node" section)
     std::uint64_t nodeId{0};              // 0 = single-node
     std::vector<std::string> peers;       // peer admin endpoints
+    std::string syncToken;                // bearer token for peer pulls (#78 P1c)
 
     /// Load from a JSON file. Returns true on success, false if file not found.
     /// Missing fields use defaults. CLI args override loaded values.

@@ -44,6 +44,9 @@ bool DatabaseConfig::LoadFromFile(const std::string& path) {
                 for (const auto& p : arr) peers.push_back(p.asString());
             }
         }
+        if (nd.isMember("sync_token")) {
+            syncToken = nd["sync_token"].asString();
+        }
     }
     if (root.isMember("postgresql")) {
         const auto& pg = root["postgresql"];
@@ -91,6 +94,9 @@ void DatabaseConfig::ApplyTo(KernelConfig& config) const {
     if (config.node.id == 0 && nodeId != 0) {
         config.node.id = nodeId;
         config.node.peers = peers;
+        if (config.node.syncToken.empty() && !syncToken.empty()) {
+            config.node.syncToken = syncToken;
+        }
     }
 }
 

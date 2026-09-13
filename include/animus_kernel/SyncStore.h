@@ -63,6 +63,10 @@ public:
     IDataStore* Store() const { return m_store; }
     uint64_t LocalNodeId() const { return m_nodeId; }
 
+    // Tables triggers were actually installed on (subset of agent-global;
+    // missing stores are skipped). Handshake reports this list.
+    const std::vector<std::string>& SyncedTables() const { return m_syncedTables; }
+
 private:
     std::vector<std::string> ReadTableColumns(const std::string& table);
     bool InstallTriggersFor(const std::string& table, std::string* error);
@@ -71,6 +75,7 @@ private:
 
     IDataStore* m_store;
     uint64_t m_nodeId;
+    std::vector<std::string> m_syncedTables;
 };
 
 } // namespace animus::kernel
