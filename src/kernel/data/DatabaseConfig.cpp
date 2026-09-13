@@ -33,6 +33,18 @@ bool DatabaseConfig::LoadFromFile(const std::string& path) {
             sqlitePath = sq["path"].asString();
         }
     }
+    if (root.isMember("node")) {
+        const auto& nd = root["node"];
+        if (nd.isMember("id")) {
+            nodeId = nd["id"].asUInt64();
+        }
+        if (nd.isMember("peers")) {
+            const auto& arr = nd["peers"];
+            if (arr.isArray()) {
+                for (const auto& p : arr) peers.push_back(p.asString());
+            }
+        }
+    }
     if (root.isMember("postgresql")) {
         const auto& pg = root["postgresql"];
         if (pg.isMember("host"))      pgHost = pg["host"].asString();
@@ -75,6 +87,10 @@ void DatabaseConfig::ApplyTo(KernelConfig& config) const {
     }
     if (config.pg_pool_size == 10 && pgPoolSize != 10) {
         config.pg_pool_size = pgPoolSize;
+    }
+    if (config.node.id == 0 && nodeId != 0) {
+        config.node.id = nodeId;
+        config.node.peers = peers;
     }
 }
 

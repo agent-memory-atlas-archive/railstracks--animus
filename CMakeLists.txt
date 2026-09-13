@@ -372,6 +372,7 @@ add_library(animus_kernel
   src/kernel/scheduler/ScheduleStore.cpp
   src/kernel/scheduler/Scheduler.cpp
   src/kernel/scheduler/TaskRunStore.cpp
+  src/kernel/data/IdRanges.cpp
   src/kernel/social/SocialEventPoller.cpp
   src/kernel/social/TelegramBotApi.cpp
   src/kernel/ChannelManager.cpp
@@ -615,6 +616,32 @@ if(ANIMUS_BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
     )
     add_test(NAME SchedulerTests COMMAND animus_scheduler_tests)
+
+    add_executable(animus_node_id_tests
+      tests/NodeIdRangeTests.cpp
+    )
+    target_link_libraries(animus_node_id_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_node_id_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_node_id_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME NodeIdRangeTests COMMAND animus_node_id_tests)
+
+    add_executable(animus_pg_id_smoke
+      tests/PgIdRangeSmoke.cpp
+    )
+    target_link_libraries(animus_pg_id_smoke PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_pg_id_smoke PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_pg_id_smoke PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME PgIdRangeSmoke COMMAND animus_pg_id_smoke)
 
     add_executable(animus_consolidation_tests
       tests/ConsolidationTests.cpp

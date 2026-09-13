@@ -1,7 +1,9 @@
 #pragma once
 
 #include "animus_kernel/KernelConfig.h"
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace animus::kernel {
 
@@ -18,6 +20,10 @@ struct DatabaseConfig {
     std::string pgUsername{"animus"};
     std::string pgPassword;
     int pgPoolSize{10};
+
+    // #78 node federation identity (db.json "node" section)
+    std::uint64_t nodeId{0};              // 0 = single-node
+    std::vector<std::string> peers;       // peer admin endpoints
 
     /// Load from a JSON file. Returns true on success, false if file not found.
     /// Missing fields use defaults. CLI args override loaded values.

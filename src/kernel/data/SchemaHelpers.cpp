@@ -112,7 +112,9 @@ void CreateTable(IDataStore* store, const std::string& sql) {
 
     if (store->Dialect() == DataStoreDialect::PostgreSQL) {
         // Transform SQLite DDL to PostgreSQL:
-        // 1. INTEGER PRIMARY KEY AUTOINCREMENT → SERIAL PRIMARY KEY
+        // 1. INTEGER PRIMARY KEY AUTOINCREMENT → BIGSERIAL PRIMARY KEY
+        //    (64-bit: #78 federated id ranges are node_id<<40 — far beyond
+        //    int4 SERIAL's 2^31-1; SQLite INTEGER is 64-bit natively)
         // 2. All other INTEGER columns → BIGINT (SQLite INTEGER is 64-bit variable;
         //    PostgreSQL INTEGER is 32-bit, which overflows with Unix millisecond timestamps)
         std::string pgSql = sql;
@@ -121,13 +123,13 @@ void CreateTable(IDataStore* store, const std::string& sql) {
         std::regex autoIncComma(
             R"(\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\s*,)",
             std::regex::icase);
-        pgSql = std::regex_replace(pgSql, autoIncComma, "SERIAL PRIMARY KEY,");
+        pgSql = std::regex_replace(pgSql, autoIncComma, "BIGSERIAL PRIMARY KEY,");
 
         // Also handle the case where it's the last column (no trailing comma)
         std::regex autoIncEnd(
             R"(\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\s*\))",
             std::regex::icase);
-        pgSql = std::regex_replace(pgSql, autoIncEnd, "SERIAL PRIMARY KEY)");
+        pgSql = std::regex_replace(pgSql, autoIncEnd, "BIGSERIAL PRIMARY KEY)");
 
         // Replace remaining INTEGER with BIGINT
         // (after AUTOINCREMENT is already replaced)
