@@ -21,6 +21,10 @@ struct KernelConfig {
     struct NodeConfig {
         std::uint64_t id{0};
         std::vector<std::string> peers;  // peer admin endpoints (P1c transport)
+        // Bearer token presented to peers when pulling. Empty = no auth
+        // header (peer admin servers with auth disabled). Peers share one
+        // token per network by convention; rotate by changing both sides.
+        std::string syncToken{};
     };
 
     struct AdminServerConfig {

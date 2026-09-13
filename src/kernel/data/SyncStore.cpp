@@ -173,6 +173,7 @@ END $$ LANGUAGE plpgsql;)");
                          << ": " << err);
         } else {
             installed++;
+            m_syncedTables.push_back(table);
         }
     }
     if (installed == 0) {

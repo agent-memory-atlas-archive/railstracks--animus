@@ -1,0 +1,133 @@
+// ============================================================================
+// AdminServer Routes — Node Federation Sync API (#78 P1c)
+//
+// GET  /api/v1/sync/handshake — identity + protocol + synced-table list
+// GET  /api/v1/sync/outbox    — pull changes: ?since=<cursor>&limit=<n>
+// GET  /api/v1/sync/status    — local view of peers (outbound + incoming)
+//
+// Auth: rides the standard bearer-token filter like every other /api route.
+// A peer's pull carries X-Animus-Node (its node id) — the outbox handler
+// records it as incoming liveness on the local PeerSyncService (if
+// running), which is the "they are alive" half of the membership
+// heartbeat; our own pulls of them are the other half.
+// ============================================================================
+
+{
+    auto* server = g_activeAdminServer.load();
+
+    // GET /api/v1/sync/handshake — who we are, what we speak, what we sync.
+    drogon::app().registerHandler(
+        "/api/v1/sync/handshake",
+        [](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+            AdminServer* srv = g_activeAdminServer.load();
+            if (!srv) { SendServerNotActive(callback); return; }
+            if (!srv->m_syncStore) {
+                SendJsonError(callback, "sync store not available",
+                              drogon::k503ServiceUnavailable);
+                return;
+            }
+            Json::Value out(Json::objectValue);
+            out["protocol"] = PeerSyncService::kProtocol;
+            out["node_id"] = Json::UInt64(srv->m_syncStore->LocalNodeId());
+            Json::Value tables(Json::arrayValue);
+            for (const auto& t : srv->m_syncStore->SyncedTables()) {
+                tables.append(t);
+            }
+            out["tables"] = tables;
+            out["max_outbox_id"] = Json::Int64(srv->m_syncStore->MaxOutboxId());
+            callback(drogon::HttpResponse::newHttpJsonResponse(out));
+        },
+        {drogon::Get});
+
+    // GET /api/v1/sync/outbox?since&limit — ordered change log for pullers.
+    drogon::app().registerHandler(
+        "/api/v1/sync/outbox",
+        [server](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+            AdminServer* srv = g_activeAdminServer.load();
+            if (!srv) { SendServerNotActive(callback); return; }
+            if (!srv->m_syncStore) {
+                SendJsonError(callback, "sync store not available",
+                              drogon::k503ServiceUnavailable);
+                return;
+            }
+
+            // Incoming liveness: record the puller before serving.
+            const std::string pullerHdr = req->getHeader("X-Animus-Node");
+            if (srv->m_peerSyncService && !pullerHdr.empty()) {
+                char* end = nullptr;
+                const unsigned long long puller =
+                    std::strtoull(pullerHdr.c_str(), &end, 10);
+                if (end && *end == '\0' && puller != 0) {
+                    srv->m_peerSyncService->RecordIncomingPull(
+                        puller, req->getHeader("X-Animus-Url"));
+                }
+            }
+
+            int64_t since = 0;
+            {
+                const std::string s = req->getParameter("since");
+                if (!s.empty()) since = std::strtoll(s.c_str(), nullptr, 10);
+            }
+            int64_t limit = 500;
+            {
+                const std::string l = req->getParameter("limit");
+                if (!l.empty()) limit = std::strtoll(l.c_str(), nullptr, 10);
+            }
+            if (limit < 1) limit = 1;
+            if (limit > 5000) limit = 5000;  // body-size guard
+
+            const auto records = srv->m_syncStore->FetchOutboxSince(since, limit);
+            const int64_t maxId = srv->m_syncStore->MaxOutboxId();
+
+            Json::Value out(Json::objectValue);
+            out["node_id"] = Json::UInt64(srv->m_syncStore->LocalNodeId());
+            Json::Value arr(Json::arrayValue);
+            int64_t lastId = since;
+            for (const auto& r : records) {
+                Json::Value j(Json::objectValue);
+                j["outbox_id"] = Json::Int64(r.outbox_id);
+                j["origin_node"] = Json::Int64(r.origin_node);
+                j["table_name"] = r.table_name;
+                j["row_id"] = Json::Int64(r.row_id);
+                j["op"] = r.op;
+                j["payload"] = r.payload;   // raw full-row JSON string
+                j["unix_ms"] = Json::Int64(r.unix_ms);
+                arr.append(j);
+                lastId = r.outbox_id;
+            }
+            out["records"] = arr;
+            out["max_id"] = Json::Int64(maxId);
+            out["has_more"] = (lastId < maxId);
+            callback(drogon::HttpResponse::newHttpJsonResponse(out));
+        },
+        {drogon::Get});
+
+    // GET /api/v1/sync/status — outbound peer states + incoming pulls.
+    drogon::app().registerHandler(
+        "/api/v1/sync/status",
+        [](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+            AdminServer* srv = g_activeAdminServer.load();
+            if (!srv) { SendServerNotActive(callback); return; }
+            if (!srv->m_syncStore) {
+                SendJsonError(callback, "sync store not available",
+                              drogon::k503ServiceUnavailable);
+                return;
+            }
+            Json::Value out(Json::objectValue);
+            out["node_id"] = Json::UInt64(srv->m_syncStore->LocalNodeId());
+            out["protocol"] = PeerSyncService::kProtocol;
+            out["max_outbox_id"] = Json::Int64(srv->m_syncStore->MaxOutboxId());
+            if (srv->m_peerSyncService) {
+                out["peer_sync"] = srv->m_peerSyncService->StatusJson();
+            } else {
+                out["peer_sync"] = Json::Value(Json::objectValue);
+                out["peer_sync"]["running"] = false;
+                out["peer_sync"]["note"] = "no peers configured (single-node)";
+            }
+            callback(drogon::HttpResponse::newHttpJsonResponse(out));
+        },
+        {drogon::Get});
+}

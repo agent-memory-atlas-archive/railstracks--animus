@@ -29,6 +29,7 @@ class SessionManager;
 class ChainRunner;
 class CompactionService;
 class SyncStore;
+class PeerSyncService;
 class Scheduler;
 class ConsolidationPipeline;
 class NodeManager;
@@ -159,6 +160,7 @@ private:
     SessionTagsStore* m_sessionTagsStore{nullptr}; // session tag keywords
     PromptLogStore* m_promptLogStore{nullptr}; // LLM call logging
     SyncStore* m_syncStore{nullptr};
+    PeerSyncService* m_peerSyncService{nullptr};   // #78 P1c pull loop
     Scheduler* m_scheduler{nullptr};              // cron-like schedule subsystem
     ConsolidationPipeline* m_consolidation{nullptr}; // memory consolidation pipeline
     std::unordered_map<std::string, std::unique_ptr<LuaState>> m_luaStates; // per-agent Lua VMs
