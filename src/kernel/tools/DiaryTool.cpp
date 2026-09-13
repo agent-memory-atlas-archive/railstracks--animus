@@ -143,7 +143,7 @@ ToolDefinition DiaryTool::GetDefinition() const {
     // search parameters
     def.parameters.push_back({
         "query", "string",
-        "Search query for full-text search (required for search)",
+        "Search terms or natural language query. Words are OR-matched with stop-word removal for broad recall, ranked by relevance (required for search)",
         false
     });
 

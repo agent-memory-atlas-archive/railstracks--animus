@@ -1,4 +1,5 @@
 #include "animus_kernel/MemorySearch.h"
+#include "animus_kernel/SearchQueryText.h"
 #include "animus_kernel/Log.h"
 
 #include "animus_kernel/IDataStore.h"
@@ -471,107 +472,6 @@ void MemorySearch::RefreshOntologyDocs() {
 }
 
 
-// Convert a natural language query into an FTS5 OR query.
-// FTS5 MATCH with space-separated words is implicit AND (all must match).
-// We want OR (any word matches) for broader recall, ranked by relevance.
-// Also strips common English stop words to reduce noise.
-static std::string FtsQueryFromNaturalLanguage(const std::string& query) {
-    // Common stop words to exclude
-    static const std::set<std::string> stopWords = {
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-        "has", "have", "he", "in", "is", "it", "its", "of", "on", "or",
-        "that", "the", "to", "was", "were", "will", "with", "about",
-        "into", "than", "then", "them", "these", "they", "this", "what",
-        "when", "where", "which", "who", "how", "all", "any", "can",
-        "do", "not", "but", "if", "so", "up", "out", "no", "just",
-        "recent", "new", "latest"
-    };
-
-    // Split on whitespace and non-alphanumeric
-    std::vector<std::string> tokens;
-    std::string current;
-    for (char c : query) {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
-            current += std::tolower(static_cast<unsigned char>(c));
-        } else {
-            if (!current.empty()) {
-                tokens.push_back(current);
-                current.clear();
-            }
-        }
-    }
-    if (!current.empty()) tokens.push_back(current);
-
-    // Filter: remove stop words, remove too-short tokens, deduplicate
-    std::vector<std::string> ftsTerms;
-    std::set<std::string> seen;
-    for (const auto& tok : tokens) {
-        if (tok.size() < 2) continue;
-        if (stopWords.count(tok)) continue;
-        if (seen.insert(tok).second) {
-            ftsTerms.push_back(tok);
-        }
-    }
-
-    if (ftsTerms.empty()) return query;  // fallback to raw query
-
-    // Join with OR for broad recall
-    std::string result;
-    for (size_t i = 0; i < ftsTerms.size(); ++i) {
-        if (i > 0) result += " OR ";
-        result += ftsTerms[i];
-    }
-    return result;
-}
-
-// Convert a natural language query into a PostgreSQL tsquery with OR semantics.
-// plainto_tsquery produces implicit AND — we want OR for broad recall.
-// Uses the same tokenization as FtsQueryFromNaturalLanguage for consistency.
-static std::string PgTsQueryFromNaturalLanguage(const std::string& query) {
-    static const std::set<std::string> stopWords = {
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-        "has", "have", "he", "in", "is", "it", "its", "of", "on", "or",
-        "that", "the", "to", "was", "were", "will", "with", "about",
-        "into", "than", "then", "them", "these", "they", "this", "what",
-        "when", "where", "which", "who", "how", "all", "any", "can",
-        "do", "not", "but", "if", "so", "up", "out", "no", "just",
-        "recent", "new", "latest"
-    };
-
-    std::vector<std::string> tokens;
-    std::string current;
-    for (char c : query) {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
-            current += std::tolower(static_cast<unsigned char>(c));
-        } else {
-            if (!current.empty()) {
-                tokens.push_back(current);
-                current.clear();
-            }
-        }
-    }
-    if (!current.empty()) tokens.push_back(current);
-
-    std::vector<std::string> tsTerms;
-    std::set<std::string> seen;
-    for (const auto& tok : tokens) {
-        if (tok.size() < 2) continue;
-        if (stopWords.count(tok)) continue;
-        if (seen.insert(tok).second) {
-            tsTerms.push_back(tok);
-        }
-    }
-
-    if (tsTerms.empty()) return query;
-
-    // Build tsquery with OR: word1 | word2 | word3
-    std::string result;
-    for (size_t i = 0; i < tsTerms.size(); ++i) {
-        if (i > 0) result += " | ";
-        result += tsTerms[i];
-    }
-    return result;
-}
 
 std::vector<MemorySearchResult> MemorySearch::Search(
         const std::string& query,
