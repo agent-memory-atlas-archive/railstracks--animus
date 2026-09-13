@@ -1,6 +1,7 @@
 #pragma once
 
 #include "animus_kernel/scheduler/ScheduleStore.h"
+#include "animus_kernel/scheduler/TaskRunStore.h"
 #include "animus_kernel/IncomingEvent.h"
 
 #include <atomic>
@@ -19,7 +20,9 @@ namespace animus::kernel {
 
 class Scheduler {
 public:
-    using FireCallback = std::function<void(const IncomingEvent& event)>;
+    // Returns a short status token recorded in task_runs
+    // ("dispatched:...", "skipped:...", "error:...").
+    using FireCallback = std::function<std::string(const IncomingEvent& event)>;
 
     explicit Scheduler(IDataStore* dataStore);
     ~Scheduler();
@@ -45,8 +48,9 @@ public:
     void SetMaxSchedulesPerAgent(uint32_t limit);
     void SetFireCallback(FireCallback cb);
 
-    // Access to store (for tests)
+    // Access to stores (for tests / admin routes)
     ScheduleStore& Store() { return m_store; }
+    TaskRunStore& RunStore() { return m_runStore; }
 
     // Utility: current time as ISO-8601 string (UTC).
     static std::string IsoNow();
@@ -68,6 +72,7 @@ private:
                              int wday);
 
     ScheduleStore m_store;
+    TaskRunStore m_runStore;
     FireCallback m_fireCallback;
     std::thread m_thread;
     std::atomic<bool> m_running{false};

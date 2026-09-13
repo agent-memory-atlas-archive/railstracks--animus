@@ -1,5 +1,6 @@
 #include "animus_kernel/scheduler/Scheduler.h"
 #include "animus_kernel/IDataStore.h"
+#include "animus_kernel/Log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -316,7 +317,10 @@ std::string Scheduler::ComputeNextFire(
 // Scheduler lifecycle
 // ──────────────────────────────────────────────────────────────────
 
-Scheduler::Scheduler(IDataStore* dataStore) : m_store(dataStore) {}
+Scheduler::Scheduler(IDataStore* dataStore)
+        : m_store(dataStore), m_runStore(dataStore) {
+    m_runStore.EnsureSchema();
+}
 
 Scheduler::~Scheduler() {
     Stop();
@@ -465,8 +469,20 @@ void Scheduler::ProcessDueSchedules() {
     if (due.empty()) return;
 
     for (const auto& schedule : due) {
-        // Fire the event
-        if (m_fireCallback) {
+        // Idempotency claim (#78 task_runs): the window identity is the
+        // next_fire that made this schedule due. Claimed windows dispatch;
+        // lost claims (crash before state update, double-poll, future peer
+        // node) skip dispatch but STILL advance schedule state below — the
+        // schedule must not wedge on an already-processed window.
+        const std::string window = schedule.next_fire.empty() ? nowIso : schedule.next_fire;
+        const std::string runUuid = schedule.id + "@" + window;
+        const bool claimed = m_runStore.TryClaim(
+            runUuid, schedule.id, schedule.agent_id, window,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+
+        std::string outcome = "no_callback";
+        if (claimed && m_fireCallback) {
             IncomingEvent event;
             event.source = "scheduler";
             event.metadata["schedule_id"] = schedule.id;
@@ -474,7 +490,17 @@ void Scheduler::ProcessDueSchedules() {
             event.metadata["message"] = schedule.message;
             event.metadata["metadata"] = schedule.metadata;
             event.metadata["agent_id"] = schedule.agent_id;
-            m_fireCallback(event);
+            outcome = m_fireCallback(event);
+            m_runStore.Finish(runUuid, outcome, "",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+        } else if (claimed) {
+            m_runStore.Finish(runUuid, outcome, "",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+        } else {
+            ALOG_INFO("scheduler", "skipping already-claimed window: "
+                      << runUuid);
         }
 
         // Update schedule state

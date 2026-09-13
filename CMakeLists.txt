@@ -371,6 +371,7 @@ add_library(animus_kernel
   src/kernel/email/EmailTool.cpp
   src/kernel/scheduler/ScheduleStore.cpp
   src/kernel/scheduler/Scheduler.cpp
+  src/kernel/scheduler/TaskRunStore.cpp
   src/kernel/social/SocialEventPoller.cpp
   src/kernel/social/TelegramBotApi.cpp
   src/kernel/ChannelManager.cpp
