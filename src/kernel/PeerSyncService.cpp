@@ -314,6 +314,66 @@ int PeerSyncService::SyncOnce() {
     return totalApplied;
 }
 
+PeerSyncService::LeasePeerState PeerSyncService::CheckLeaseAck(
+        const std::string& scheduleId, int64_t epoch) {
+    LeasePeerState out;
+    std::lock_guard<std::mutex> lk(m_mutex);
+    int downCount = 0;
+    for (auto& p : m_peers) {
+        out.peersConfigured++;
+        if (p.state == "down" || p.state == "incompatible") {
+            downCount++;
+            continue;
+        }
+        // Reachable-ish peer: ask for its effective lease view. A failed
+        // GET is a non-ack (transient or worsening reachability — the sync
+        // loop's failure streak owns the state transition).
+        auto resp = Get(p, "/api/v1/scheduler/leases/" + scheduleId);
+        if (resp.status_code != 200) continue;
+        Json::Value body;
+        if (!ParseJson(resp.body, &body) || !body.isObject()) continue;
+        if (!body.isMember("exists") || !body["exists"].asBool()) continue;
+        const int64_t peerEpoch = body.isMember("epoch")
+            ? body["epoch"].asInt64() : -1;
+        const std::string peerHolder = body.isMember("holder_node_id")
+            ? body["holder_node_id"].asString() : "";
+        if (peerEpoch == epoch && peerHolder == std::to_string(m_store->LocalNodeId())) {
+            out.anyAcked = true;
+        }
+        out.lastExchangeOkMs = std::max(out.lastExchangeOkMs, NowMs());
+    }
+    out.allDown = out.peersConfigured > 0 && downCount == out.peersConfigured;
+    return out;
+}
+
+PeerSyncService::ClaimPeerState PeerSyncService::CheckClaimAck(
+        const std::string& runUuid) {
+    ClaimPeerState out;
+    std::lock_guard<std::mutex> lk(m_mutex);
+    int downCount = 0;
+    for (auto& p : m_peers) {
+        out.peersConfigured++;
+        if (p.state == "down" || p.state == "incompatible") {
+            downCount++;
+            continue;
+        }
+        auto resp = Get(p, "/api/v1/scheduler/claims/" + runUuid);
+        if (resp.status_code != 200) continue;
+        Json::Value body;
+        if (!ParseJson(resp.body, &body) || !body.isObject()) continue;
+        if (!body.isMember("exists") || !body["exists"].asBool()) continue;
+        const std::string node = body.isMember("node_id")
+            ? body["node_id"].asString() : "";
+        if (node == std::to_string(m_store->LocalNodeId())) {
+            out.confirmedMine = true;
+        } else {
+            out.showsOther = true;
+        }
+    }
+    out.allDown = out.peersConfigured > 0 && downCount == out.peersConfigured;
+    return out;
+}
+
 void PeerSyncService::RecordIncomingPull(uint64_t nodeId, const std::string& remoteUrl) {
     std::lock_guard<std::mutex> lk(m_mutex);
     for (auto& in : m_incoming) {

@@ -71,6 +71,29 @@ public:
     // the "they are alive" half of the heartbeat.
     void RecordIncomingPull(uint64_t nodeId, const std::string& remoteUrl);
 
+    // ── #78 P2b: lease acknowledgement ────────────────────────────────
+    // What a lease-epoch check learned from the peer set.
+    struct LeasePeerState {
+        int peersConfigured{0};
+        bool anyAcked{false};        // a peer's effective lease == (epoch, localNode)
+        bool allDown{false};         // every peer is down/incompatible
+        int64_t lastExchangeOkMs{0};
+    };
+    // Queries each reachable peer for its effective lease on a schedule.
+    // anyAcked == true proves this node's lease writes are visible on a
+    // peer (renewal-safe). Never throws; unreachable peers simply don't
+    // ack. Must NOT be called from the sync thread (blocking HTTP).
+    LeasePeerState CheckLeaseAck(const std::string& scheduleId, int64_t epoch);
+
+    // #78 P2b two-phase dispatch: peers' SURVIVOR view of a claim window.
+    struct ClaimPeerState {
+        int peersConfigured{0};
+        bool confirmedMine{false};   // a peer's survivor claim row = mine
+        bool showsOther{false};      // a peer's survivor claim row = other's
+        bool allDown{false};
+    };
+    ClaimPeerState CheckClaimAck(const std::string& runUuid);
+
     static constexpr int kProtocol = 1;
 
 private:

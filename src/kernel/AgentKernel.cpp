@@ -75,6 +75,7 @@
 #include "animus_kernel/tools/ChannelsTool.h"
 #include "animus_kernel/tools/EmailTool.h"
 #include "animus_kernel/scheduler/Scheduler.h"
+#include "animus_kernel/scheduler/ScheduleLeaseStore.h"
 #include "animus_kernel/admin/DiaryManager.h"
 #include "animus_kernel/SessionNotesStore.h"
 #include "animus_kernel/ChannelContextStore.h"
@@ -393,6 +394,8 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             ScheduleStore schedulePre(m_dataStore);
             TaskRunStore taskRunPre(m_dataStore);
             taskRunPre.EnsureSchema();   // TaskRunStore ctor does NOT ensure
+            ScheduleLeaseStore leasePre(m_dataStore);
+            leasePre.EnsureSchema();     // table must pre-exist sync trigger install
         }
 
         // --- #78 P1a: node-scoped id ranges (federation identity) ---
@@ -671,6 +674,36 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         // --- Scheduler (cron-like, fires IncomingEvent → session pipeline) ---
         m_scheduler = new Scheduler(m_dataStore);
         m_scheduler->SetNodeId(std::to_string(m_config.node.id));
+        m_scheduler->SetLeaseTtlMs(
+            static_cast<int64_t>(m_config.node.leaseTtlMs));
+        m_scheduler->SetLeaseGraceMs(
+            static_cast<int64_t>(m_config.node.leaseGraceMs));
+        // #78 P2b: wire the lease acker to the peer layer (no-op when
+        // single-node — PeerSyncService won't exist).
+        if (m_peerSyncService) {
+            m_scheduler->SetLeaseAckFn(
+                [this](const std::string& scheduleId,
+                       int64_t epoch) -> Scheduler::LeasePeerState {
+                    auto ps = m_peerSyncService->CheckLeaseAck(scheduleId, epoch);
+                    Scheduler::LeasePeerState out;
+                    out.peersConfigured = ps.peersConfigured;
+                    out.anyAcked = ps.anyAcked;
+                    out.allDown = ps.allDown;
+                    out.lastExchangeOkMs = ps.lastExchangeOkMs;
+                    return out;
+                });
+            m_scheduler->SetClaimAckFn(
+                [this](const std::string& runUuid)
+                        -> Scheduler::ClaimPeerState {
+                    auto cs = m_peerSyncService->CheckClaimAck(runUuid);
+                    Scheduler::ClaimPeerState out;
+                    out.peersConfigured = cs.peersConfigured;
+                    out.confirmedMine = cs.confirmedMine;
+                    out.showsOther = cs.showsOther;
+                    out.allDown = cs.allDown;
+                    return out;
+                });
+        }
         m_adminServer->SetScheduler(m_scheduler);
         m_scheduler->SetFireCallback([this](const IncomingEvent& event) {
             const std::string agentId = event.metadata.count("agent_id")

@@ -13,17 +13,22 @@ namespace animus::kernel {
 // TaskRunStore — durable record + idempotency guard for scheduler fires.
 //
 // Every due-window fire is claimed BEFORE dispatch via
-// INSERT ... ON CONFLICT(run_uuid) DO NOTHING RETURNING id. If the claim
-// returns no row, that window was already processed (crash between fire and
-// schedule-state update, double-poll, or — in the federation design — a peer
-// node) and dispatch is skipped while the schedule still advances.
+// INSERT ... SELECT WHERE NOT EXISTS(run_uuid) RETURNING id. No row returned
+// = that window was already processed (crash between fire and schedule-state
+// update, double-poll, or a peer node) and dispatch is skipped while the
+// schedule still advances.
 //
-// This is the at-least-once -> exactly-once-effective mechanism from the
-// node-federation design (#78): analysis tasks worst-case write twice and
-// merge; here the common case is they fire once per window, provably.
+// run_uuid is NOT a UNIQUE constraint (P2b): rows replicate with node-scoped
+// integer ids, and a partition double-claim leaves BOTH nodes holding the
+// same run_uuid with different ids — a UNIQUE index would wedge the heal
+// (apply conflict). Uniqueness is enforced at claim time (single-threaded
+// poll loop; the local race the constraint guarded does not exist) and
+// cross-node double claims are reconciled by EPOCH FENCING: survivor =
+// max(epoch), tie max(id); losers keep their rows with fenced=1 — the
+// double-fire tripwire (loud WARN at apply, visible in listings).
 //
-// node_id: claiming node's identity (P2a — filled from kernel config;
-// until manual/failover triggers exist (P2).
+// epoch: the lease epoch the claim was made under (P2b). 0 = at-least-once
+// semantics (no lease).
 // ============================================================================
 
 struct TaskRun {
@@ -38,6 +43,8 @@ struct TaskRun {
     int64_t finished_at_unix_ms{0};   // 0 while running
     std::string outcome;         // running | dispatched | skipped:* | error:* | no_callback
     std::string error;
+    int64_t epoch{0};            // lease epoch at claim time (0 = no lease)
+    bool fenced{false};          // true = lost the epoch fence (a duplicate)
 };
 
 class TaskRunStore {
@@ -47,16 +54,36 @@ public:
     void EnsureSchema();
 
     // Atomically claim a fire window. Returns true iff THIS call inserted the
-    // row (a RETURNING row came back). false = already claimed (running or
-    // finished by this node, a past life, or a peer).
+    // row (a RETURNING row came back). false = already claimed locally.
     bool TryClaim(const std::string& runUuid, const std::string& scheduleId,
                   const std::string& agentId, const std::string& scheduledFor,
                   int64_t startedAtUnixMs,
-                  const std::string& nodeId = "");
+                  const std::string& nodeId = "",
+                  int64_t epoch = 0);
 
     // Record the dispatch outcome. Returns false if the uuid is unknown.
     bool Finish(const std::string& runUuid, const std::string& outcome,
                 const std::string& error, int64_t finishedAtUnixMs);
+
+    // Window takeover for a stale pending claim (#78 P2b): the claiming
+    // node died between claim and dispatch (outcome still 'running' while
+    // provably down + aged past the visibility bound). Fences the stale
+    // row and inserts a fresh claim at epoch+1 for this node. Returns the
+    // new claim's epoch (0 = takeover refused: row not stale or missing).
+    int64_t TakeOverStaleClaim(const std::string& runUuid,
+                               const std::string& scheduleId,
+                               const std::string& agentId,
+                               const std::string& scheduledFor,
+                               int64_t nowMs,
+                               const std::string& nodeId,
+                               int64_t staleBeforeMs);
+
+    // Epoch-fence reconciliation for a run_uuid: keeps the winner
+    // (max epoch, tie max id) unfenced, marks every other row fenced.
+    // Returns the number of rows fenced (0 = no collision). Called after
+    // remote applies and after local claims — the double-fire tripwire
+    // fires (WARN) whenever a collision is witnessed.
+    int FenceRunUuid(const std::string& runUuid);
 
     std::optional<TaskRun> GetByUuid(const std::string& runUuid) const;
     std::vector<TaskRun> ListForSchedule(const std::string& scheduleId, int limit) const;

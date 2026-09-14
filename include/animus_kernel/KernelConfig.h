@@ -25,6 +25,10 @@ struct KernelConfig {
         // header (peer admin servers with auth disabled). Peers share one
         // token per network by convention; rotate by changing both sides.
         std::string syncToken{};
+        // #78 P2b lease tunables (defaults tuned for production cadence;
+        // chaos tests shrink them).
+        std::uint64_t leaseTtlMs{60000};
+        std::uint64_t leaseGraceMs{30000};
     };
 
     struct AdminServerConfig {

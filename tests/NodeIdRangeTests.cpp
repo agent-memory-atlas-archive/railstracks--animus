@@ -86,7 +86,8 @@ int TestSeedNodeOne() {
         StoreSet stores(dbPath);
         std::string err;
         const int seeded = SeedAgentGlobalIdRanges(&stores.dataStore, 1, &err);
-        // 12 agent-global tables + task_runs (P2a scheduler replication).
+        // 13 agent-global tables (P2b adds schedule_leases) + task_runs
+        // (P2a scheduler replication; seeded explicitly as well).
         Assert(seeded == (int)AgentGlobalTables().size() + 1,
                "all tables seeded, got " + std::to_string(seeded) +
                " err=" + err);

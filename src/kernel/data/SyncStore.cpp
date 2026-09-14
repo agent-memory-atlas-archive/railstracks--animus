@@ -2,6 +2,7 @@
 #include "animus_kernel/IdRanges.h"
 #include "animus_kernel/Log.h"
 #include "animus_kernel/SchemaHelpers.h"
+#include "animus_kernel/scheduler/TaskRunStore.h"
 
 #include <algorithm>
 #include <chrono>
@@ -506,7 +507,23 @@ bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
     }
     if (!ok) ALOG_WARNING("sync", "apply FAILED for " << rec.table_name
                           << "/" << rec.row_key << ": " << m_store->ErrMsg());
+    else if (ok && rec.table_name == "task_runs")
+        // P2b: a task_runs apply can complete a partition double-claim —
+        // run the epoch-fence reconciliation for that window so the loser
+        // row is marked and the violation surfaces (tripwire).
+        FenceTaskRun(rec.payload);
     return ok;
+}
+
+void SyncStore::FenceTaskRun(const std::string& payloadJson) {
+    Json::Value root;
+    Json::CharReaderBuilder rb;
+    std::string parseErr;
+    std::istringstream ss(payloadJson);
+    if (!Json::parseFromStream(rb, ss, &root, &parseErr) || !root.isObject()) return;
+    if (!root.isMember("run_uuid")) return;
+    TaskRunStore runs(m_store);
+    runs.FenceRunUuid(root["run_uuid"].asString());
 }
 
 bool SyncStore::ApplyDelete(const OutboxRecord& rec) {

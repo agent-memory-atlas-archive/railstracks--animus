@@ -47,6 +47,12 @@ bool DatabaseConfig::LoadFromFile(const std::string& path) {
         if (nd.isMember("sync_token")) {
             syncToken = nd["sync_token"].asString();
         }
+        if (nd.isMember("lease_ttl_ms")) {
+            leaseTtlMs = nd["lease_ttl_ms"].asUInt64();
+        }
+        if (nd.isMember("lease_grace_ms")) {
+            leaseGraceMs = nd["lease_grace_ms"].asUInt64();
+        }
     }
     if (root.isMember("postgresql")) {
         const auto& pg = root["postgresql"];
@@ -96,6 +102,12 @@ void DatabaseConfig::ApplyTo(KernelConfig& config) const {
         config.node.peers = peers;
         if (config.node.syncToken.empty() && !syncToken.empty()) {
             config.node.syncToken = syncToken;
+        }
+        if (config.node.leaseTtlMs == 60000 && leaseTtlMs != 60000) {
+            config.node.leaseTtlMs = leaseTtlMs;
+        }
+        if (config.node.leaseGraceMs == 30000 && leaseGraceMs != 30000) {
+            config.node.leaseGraceMs = leaseGraceMs;
         }
     }
 }
