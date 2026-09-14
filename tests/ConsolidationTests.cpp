@@ -205,8 +205,26 @@ int TestPipelineIntakeFromDiary() {
     diaryStore.Create(entry);
 
     g_llmCallCount = 0;
+    // Current intake contract: the LLM creates observations via the
+    // consolidation tool DURING the callback (no return-value parsing).
+    // Simulate that side effect here, as the tool path would.
+    auto intakeCallback = [&memStore](const std::string&,
+                                       const std::string&,
+                                       const std::string& userPrompt) -> std::string {
+        g_llmCallCount++;
+        if (userPrompt.find("diary entries") == std::string::npos) return "[]";
+        memory::Observation obs;
+        obs.agent_id = "agent1";
+        obs.text = "Agent learned about memory consolidation";
+        obs.tags_json = "[\"memory\",\"learning\"]";
+        obs.weight = 0.8;
+        obs.created_at_unix_ms = 3000000;
+        obs.updated_at_unix_ms = 3000000;
+        memStore.CreateObservationForAgent("agent1", obs);
+        return "[]";
+    };
     ConsolidationPipeline pipeline(
-        &dataStore, &memStore, nullptr, &diaryStore, nullptr, nullptr, &MockLLMCallback);
+        &dataStore, &memStore, nullptr, &diaryStore, nullptr, nullptr, intakeCallback);
 
     ConsolidationPipeline::Config cfg;
     cfg.intake_enabled = true;
