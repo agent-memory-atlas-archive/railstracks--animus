@@ -425,6 +425,21 @@ int TestPipelinePerspectiveRevision() {
 
     auto layers = memStore.ListLayers();
 
+    // Perspective revision requires active observations (drift guard skips
+    // empty layers) and the newest observation must postdate the
+    // auto-created perspective row (staleness guard).
+    const int64_t obsTs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() + 5000;
+    memory::Observation seed;
+    seed.agent_id = "agent1";
+    seed.layer_id = layers.front().id;
+    seed.text = "Core observation for perspective revision";
+    seed.weight = 1.0;
+    seed.created_at_unix_ms = obsTs;
+    seed.updated_at_unix_ms = obsTs;
+    memStore.CreateObservationForAgent("agent1", seed);
+
     auto perspCallback = [](const std::string&,
                              const std::string&,
                              const std::string&) -> std::string {
