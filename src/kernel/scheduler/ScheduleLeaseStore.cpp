@@ -2,6 +2,7 @@
 #include "animus_kernel/Log.h"
 
 #include <chrono>
+#include "animus_kernel/SchemaHelpers.h"
 
 namespace animus::kernel {
 
@@ -9,7 +10,8 @@ ScheduleLeaseStore::ScheduleLeaseStore(IDataStore* store)
         : m_store(store) {}
 
 void ScheduleLeaseStore::EnsureSchema() {
-    m_store->Exec(R"(
+    // schema::CreateTable: PG translation (AUTOINCREMENT -> BIGSERIAL).
+    schema::CreateTable(m_store, R"(
         CREATE TABLE IF NOT EXISTS schedule_leases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             schedule_id TEXT NOT NULL,
@@ -18,7 +20,7 @@ void ScheduleLeaseStore::EnsureSchema() {
             acquired_ms INTEGER NOT NULL,
             expires_ms INTEGER NOT NULL,
             last_renew_ms INTEGER NOT NULL
-        );
+        )");
     )");
     m_store->Exec(
         "CREATE INDEX IF NOT EXISTS idx_schedule_leases_sched "

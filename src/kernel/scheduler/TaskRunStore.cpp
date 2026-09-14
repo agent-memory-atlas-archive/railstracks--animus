@@ -1,6 +1,7 @@
 #include "animus_kernel/scheduler/TaskRunStore.h"
 
 #include "animus_kernel/Log.h"
+#include "animus_kernel/SchemaHelpers.h"
 
 #include <algorithm>
 
@@ -13,7 +14,11 @@ static const char* kTaskRunCols =
 TaskRunStore::TaskRunStore(IDataStore* store) : m_store(store) {}
 
 void TaskRunStore::EnsureSchema() {
-    m_store->Exec(R"(
+    // schema::CreateTable translates the SQLite DDL for PostgreSQL
+    // (AUTOINCREMENT -> BIGSERIAL etc.). Raw Exec leaves PG without the
+    // table and every TryClaim wedges the schedule "due" forever —
+    // seen live on a PG-backed prod instance (2026-09-14).
+    schema::CreateTable(m_store, R"(
         CREATE TABLE IF NOT EXISTS task_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_uuid TEXT NOT NULL,
@@ -28,7 +33,7 @@ void TaskRunStore::EnsureSchema() {
             error TEXT NOT NULL DEFAULT '',
             epoch INTEGER NOT NULL DEFAULT 0,
             fenced INTEGER NOT NULL DEFAULT 0
-        );
+        )");
     )");
     // P2b migration: run_uuid drops its UNIQUE constraint (replicated rows
     // from a partition double-claim share run_uuid with different node-scoped
