@@ -184,6 +184,7 @@ int TestPipelineIntakeFromDiary() {
     // Seed memory layers (need at least one)
     MemoryLayer baseLayer;
     baseLayer.name = "day";
+    baseLayer.agent_id = "agent1";
     baseLayer.horizon = "1 day";
     baseLayer.sort_order = 0;
     baseLayer.evaluation_interval_seconds = 86400;
@@ -246,6 +247,7 @@ int TestPipelineLayerConsolidation() {
     // Create two layers: day (bottom) and week (top)
     MemoryLayer day;
     day.name = "day";
+    day.agent_id = "agent1";
     day.horizon = "1 day";
     day.sort_order = 0;
     day.evaluation_interval_seconds = 3600;
@@ -258,6 +260,7 @@ int TestPipelineLayerConsolidation() {
 
     MemoryLayer week;
     week.name = "week";
+    week.agent_id = "agent1";
     week.horizon = "1 week";
     week.sort_order = 1;
     week.evaluation_interval_seconds = 86400;
@@ -329,6 +332,7 @@ int TestPipelineDemoteToArchive() {
     // Single bottom layer
     MemoryLayer day;
     day.name = "day";
+    day.agent_id = "agent1";
     day.horizon = "1 day";
     day.sort_order = 0;
     day.evaluation_interval_seconds = 3600;
@@ -387,6 +391,7 @@ int TestPipelinePerspectiveRevision() {
 
     MemoryLayer layer;
     layer.name = "week";
+    layer.agent_id = "agent1";
     layer.horizon = "1 week";
     layer.sort_order = 1;
     layer.evaluation_interval_seconds = 86400;
@@ -437,6 +442,7 @@ int TestPipelineMillenniumLayerSkipped() {
 
     MemoryLayer ml;
     ml.name = "millennium";
+    ml.agent_id = "agent1";
     ml.horizon = "1 millennium";
     ml.sort_order = 6;
     ml.evaluation_interval_seconds = 2592000;  // 30 days
