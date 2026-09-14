@@ -111,6 +111,10 @@ bool SyncStore::EnsureSchema(std::string* error) {
         if (q) { q->BindInt64(1, (int64_t)m_nodeId); q->ExecDML(); }
     }
 
+    // Row-id migration must precede trigger install: once triggers are
+    // live, any write against unconverted bigint columns aborts.
+    MigrateRowIdsIfNeeded();
+
     const bool isPg = m_store->Dialect() == DataStoreDialect::PostgreSQL;
 
     if (isPg) {
@@ -182,6 +186,99 @@ END $$ LANGUAGE plpgsql;)");
         return false;
     }
     return true;
+}
+
+// --- P2a migration: row-id columns INTEGER -> TEXT -----------------------
+// schedules (TEXT primary keys) and task_runs joined the synced set;
+// the sync layer's row identity is now TEXT uniformly (int ids are
+// stringified at capture). SQLite can't ALTER a column type, so the
+// tables are rebuilt via create-copy-swap. PG uses ALTER TYPE (+USING).
+// NOTE: this block was formerly embedded inside ReadTableColumns' SQLite
+// branch — it only ever ran on SQLite as a side effect of trigger install.
+// PG never migrated: legacy bigint row-id columns stayed while the P2a
+// trigger compares NEW.id::text -> "operator does not exist: bigint = text"
+// aborting every write on triggered tables (live: Buffett, 2026-09-14).
+void SyncStore::MigrateRowIdsIfNeeded() {
+        const bool isPgNow = m_store->Dialect() == DataStoreDialect::PostgreSQL;
+        if (isPgNow) {
+            // bigint -> TEXT needs an explicit USING cast; PG refuses
+            // "cannot be cast automatically" otherwise. Exec failure was
+            // silent, leaving legacy-P1 columns bigint while the P2a trigger
+            // compares NEW.id::text -> "operator does not exist: bigint = text"
+            // aborting every write on triggered tables (live: Buffett's
+            // instance — boot registration, layer saves, schedule inserts).
+            // Guarded so already-TEXT databases skip the table rewrite.
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_outbox' AND column_name='row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_outbox ALTER COLUMN row_id TYPE TEXT "
+                "USING row_id::text; END IF; END $$;");
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_row_versions' AND column_name='row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_row_versions ALTER COLUMN row_id TYPE TEXT "
+                "USING row_id::text; END IF; END $$;");
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_control' AND column_name='apply_row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_control ALTER COLUMN apply_row_id TYPE TEXT "
+                "USING apply_row_id::text; END IF; END $$;");
+        } else {
+            std::string migErr;
+            auto probe = m_store->Prepare(
+                "SELECT type FROM pragma_table_info('sync_outbox') "
+                "WHERE name = 'row_id'");
+            const bool needMigrate = [&]() {
+                if (!probe) return false;
+                if (!probe->Step()) return false;
+                return probe->ColumnText(0) != "TEXT";
+            }();
+            if (needMigrate) {
+                if (RebuildSqliteTableWide(m_store, R"SQL(
+                    CREATE TABLE sync_outbox (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        origin_node INTEGER NOT NULL,
+                        table_name TEXT NOT NULL,
+                        row_id TEXT NOT NULL,
+                        op TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        unix_ms INTEGER NOT NULL
+                    ))SQL", "sync_outbox", &migErr)) {
+                    ALOG_INFO("sync", "migrated sync_outbox.row_id INTEGER -> TEXT");
+                } else {
+                    ALOG_WARNING("sync", "sync_outbox row_id migration failed: "
+                                 << migErr);
+                }
+                if (RebuildSqliteTableWide(m_store, R"SQL(
+                    CREATE TABLE sync_row_versions (
+                        table_name TEXT NOT NULL,
+                        row_id TEXT NOT NULL,
+                        last_ms INTEGER NOT NULL,
+                        last_node INTEGER NOT NULL,
+                        PRIMARY KEY (table_name, row_id)
+                    ))SQL", "sync_row_versions", &migErr)) {
+                    ALOG_INFO("sync", "migrated sync_row_versions.row_id INTEGER -> TEXT");
+                } else {
+                    ALOG_WARNING("sync", "sync_row_versions row_id migration failed: "
+                                 << migErr);
+                }
+                // sync_control holds a single identity row, re-inserted below;
+                // drop+recreate is the safe rebuild.
+                m_store->Exec("DROP TABLE IF EXISTS sync_control");
+                m_store->Exec(R"SQL(
+                    CREATE TABLE sync_control (
+                        node_id INTEGER PRIMARY KEY,
+                        apply_table TEXT,
+                        apply_row_id TEXT,
+                        apply_origin INTEGER,
+                        apply_ms INTEGER
+                    ))SQL");
+                ALOG_INFO("sync", "migrated sync_control.apply_row_id INTEGER -> TEXT");
+            }
+        }
 }
 
 std::vector<std::string> SyncStore::ReadTableColumns(const std::string& table) {

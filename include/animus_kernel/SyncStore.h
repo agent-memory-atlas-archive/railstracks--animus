@@ -94,6 +94,7 @@ public:
     const std::vector<std::string>& SyncedTables() const { return m_syncedTables; }
 
 private:
+    void MigrateRowIdsIfNeeded();  // P2a: bigint/INTEGER row-id columns -> TEXT (both dialects)
     std::vector<std::string> ReadTableColumns(const std::string& table);
     bool InstallTriggersFor(const std::string& table, std::string* error);
     bool ApplyUpsert(const OutboxRecord& rec);
