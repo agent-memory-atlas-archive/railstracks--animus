@@ -1,5 +1,6 @@
 #include "animus_kernel/SchemaHelpers.h"
 #include "animus_kernel/IDataStore.h"
+#include "animus_kernel/Log.h"
 
 #include <algorithm>
 #include <regex>
