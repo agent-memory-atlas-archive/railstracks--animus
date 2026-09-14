@@ -33,7 +33,8 @@ void TaskRunStore::EnsureSchema() {
             error TEXT NOT NULL DEFAULT '',
             epoch INTEGER NOT NULL DEFAULT 0,
             fenced INTEGER NOT NULL DEFAULT 0
-        )");
+        );
+    )");
     // P2b migration: run_uuid drops its UNIQUE constraint (replicated rows
     // from a partition double-claim share run_uuid with different node-scoped
     // ids — UNIQUE would wedge the sync heal with an apply conflict). Fresh
