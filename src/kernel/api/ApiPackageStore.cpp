@@ -868,8 +868,16 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
 
     if (!lint.Ok()) lint.Throw("manifest lint failed");
 
-    if (GetPackageByName(name))
-        throw std::runtime_error("api package '" + name + "' is already installed");
+    // Upgrade-in-place: same name -> replace commands/connections/meta while
+    // PRESERVING operator-owned state and the enabled flag. ApiRuntime re-reads
+    // package/command rows on every invocation, so new scripts apply on the
+    // next call; connection template changes apply after a daemon restart.
+    // Local modifications are never clobbered silently.
+    std::optional<ApiPackage> existing = GetPackageByName(name);
+    if (existing && existing->locally_modified)
+        throw std::runtime_error(
+            "api package '" + name + "' has local modifications - refusing registry "
+            "upgrade (delete and reinstall to discard them)");
 
     ApiPackage pkg;
     pkg.name = name;
@@ -884,12 +892,35 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
     pkg.dispatch_cooldown_ms = cooldown;
     pkg.files_quota_mb = quota;
     pkg.state_schema = JsonCompact(stateSchema);
-    pkg.state = "{}";
+    if (existing) {
+        pkg.id = existing->id;
+        pkg.created_at_unix_ms = existing->created_at_unix_ms;
+        pkg.enabled = existing->enabled;  // operator choice survives upgrades
+        // State is operator-owned: keep all values; overlay defaults for keys
+        // the new version introduces (same overlay Execute applies at read).
+        Json::Value liveState;
+        std::string stateErr;
+        ParseJson(existing->state.empty() ? "{}" : existing->state, liveState, stateErr);
+        if (!liveState.isObject()) liveState = Json::Value(Json::objectValue);
+        for (const std::string& k : stateSchema.getMemberNames()) {
+            if (stateSchema[k].isMember("default") && !liveState.isMember(k))
+                liveState[k] = stateSchema[k]["default"];
+        }
+        pkg.state = JsonCompact(liveState);
+    } else {
+        pkg.state = "{}";
+    }
 
     m_store->BeginTransaction();
     ApiPackage stored;
     try {
-        stored = CreatePackage(pkg);
+        if (existing) {
+            if (!UpdatePackageMeta(pkg))
+                throw std::runtime_error("upgrade meta update failed: " + m_store->ErrMsg());
+            stored = pkg;
+        } else {
+            stored = CreatePackage(pkg);
+        }
         // Inline replaces (no nested transactions — Begin inside Begin is a
         // no-op returning false and the inner Commit would end the outer tx).
         if (!DeleteRows("api_package_commands", "package_id", stored.id))
