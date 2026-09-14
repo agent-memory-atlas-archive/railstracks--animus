@@ -141,7 +141,11 @@ void CreateTable(IDataStore* store, const std::string& sql) {
         // Replace BLOB with BYTEA
         pgSql = std::regex_replace(pgSql, std::regex("\\bBLOB\\b", std::regex::icase), "BYTEA");
 
-        store->Exec(pgSql);
+        if (!store->Exec(pgSql)) {
+            ALOG_ERROR("schema", "CreateTable failed (postgres): "
+                      << store->ErrMsg() << " | sql head: "
+                      << pgSql.substr(0, 120));
+        }
         return;
     }
 
