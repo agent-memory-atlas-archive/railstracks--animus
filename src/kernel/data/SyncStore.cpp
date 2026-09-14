@@ -199,9 +199,31 @@ std::vector<std::string> SyncStore::ReadTableColumns(const std::string& table) {
     {
         const bool isPgNow = m_store->Dialect() == DataStoreDialect::PostgreSQL;
         if (isPgNow) {
-            m_store->Exec("ALTER TABLE sync_outbox ALTER COLUMN row_id TYPE TEXT");
-            m_store->Exec("ALTER TABLE sync_row_versions ALTER COLUMN row_id TYPE TEXT");
-            m_store->Exec("ALTER TABLE sync_control ALTER COLUMN apply_row_id TYPE TEXT");
+            // bigint -> TEXT needs an explicit USING cast; PG refuses
+            // "cannot be cast automatically" otherwise. Exec failure was
+            // silent, leaving legacy-P1 columns bigint while the P2a trigger
+            // compares NEW.id::text -> "operator does not exist: bigint = text"
+            // aborting every write on triggered tables (live: Buffett's
+            // instance — boot registration, layer saves, schedule inserts).
+            // Guarded so already-TEXT databases skip the table rewrite.
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_outbox' AND column_name='row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_outbox ALTER COLUMN row_id TYPE TEXT "
+                "USING row_id::text; END IF; END $$;");
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_row_versions' AND column_name='row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_row_versions ALTER COLUMN row_id TYPE TEXT "
+                "USING row_id::text; END IF; END $$;");
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_control' AND column_name='apply_row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_control ALTER COLUMN apply_row_id TYPE TEXT "
+                "USING apply_row_id::text; END IF; END $$;");
         } else {
             std::string migErr;
             auto probe = m_store->Prepare(
