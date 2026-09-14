@@ -38,12 +38,13 @@ void TaskRunStore::EnsureSchema() {
 
 bool TaskRunStore::TryClaim(const std::string& runUuid, const std::string& scheduleId,
                             const std::string& agentId, const std::string& scheduledFor,
-                            int64_t startedAtUnixMs) {
+                            int64_t startedAtUnixMs,
+                            const std::string& nodeId) {
     // Claim detection without any store-global state (#76 lesson):
     // the RETURNING row IS the receipt — a conflict produces no row.
     auto stmt = m_store->Prepare(
         "INSERT INTO task_runs (run_uuid, schedule_id, agent_id, scheduled_for, "
-        "started_at_unix_ms) VALUES (?,?,?,?,?) "
+        "node_id, started_at_unix_ms) VALUES (?,?,?,?,?,?) "
         "ON CONFLICT(run_uuid) DO NOTHING RETURNING id");
     if (!stmt) return false;
 
@@ -51,7 +52,8 @@ bool TaskRunStore::TryClaim(const std::string& runUuid, const std::string& sched
     stmt->BindText(2, scheduleId);
     stmt->BindText(3, agentId);
     stmt->BindText(4, scheduledFor);
-    stmt->BindInt64(5, startedAtUnixMs);
+    stmt->BindText(5, nodeId);
+    stmt->BindInt64(6, startedAtUnixMs);
 
     if (!stmt->Step()) {
         ALOG_DEBUG("scheduler", "task_run claim lost (already processed): " << runUuid);

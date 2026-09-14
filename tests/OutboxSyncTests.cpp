@@ -5,6 +5,8 @@
 #include "animus_kernel/MemoryFileStore.h"
 #include "animus_kernel/OntologyStore.h"
 #include "animus_kernel/admin/DiaryManager.h"
+#include "animus_kernel/scheduler/ScheduleStore.h"
+#include "animus_kernel/scheduler/TaskRunStore.h"
 #include "animus_kernel/IDataStore.h"
 
 #include <cstdint>
@@ -39,12 +41,16 @@ struct Node {
     memory::MemoryFileStore files;
     ontology::OntologyStore ontology;
     DiaryStore diary;
+    ScheduleStore scheduleStore;
+    TaskRunStore taskRunStore;
     SyncStore sync;
 
     Node(uint64_t nodeId)
         : dbPath(MakeTempDbPath()), dataStore(dbPath), memory(&dataStore),
           files(&dataStore), ontology(&dataStore), diary(&dataStore),
+          scheduleStore(&dataStore), taskRunStore(&dataStore),
           sync(&dataStore, nodeId) {
+        taskRunStore.EnsureSchema();   // ctor doesn't ensure; schedules does
         std::string err;
         if (!sync.EnsureSchema(&err)) {
             std::cerr << "  FATAL: node " << nodeId << " sync init: " << err << "\n";
@@ -132,12 +138,20 @@ int TestTriggerCoverage() {
     a.dataStore.Exec("INSERT INTO ontology_mutations (mutation_type, target_type, target_id, unix_ms) "
                      "VALUES ('m', 't', 1, 1)");
 
+    // P2a: scheduler tables are agent-global too — write one of each so
+    // coverage exercises the TEXT-key (schedules) + seeded-int-key
+    // (task_runs) trigger paths.
+    a.dataStore.Exec("INSERT INTO schedules (id, agent_id, type, next_fire, message, enabled, created_at) "
+                     "VALUES ('cov-sched', 'ag', 'one_shot', '2026-09-14T00:00:00Z', 'x', 1, '2026-09-13T00:00:00Z')");
+    a.dataStore.Exec("INSERT INTO task_runs (run_uuid, schedule_id, agent_id, scheduled_for, started_at_unix_ms) "
+                     "VALUES ('cov-run', 'cov-sched', 'ag', 'w', 1)");
+
     auto records = a.sync.FetchOutboxSince(0, 1000);
-    Assert(records.size() >= 10, "10+ outbox records, got " +
+    Assert(records.size() >= 12, "12+ outbox records, got " +
            std::to_string(records.size()));
     // distinct agent-global tables captured
-    bool seen[10] = {false};
     const auto tables = AgentGlobalTables();
+    std::vector<bool> seen(tables.size(), false);
     for (const auto& r : records) {
         for (size_t i = 0; i < tables.size(); ++i)
             if (r.table_name == tables[i]) seen[i] = true;
@@ -206,7 +220,7 @@ int TestTwoNodeReplication() {
     // Stale record rejected: pair-lesser (older ms, same origin)
     OutboxRecord stale;
     stale.table_name = "observations";
-    stale.row_id = obs.id;
+    stale.row_key = std::to_string(obs.id);
     stale.op = "upsert";
     stale.origin_node = 1;
     stale.unix_ms = 1;   // ancient
@@ -245,7 +259,7 @@ int TestLwwPairSemantics() {
     auto current = a.sync.FetchOutboxSince(0, 1000);
     int64_t writeMs = 0; std::string realPayload;
     for (const auto& r : current)
-        if (r.table_name == "observations" && r.row_id == obs.id) {
+        if (r.table_name == "observations" && r.row_key == std::to_string(obs.id)) {
             writeMs = r.unix_ms; realPayload = r.payload;
         }
     Assert(writeMs > 0, "found write ms");
@@ -261,7 +275,7 @@ int TestLwwPairSemantics() {
     // Equal ms, HIGHER node: version at b is (ms_of_write, 1);
     // send (same ms, node 2) → pair-greater → wins.
     OutboxRecord tie;
-    tie.table_name = "observations"; tie.row_id = obs.id; tie.op = "upsert";
+    tie.table_name = "observations"; tie.row_key = std::to_string(obs.id); tie.op = "upsert";
     tie.origin_node = 2; tie.unix_ms = writeMs; tie.payload = pay;
     Assert(b.sync.ApplyRemoteChange(tie), "tie broken by higher node id");
     Assert(b.TextOf("observations", obs.id, "text") == "X", "tie-winner applied");
@@ -274,7 +288,7 @@ int TestLwwPairSemantics() {
     // Unknown table / op rejected (identifier whitelist)
     OutboxRecord evil;
     evil.table_name = "sync_outbox; DROP TABLE observations;--";
-    evil.row_id = 1; evil.op = "upsert"; evil.origin_node = 9;
+    evil.row_key = "1"; evil.op = "upsert"; evil.origin_node = 9;
     evil.unix_ms = 99999999999999; evil.payload = "{}";
     Assert(!b.sync.ApplyRemoteChange(evil), "unknown table rejected");
     OutboxRecord badOp = tie;
@@ -298,11 +312,11 @@ int TestLocalWritesDuringApply() {
 
     // simulate mid-batch: apply context set, then a local write happens
     OutboxRecord from;
-    from.table_name = "diary_entries"; from.row_id = 777; from.op = "delete";
+    from.table_name = "diary_entries"; from.row_key = "777"; from.op = "delete";
     from.origin_node = 1; from.unix_ms = 1; from.payload = R"({"id":777})";
     // (set apply context the same way ApplyRemoteChange does)
     auto q = b.dataStore.Prepare(
-        "UPDATE sync_control SET apply_table = 'diary_entries', apply_row_id = 777, "
+        "UPDATE sync_control SET apply_table = 'diary_entries', apply_row_id = '777', "
         "apply_origin = 1, apply_ms = 2");
     q->ExecDML();
 
@@ -314,7 +328,7 @@ int TestLocalWritesDuringApply() {
     auto midRec = b.sync.FetchOutboxSince(0, 1000);
     bool midCaptured = false; int64_t midMs = 0;
     for (const auto& r : midRec)
-        if (r.table_name == "observations" && r.row_id == obsMid.id) {
+        if (r.table_name == "observations" && r.row_key == std::to_string(obsMid.id)) {
             midCaptured = true; midMs = r.unix_ms;
         }
     Assert(midCaptured, "mid-batch local write captured in outbox");
@@ -384,6 +398,86 @@ int TestIdempotentBoot() {
     return 0;
 }
 
+// P2a: TEXT-keyed replication — schedules (TEXT pk) + task_runs (node-seeded
+// int ids) replicate through the same outbox/LWW machinery.
+int TestSchedulerTableReplication() {
+    std::cerr << "  [P2a] scheduler tables replicate (TEXT + int keys)...\n";
+    Node a(1);
+    Node b(2);
+
+    // A creates a schedule through the real store API (random hex TEXT id).
+    ScheduleDescriptor sd;
+    sd.agent_id = "ag";
+    sd.type = ScheduleType::OneShot;
+    sd.next_fire = "2026-09-14T00:00:00Z";
+    sd.message = "p2a replication probe";
+    std::string err;
+    std::string schedId = a.scheduleStore.CreateAndReturnId(sd, &err);
+    Assert(!schedId.empty(), "schedule created: " + err);
+
+    // A claims a task_run (node 1 identity) via the real claim path.
+    const bool claimOk = a.taskRunStore.TryClaim(schedId + "@2026-09-14T00:00:00Z",
+                                  schedId, "ag", "2026-09-14T00:00:00Z",
+                                  12345, "1");
+    if (!claimOk) {
+        // Diagnose: does the table exist? does the insert work at all?
+        auto q = a.dataStore.Prepare("SELECT count(*) FROM task_runs");
+        std::string n = (q && q->Step()) ? std::to_string(q->ColumnInt64(0)) : "?";
+        std::cerr << "    [diag] task_runs rows: " << n << "\n";
+        auto raw = a.dataStore.Prepare(
+            "INSERT INTO task_runs (run_uuid, schedule_id, agent_id, scheduled_for, "
+            "node_id, started_at_unix_ms) VALUES ('diag','" + schedId + "','ag','w','1',1) "
+            "ON CONFLICT(run_uuid) DO NOTHING");
+        std::cerr << "    [diag] raw insert: " << (raw && raw->ExecDML()) << " err="
+                  << a.dataStore.ErrMsg() << "\n";
+        auto t = a.dataStore.Prepare(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='task_runs'");
+        while (t && t->Step()) std::cerr << "    [diag] trigger: " << t->ColumnText(0) << "\n";
+    }
+    Assert(claimOk, "claim inserted");
+
+    // Both writes must be in A's outbox.
+    auto recs = a.sync.FetchOutboxSince(0, 1000);
+    bool sawSched = false, sawRun = false;
+    std::string schedKey;
+    for (const auto& r : recs) {
+        if (r.table_name == "schedules" && r.row_key == schedId) sawSched = true;
+        if (r.table_name == "task_runs") sawRun = true;
+    }
+    Assert(sawSched, "outbox captured schedule row (TEXT key)");
+    Assert(sawRun, "outbox captured task_run claim");
+
+    // B pulls: both tables converge.
+    const int applied = b.PullFrom(a);
+    Assert(applied >= 2, "B applied both rows, got " + std::to_string(applied));
+    Assert(b.scheduleStore.Get(schedId).has_value(),
+           "B sees the schedule after pull");
+    Assert(b.taskRunStore.GetByUuid(schedId + "@2026-09-14T00:00:00Z").has_value(),
+           "B sees the task_run claim after pull");
+    Assert(b.taskRunStore.GetByUuid(schedId + "@2026-09-14T00:00:00Z")->node_id == "1",
+           "claim carries node identity");
+
+    // Cross-node idempotency: B's claim of the SAME uuid fails (A owns it),
+    // and replicating that conflict back to A changes nothing.
+    Assert(!b.taskRunStore.TryClaim(schedId + "@2026-09-14T00:00:00Z",
+                                    schedId, "ag", "2026-09-14T00:00:00Z",
+                                    99999, "2"),
+           "duplicate claim rejected on B (replicated claim fences)");
+
+    // Update + delete of a schedule replicate too.
+    auto got = a.scheduleStore.Get(schedId);
+    Assert(got.has_value(), "refetch");
+    got->message = "updated message";
+    Assert(a.scheduleStore.Update(*got, &err), "update: " + err);
+    std::string delErr;
+    Assert(a.scheduleStore.Delete(schedId, &delErr), "delete: " + delErr);
+    const int applied2 = b.PullFrom(a);
+    Assert(applied2 >= 2, "update+delete replicated, got " + std::to_string(applied2));
+    Assert(!b.scheduleStore.Get(schedId).has_value(),
+           "schedule delete converged on B");
+    return 0;
+}
+
 int main() {
     std::cerr << "\n=== Outbox Sync Tests (#78 P1b) ===\n\n";
     TestTriggerCoverage();
@@ -392,6 +486,7 @@ int main() {
     TestLocalWritesDuringApply();
     TestPeerCursors();
     TestIdempotentBoot();
+    TestSchedulerTableReplication();
     if (g_failures == 0) std::cerr << "\nAll outbox sync tests passed.\n";
     else std::cerr << "\n" << g_failures << " test assertion(s) FAILED.\n";
     return g_failures == 0 ? 0 : 1;

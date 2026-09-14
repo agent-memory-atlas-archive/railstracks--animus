@@ -3,6 +3,8 @@
 #include "animus_kernel/MemoryStore.h"
 #include "animus_kernel/OntologyStore.h"
 #include "animus_kernel/admin/DiaryManager.h"
+#include "animus_kernel/scheduler/ScheduleStore.h"
+#include "animus_kernel/scheduler/TaskRunStore.h"
 #include "animus_kernel/IDataStore.h"
 
 #include <cstdint>
@@ -40,10 +42,15 @@ struct StoreSet {
     memory::MemoryStore memory;
     ontology::OntologyStore ontology;
     DiaryStore diary;
+    ScheduleStore schedules;
+    TaskRunStore taskRuns;
 
     explicit StoreSet(const std::string& path)
         : dataStore(path), memory(&dataStore),
-          ontology(&dataStore), diary(&dataStore) {}
+          ontology(&dataStore), diary(&dataStore),
+          schedules(&dataStore), taskRuns(&dataStore) {
+        taskRuns.EnsureSchema();   // ctor doesn't ensure
+    }
 };
 
 } // namespace
@@ -79,7 +86,8 @@ int TestSeedNodeOne() {
         StoreSet stores(dbPath);
         std::string err;
         const int seeded = SeedAgentGlobalIdRanges(&stores.dataStore, 1, &err);
-        Assert(seeded == (int)AgentGlobalTables().size(),
+        // 12 agent-global tables + task_runs (P2a scheduler replication).
+        Assert(seeded == (int)AgentGlobalTables().size() + 1,
                "all tables seeded, got " + std::to_string(seeded) +
                " err=" + err);
 

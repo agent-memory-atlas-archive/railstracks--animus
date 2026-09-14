@@ -17,6 +17,13 @@ const std::vector<std::string>& AgentGlobalTables() {
         "ontology_properties",
         "ontology_mutations",
         "diary_entries",
+        // #78 P2a: scheduler tables join the replicated set. schedules.id
+        // is TEXT (random hex — globally unique by construction, no id-range
+        // needed); task_runs.id is INTEGER (node-range seeded alongside the
+        // agent-global set in SeedAgentGlobalIdRanges). The P2a sync-layer
+        // migration widens row-id columns to TEXT to carry both key styles.
+        "schedules",
+        "task_runs",
     };
     return tables;
 }
@@ -163,9 +170,20 @@ int SeedAgentGlobalIdRanges(IDataStore* store, uint64_t nodeId, std::string* err
         }
         raised++;
     }
+    // task_runs (#78 P2a): replicated table with integer ids — same
+    // node-scoped range discipline (a peer's task_runs claim rows must be
+    // distinguishable by id alone). Seeded alongside the agent-global set;
+    // a failure here is non-fatal for the same reason.
+    {
+        const bool ok = (store->Dialect() == DataStoreDialect::PostgreSQL)
+            ? SeedPostgres(store, "task_runs", seed)
+            : SeedSqlite(store, "task_runs", seed);
+        if (ok) raised++;
+        else ALOG_WARNING("id-ranges", "failed to seed task_runs "
+                          "(store error: " << store->ErrMsg() << ")");
+    }
     ALOG_INFO("id-ranges", "node " << nodeId << " id ranges seeded at "
-              << seed << " (" << raised << "/" << AgentGlobalTables().size()
-              << " tables)");
+              << seed << " (" << raised << " tables)");
     return raised;
 }
 

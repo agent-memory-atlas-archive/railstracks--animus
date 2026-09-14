@@ -102,7 +102,7 @@
                 j["outbox_id"] = Json::Int64(r.outbox_id);
                 j["origin_node"] = Json::Int64(r.origin_node);
                 j["table_name"] = r.table_name;
-                j["row_id"] = Json::Int64(r.row_id);
+                j["row_id"] = r.row_key;
                 j["op"] = r.op;
                 j["payload"] = r.payload;   // raw full-row JSON string
                 j["unix_ms"] = Json::Int64(r.unix_ms);

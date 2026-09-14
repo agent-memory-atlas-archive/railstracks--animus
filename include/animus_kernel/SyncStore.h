@@ -32,15 +32,22 @@ struct OutboxRecord {
     int64_t outbox_id{0};
     int64_t origin_node{0};
     std::string table_name;
-    int64_t row_id{0};
+    std::string row_key;    // TEXT row identity: int ids stringify, TEXT ids as-is
     std::string op;        // "upsert" | "delete"
     std::string payload;   // full-row JSON (upsert) or {"id":N} (delete)
     int64_t unix_ms{0};
 };
 
-class SyncStore {
+struct SyncStore {
 public:
     SyncStore(IDataStore* store, uint64_t localNodeId);
+
+    // SQLite table-rebuild helper (P2a): recreates a sync table with a
+    // changed column type, preserving rows. Used for the INTEGER -> TEXT
+    // row-id migration (schedules/task_runs joined the synced set with
+    // TEXT / node-scoped int ids expressed as text).
+    static bool RebuildSqliteTableWide(IDataStore* store, const std::string& ddl,
+                                       const std::string& table, std::string* error);
 
     // Creates the sync tables and installs change triggers on EVERY
     // agent-global table (live schema read at install time). Call after all
