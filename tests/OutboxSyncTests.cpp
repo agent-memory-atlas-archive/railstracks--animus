@@ -508,6 +508,33 @@ int TestSchedulerTableReplication() {
 
 // ── #78 P2b: leases replicate, epochs fence, double-claims reconcile ──
 int TestLeaseReplicationAndFencing() {
+    std::cerr << "  [P2c] default layer seeding converges cross-node...\n";
+    {
+        Node a(1), b(2);
+        Assert(a.memory.CreateDefaultLayersForAgent("ag"), "A seeds defaults");
+        Assert(b.memory.CreateDefaultLayersForAgent("ag"), "B seeds defaults");
+        a.PullFrom(b);
+        b.PullFrom(a);
+        Assert(a.CountRows("memory_layers") == 7, "A: exactly 7 layers");
+        Assert(b.CountRows("memory_layers") == 7, "B: exactly 7 layers");
+        Assert(a.CountRows("layer_perspectives") == 7, "A: exactly 7 perspectives");
+        Assert(b.CountRows("layer_perspectives") == 7, "B: exactly 7 perspectives");
+        for (int64_t id = 1; id <= 7; ++id) {
+            Assert(a.HasRow("memory_layers", id), "A has fixed-id layer");
+            Assert(b.HasRow("memory_layers", id), "B has fixed-id layer");
+            Assert(a.HasRow("layer_perspectives", id), "A has fixed-id perspective");
+            Assert(b.HasRow("layer_perspectives", id), "B has fixed-id perspective");
+        }
+        // Wiped node rebuild: reseed produces the SAME fixed ids and reconverges.
+        a.dataStore.Exec("DELETE FROM memory_layers");
+        Assert(a.CountRows("memory_layers") == 0, "A wiped");
+        Assert(a.memory.CreateDefaultLayersForAgent("ag"), "A reseeds");
+        a.PullFrom(b);
+        Assert(a.CountRows("memory_layers") == 7, "A rebuilt to 7");
+        for (int64_t id = 1; id <= 7; ++id)
+            Assert(a.HasRow("memory_layers", id), "A rebuilt fixed-id layer");
+    }
+
     std::cerr << "  [P2b] lease replication + epoch fencing + double-claim heal...\n";
     Node a(1);
     Node b(2);

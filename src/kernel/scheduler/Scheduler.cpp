@@ -677,7 +677,7 @@ void Scheduler::ProcessDueSchedules() {
                             event.metadata["agent_id"] = schedule.agent_id;
                             outcome2 = m_fireCallback(event);
                         }
-                        m_runStore.Finish(runUuid, outcome2, "", nowMs);
+                        m_runStore.Finish(runUuid, outcome2, "", nowMs, m_nodeId);
                         // fall through to state update below
                     } else {
                         continue;   // lag / unreachable — pause
@@ -730,7 +730,7 @@ void Scheduler::ProcessDueSchedules() {
                     event.metadata["agent_id"] = schedule.agent_id;
                     outcome = m_fireCallback(event);
                 }
-                m_runStore.Finish(runUuid, outcome, "", nowMs);
+                m_runStore.Finish(runUuid, outcome, "", nowMs, m_nodeId);
             }
         }
 

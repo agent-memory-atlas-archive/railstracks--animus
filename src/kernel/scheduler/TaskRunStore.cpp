@@ -183,15 +183,21 @@ int TaskRunStore::FenceRunUuid(const std::string& runUuid) {
 }
 
 bool TaskRunStore::Finish(const std::string& runUuid, const std::string& outcome,
-                          const std::string& error, int64_t finishedAtUnixMs) {
+                          const std::string& error, int64_t finishedAtUnixMs,
+                          const std::string& nodeId) {
+    // Empty nodeId = legacy unscoped form (unit tests on single-node
+    // stores); production callers pass their node id so a finish touches
+    // only the caller's own row of the window.
+    const std::string scope = nodeId.empty() ? "" : " AND node_id=?";
     auto stmt = m_store->Prepare(
         "UPDATE task_runs SET outcome=?, error=?, finished_at_unix_ms=? "
-        "WHERE run_uuid=?");
+        "WHERE run_uuid=?" + scope);
     if (!stmt) return false;
     stmt->BindText(1, outcome);
     stmt->BindText(2, error);
     stmt->BindInt64(3, finishedAtUnixMs);
     stmt->BindText(4, runUuid);
+    if (!nodeId.empty()) stmt->BindText(5, nodeId);
     stmt->ExecDML();
     return true;
 }

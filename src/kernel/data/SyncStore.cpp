@@ -499,6 +499,12 @@ bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
         }
     }
     bool ok = (rec.op == kDelete) ? ApplyDelete(rec) : ApplyUpsert(rec);
+    // Capture the error string NOW — sqlite3_errmsg is per-connection and
+    // the next SUCCESSFUL statement (the sync_control cleanup below)
+    // resets it to "not an error", hiding the real cause (witnessed as a
+    // 14x/side WARN flood during #78 P2b chaos; real cause was a natural-
+    // key UNIQUE violation, invisible in the log).
+    std::string applyErr = ok ? std::string() : m_store->ErrMsg();
     {
         auto q = m_store->Prepare(
             "UPDATE sync_control SET apply_table = NULL, apply_row_id = NULL, "
@@ -506,7 +512,7 @@ bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
         if (q) q->ExecDML();
     }
     if (!ok) ALOG_WARNING("sync", "apply FAILED for " << rec.table_name
-                          << "/" << rec.row_key << ": " << m_store->ErrMsg());
+                          << "/" << rec.row_key << ": " << applyErr);
     else if (ok && rec.table_name == "task_runs")
         // P2b: a task_runs apply can complete a partition double-claim —
         // run the epoch-fence reconciliation for that window so the loser

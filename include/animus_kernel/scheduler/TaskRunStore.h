@@ -62,8 +62,13 @@ public:
                   int64_t epoch = 0);
 
     // Record the dispatch outcome. Returns false if the uuid is unknown.
+    // Finishes THIS node's claim row for the window. Scoped by node_id:
+    // one node's finish must not smear its outcome onto peer rows of the
+    // same run_uuid (the fenced loser keeps its own state — witnessed as
+    // identical-ms finished stamps on both rows during chaos S1).
     bool Finish(const std::string& runUuid, const std::string& outcome,
-                const std::string& error, int64_t finishedAtUnixMs);
+                const std::string& error, int64_t finishedAtUnixMs,
+                const std::string& nodeId = "");
 
     // Window takeover for a stale pending claim (#78 P2b): the claiming
     // node died between claim and dispatch (outcome still 'running' while

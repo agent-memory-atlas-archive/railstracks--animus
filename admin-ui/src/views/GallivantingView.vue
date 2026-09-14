@@ -414,6 +414,7 @@ async function saveSchedule() {
     const payload: Record<string, unknown> = {
       agent_id: selectedAgentId.value,
       tag: 'gallivanting',
+      semantics: 'at_least_once',
       when: cronExpr,
       repeat: true,
       timezone: scheduleForm.value.timezone,
