@@ -21,7 +21,6 @@ void ScheduleLeaseStore::EnsureSchema() {
             expires_ms INTEGER NOT NULL,
             last_renew_ms INTEGER NOT NULL
         )");
-    )");
     m_store->Exec(
         "CREATE INDEX IF NOT EXISTS idx_schedule_leases_sched "
         "ON schedule_leases(schedule_id, epoch DESC, expires_ms DESC);");
