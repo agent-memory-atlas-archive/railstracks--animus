@@ -213,8 +213,11 @@ int TestPipelineIntakeFromDiary() {
                                        const std::string& userPrompt) -> std::string {
         g_llmCallCount++;
         if (userPrompt.find("diary entries") == std::string::npos) return "[]";
+        auto layers = memStore.ListLayersForAgent("agent1");
+        if (layers.empty()) return "[]";
         memory::Observation obs;
         obs.agent_id = "agent1";
+        obs.layer_id = layers.front().id;
         obs.text = "Agent learned about memory consolidation";
         obs.tags_json = "[\"memory\",\"learning\"]";
         obs.weight = 0.8;
