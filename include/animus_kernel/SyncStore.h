@@ -98,6 +98,8 @@ private:
     bool InstallTriggersFor(const std::string& table, std::string* error);
     bool ApplyUpsert(const OutboxRecord& rec);
     bool ApplyDelete(const OutboxRecord& rec);
+    // P2b: epoch-fence a run window after a remote task_runs apply.
+    void FenceTaskRun(const std::string& payloadJson);
 
     IDataStore* m_store;
     uint64_t m_nodeId;

@@ -412,36 +412,59 @@ std::optional<MemoryLayer> MemoryStore::GetIntakeLayer(const std::string& agent_
     return RowToLayer(stmt.get());
 }
 
-MemoryLayer MemoryStore::CreateLayer(const MemoryLayer& layer) {
+MemoryLayer MemoryStore::CreateLayer(const MemoryLayer& layer, int64_t preset_id) {
     auto now = NowUnixMs();
     std::string agentId = layer.agent_id;
-    auto stmt = m_store->Prepare(
-        "INSERT INTO memory_layers (agent_id, name, horizon, sort_order, evaluation_interval_seconds, "
+
+    // #78 P2c deterministic defaults: a preset row that already exists (by
+    // id — replicated copy or reseed; or by name — legacy autoincrement
+    // defaults from a pre-P2c node) is KEPT, never duplicated.
+    if (preset_id > 0) {
+        auto byId = m_store->Prepare(
+            "SELECT id FROM memory_layers WHERE id = ?");
+        if (byId && byId->BindInt64(1, preset_id) && byId->Step()) {
+            return GetLayer(preset_id).value_or(MemoryLayer{});
+        }
+        auto byName = m_store->Prepare(
+            "SELECT id FROM memory_layers WHERE agent_id = ? AND name = ?");
+        if (byName && byName->BindText(1, agentId)
+                && byName->BindText(2, layer.name) && byName->Step()) {
+            return GetLayer(byName->ColumnInt64(0)).value_or(MemoryLayer{});
+        }
+    }
+
+    const bool fixed = preset_id > 0;
+    auto stmt = m_store->Prepare(std::string(
+        "INSERT INTO memory_layers (")
+        + (fixed ? "id, " : "")
+        + "agent_id, name, horizon, sort_order, evaluation_interval_seconds, "
         "cron_expr, consolidation_prompt, consolidation_intake_prompt, intake_interval, "
         "token_budget, enabled, created_at_unix_ms, updated_at_unix_ms) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "VALUES (" + (fixed ? "?, " : "") + "?,?,?,?,?,?,?,?,?,?,?,?,?) "
         // #76: idempotent layer ensure — parallel boot races collapse onto one row.
         "ON CONFLICT(agent_id, name) DO NOTHING "
         "RETURNING id");
     if (!stmt) return {};
 
-    stmt->BindText(1, agentId);
-    stmt->BindText(2, layer.name);
-    stmt->BindText(3, layer.horizon);
-    stmt->BindInt(4, layer.sort_order);
-    stmt->BindInt64(5, layer.evaluation_interval_seconds);
-    stmt->BindText(6, layer.cron_expr);
-    stmt->BindText(7, layer.consolidation_review_prompt);
-    stmt->BindText(8, layer.consolidation_intake_prompt);
+    int bind = 0;
+    if (fixed) stmt->BindInt64(++bind, preset_id);
+    stmt->BindText(++bind, agentId);
+    stmt->BindText(++bind, layer.name);
+    stmt->BindText(++bind, layer.horizon);
+    stmt->BindInt(++bind, layer.sort_order);
+    stmt->BindInt64(++bind, layer.evaluation_interval_seconds);
+    stmt->BindText(++bind, layer.cron_expr);
+    stmt->BindText(++bind, layer.consolidation_review_prompt);
+    stmt->BindText(++bind, layer.consolidation_intake_prompt);
     if (layer.intake_interval.has_value() && !layer.intake_interval->empty()) {
-        stmt->BindText(9, *layer.intake_interval);
+        stmt->BindText(++bind, *layer.intake_interval);
     } else {
-        stmt->BindNull(9);
+        stmt->BindNull(++bind);
     }
-    stmt->BindInt64(10, layer.token_budget);
-    stmt->BindInt(11, layer.enabled ? 1 : 0);
-    stmt->BindInt64(12, now);
-    stmt->BindInt64(13, now);
+    stmt->BindInt64(++bind, layer.token_budget);
+    stmt->BindInt(++bind, layer.enabled ? 1 : 0);
+    stmt->BindInt64(++bind, now);
+    stmt->BindInt64(++bind, now);
 
     // #76: statement-scoped id via RETURNING; on conflict resolve the
     // existing row instead of failing (parallel-boot safe).
@@ -464,14 +487,24 @@ MemoryLayer MemoryStore::CreateLayer(const MemoryLayer& layer) {
 
     auto result = GetLayer(newLayerId);
 
-    // Auto-create perspective row
+    // Auto-create perspective row. #78 P2c: preset layers get a preset
+    // perspective id (same value) — cross-apply converges on identical rows.
     if (result) {
-        std::string sql = schema::InsertIgnoreSql(m_store,
-            "layer_perspectives", "layer_id, updated_at_unix_ms", "layer_id");
+        std::string sql = (preset_id > 0)
+            ? "INSERT OR IGNORE INTO layer_perspectives "
+              "(id, layer_id, updated_at_unix_ms) VALUES (?,?,?)"
+            : schema::InsertIgnoreSql(m_store,
+              "layer_perspectives", "layer_id, updated_at_unix_ms", "layer_id");
         auto ps = m_store->Prepare(sql);
         if (ps) {
-            ps->BindInt64(1, result->id);
-            ps->BindInt64(2, now);
+            if (preset_id > 0) {
+                ps->BindInt64(1, result->id);   // id = layer_id (1:1)
+                ps->BindInt64(2, result->id);
+                ps->BindInt64(3, now);
+            } else {
+                ps->BindInt64(1, result->id);
+                ps->BindInt64(2, now);
+            }
             ps->Step();
         }
     }
@@ -591,7 +624,13 @@ bool MemoryStore::CreateDefaultLayersForAgent(const std::string& agent_id) {
         layer.token_budget = def.token_budget;
         layer.enabled = true;
 
-        auto created = CreateLayer(layer);
+        // #78 P2c: deterministic ids 1..7 — below every node's id-space
+        // (node ranges start at N<<40 + 1), so independently-booted nodes
+        // seed IDENTICAL rows and cross-apply converges instead of
+        // colliding on unique(agent_id, name) (the 14×/side WARN flood).
+        static_assert(7 <= 1099511627776LL, "reserved default ids fit below node 1 range");
+        const int64_t presetId = static_cast<int64_t>(&def - defaults) + 1;
+        auto created = CreateLayer(layer, presetId);
         if (created.id == 0) {
             ALOG_WARNING("memory", "failed to seed layer: " << def.name);
         }

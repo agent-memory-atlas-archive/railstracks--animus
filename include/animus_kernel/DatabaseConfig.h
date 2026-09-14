@@ -25,6 +25,8 @@ struct DatabaseConfig {
     std::uint64_t nodeId{0};              // 0 = single-node
     std::vector<std::string> peers;       // peer admin endpoints
     std::string syncToken;                // bearer token for peer pulls (#78 P1c)
+    std::uint64_t leaseTtlMs{60000};      // #78 P2b schedule lease TTL
+    std::uint64_t leaseGraceMs{30000};    // #78 P2b takeover grace window
 
     /// Load from a JSON file. Returns true on success, false if file not found.
     /// Missing fields use defaults. CLI args override loaded values.

@@ -372,6 +372,7 @@ add_library(animus_kernel
   src/kernel/scheduler/ScheduleStore.cpp
   src/kernel/scheduler/Scheduler.cpp
   src/kernel/scheduler/TaskRunStore.cpp
+  src/kernel/scheduler/ScheduleLeaseStore.cpp
   src/kernel/data/IdRanges.cpp
   src/kernel/data/SyncStore.cpp
   src/kernel/PeerSyncService.cpp

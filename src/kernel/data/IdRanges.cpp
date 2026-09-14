@@ -24,6 +24,10 @@ const std::vector<std::string>& AgentGlobalTables() {
         // migration widens row-id columns to TEXT to carry both key styles.
         "schedules",
         "task_runs",
+        // #78 P2b: schedule leases replicate too (epoch-fenced failover —
+        // the merged effective lease is derived at read time: max epoch,
+        // then max expires_ms, then max id). Integer ids, node-range seeded.
+        "schedule_leases",
     };
     return tables;
 }

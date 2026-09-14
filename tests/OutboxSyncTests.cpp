@@ -7,12 +7,16 @@
 #include "animus_kernel/admin/DiaryManager.h"
 #include "animus_kernel/scheduler/ScheduleStore.h"
 #include "animus_kernel/scheduler/TaskRunStore.h"
+#include "animus_kernel/scheduler/ScheduleLeaseStore.h"
+#include "animus_kernel/scheduler/Scheduler.h"
 #include "animus_kernel/IDataStore.h"
 
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <thread>
 
 using namespace animus::kernel;
 
@@ -43,14 +47,20 @@ struct Node {
     DiaryStore diary;
     ScheduleStore scheduleStore;
     TaskRunStore taskRunStore;
+    ScheduleLeaseStore leaseStore;
     SyncStore sync;
 
     Node(uint64_t nodeId)
         : dbPath(MakeTempDbPath()), dataStore(dbPath), memory(&dataStore),
           files(&dataStore), ontology(&dataStore), diary(&dataStore),
           scheduleStore(&dataStore), taskRunStore(&dataStore),
-          sync(&dataStore, nodeId) {
+          leaseStore(&dataStore), sync(&dataStore, nodeId) {
         taskRunStore.EnsureSchema();   // ctor doesn't ensure; schedules does
+        leaseStore.EnsureSchema();     // must pre-exist trigger install
+        // Kernel parity: node-scoped id ranges so cross-node rows never
+        // collide (P2b double-claim test writes on BOTH nodes before pull).
+        std::string rangeErr;
+        SeedAgentGlobalIdRanges(&dataStore, nodeId, &rangeErr);
         std::string err;
         if (!sync.EnsureSchema(&err)) {
             std::cerr << "  FATAL: node " << nodeId << " sync init: " << err << "\n";
@@ -131,10 +141,20 @@ int TestTriggerCoverage() {
                      "VALUES ('m', 't', 1, 1)");
     a.dataStore.Exec("INSERT INTO memory_files (source_path, file_type, created_at_unix_ms, imported_at_unix_ms) "
                      "VALUES ('/x', 1, 1, 1)");
+    const int64_t fileId = [&]{
+        auto q = a.dataStore.Prepare(
+            "SELECT id FROM memory_files ORDER BY id DESC LIMIT 1");
+        return (q && q->Step()) ? q->ColumnInt64(0) : 1;
+    }();
     a.dataStore.Exec("INSERT INTO memory_file_chunks (file_id, source_path, content, created_at_unix_ms) "
-                     "VALUES (1, '/x', 'c', 1)");
+                     "VALUES (" + std::to_string(fileId) + ", '/x', 'c', 1)");
+    const int64_t entityId = [&]{
+        auto q = a.dataStore.Prepare(
+            "SELECT id FROM ontology_entities ORDER BY id DESC LIMIT 1");
+        return (q && q->Step()) ? q->ColumnInt64(0) : 1;
+    }();
     a.dataStore.Exec("INSERT INTO ontology_properties (entity_id, key, created_at_unix_ms, updated_at_unix_ms) "
-                     "VALUES (1, 'k', 1, 1)");
+                     "VALUES (" + std::to_string(entityId) + ", 'k', 1, 1)");
     a.dataStore.Exec("INSERT INTO ontology_mutations (mutation_type, target_type, target_id, unix_ms) "
                      "VALUES ('m', 't', 1, 1)");
 
@@ -145,9 +165,10 @@ int TestTriggerCoverage() {
                      "VALUES ('cov-sched', 'ag', 'one_shot', '2026-09-14T00:00:00Z', 'x', 1, '2026-09-13T00:00:00Z')");
     a.dataStore.Exec("INSERT INTO task_runs (run_uuid, schedule_id, agent_id, scheduled_for, started_at_unix_ms) "
                      "VALUES ('cov-run', 'cov-sched', 'ag', 'w', 1)");
+    a.leaseStore.Acquire("cov-sched", "1", 1, 1, 60000);
 
     auto records = a.sync.FetchOutboxSince(0, 1000);
-    Assert(records.size() >= 12, "12+ outbox records, got " +
+    Assert(records.size() >= 13, "13+ outbox records, got " +
            std::to_string(records.size()));
     // distinct agent-global tables captured
     const auto tables = AgentGlobalTables();
@@ -163,9 +184,16 @@ int TestTriggerCoverage() {
         Assert(r.unix_ms > 0 && r.payload.size() > 2,
                "record has ms + payload: " + r.table_name);
 
-    // UPDATE + DELETE fire too
-    a.dataStore.Exec("UPDATE memory_mutations SET motivation = 'x' WHERE id = 1");
-    a.dataStore.Exec("DELETE FROM memory_mutations WHERE id = 1");
+    // UPDATE + DELETE fire too (row created above — find its real id)
+    const int64_t mutId = [&]{
+        auto q = a.dataStore.Prepare(
+            "SELECT id FROM memory_mutations ORDER BY id DESC LIMIT 1");
+        return (q && q->Step()) ? q->ColumnInt64(0) : 1;
+    }();
+    a.dataStore.Exec("UPDATE memory_mutations SET motivation = 'x' WHERE id = "
+                     + std::to_string(mutId));
+    a.dataStore.Exec("DELETE FROM memory_mutations WHERE id = "
+                     + std::to_string(mutId));
     auto after = a.sync.FetchOutboxSince(records.back().outbox_id, 100);
     Assert(after.size() == 2, "update+delete recorded, got " +
            std::to_string(after.size()));
@@ -478,6 +506,247 @@ int TestSchedulerTableReplication() {
     return 0;
 }
 
+// ── #78 P2b: leases replicate, epochs fence, double-claims reconcile ──
+int TestLeaseReplicationAndFencing() {
+    std::cerr << "  [P2c] default layer seeding converges cross-node...\n";
+    {
+        Node a(1), b(2);
+        Assert(a.memory.CreateDefaultLayersForAgent("ag"), "A seeds defaults");
+        Assert(b.memory.CreateDefaultLayersForAgent("ag"), "B seeds defaults");
+        a.PullFrom(b);
+        b.PullFrom(a);
+        Assert(a.CountRows("memory_layers") == 7, "A: exactly 7 layers");
+        Assert(b.CountRows("memory_layers") == 7, "B: exactly 7 layers");
+        Assert(a.CountRows("layer_perspectives") == 7, "A: exactly 7 perspectives");
+        Assert(b.CountRows("layer_perspectives") == 7, "B: exactly 7 perspectives");
+        for (int64_t id = 1; id <= 7; ++id) {
+            Assert(a.HasRow("memory_layers", id), "A has fixed-id layer");
+            Assert(b.HasRow("memory_layers", id), "B has fixed-id layer");
+            Assert(a.HasRow("layer_perspectives", id), "A has fixed-id perspective");
+            Assert(b.HasRow("layer_perspectives", id), "B has fixed-id perspective");
+        }
+        // Wiped node rebuild: reseed produces the SAME fixed ids and reconverges.
+        a.dataStore.Exec("DELETE FROM memory_layers");
+        Assert(a.CountRows("memory_layers") == 0, "A wiped");
+        Assert(a.memory.CreateDefaultLayersForAgent("ag"), "A reseeds");
+        a.PullFrom(b);
+        Assert(a.CountRows("memory_layers") == 7, "A rebuilt to 7");
+        for (int64_t id = 1; id <= 7; ++id)
+            Assert(a.HasRow("memory_layers", id), "A rebuilt fixed-id layer");
+    }
+
+    std::cerr << "  [P2b] lease replication + epoch fencing + double-claim heal...\n";
+    Node a(1);
+    Node b(2);
+    const int64_t now = 1760000000000LL;
+
+    // A acquires epoch 1 and claims a run under it.
+    auto la = a.leaseStore.Acquire("sched-lease1", "1", 1, now, 60000);
+    Assert(la.epoch == 1, "A lease epoch 1");
+    const std::string uuid = "sched-lease1@2026-09-14T00:00:00Z";
+    Assert(a.taskRunStore.TryClaim(uuid, "sched-lease1", "ag",
+                                   "2026-09-14T00:00:00Z", now, "1", 1),
+           "A claims under epoch 1");
+
+    // Partition scenario: B (unaware) takes over epoch 2 and claims the
+    // SAME window under epoch 2. Both nodes now hold a claim row.
+    auto lb = b.leaseStore.Acquire("sched-lease1", "2", 2, now + 1000, 60000);
+    Assert(lb.epoch == 2, "B takeover epoch 2");
+    Assert(b.taskRunStore.TryClaim(uuid, "sched-lease1", "ag",
+                                   "2026-09-14T00:00:00Z", now + 1000, "2", 2),
+           "B claims same window under epoch 2");
+
+    // Heal: B pulls A. The epoch-1 claim row arrives — apply MUST SUCCEED
+    // (the P2a UNIQUE-constraint latent bug would fail here) and the
+    // epoch fence marks A's row the loser on B.
+    {
+        auto recsDiag = a.sync.FetchOutboxSince(0, 1000);
+        std::cerr << "    [diag] A outbox records: " << recsDiag.size() << "\n";
+        for (const auto& r : recsDiag) {
+            std::cerr << "    [diag]   " << r.table_name << "/" << r.row_key
+                      << " op=" << r.op << " ms=" << r.unix_ms << "\n";
+        }
+    }
+    const int appliedB = b.PullFrom(a);
+    Assert(appliedB >= 2, "B applied A's lease+claim (no apply failure), got "
+           + std::to_string(appliedB));
+    auto bEff = b.leaseStore.EffectiveLease("sched-lease1");
+    Assert(bEff.has_value() && bEff->epoch == 2 && bEff->holder_node_id == "2",
+           "B effective lease stays epoch 2 / holder 2 after pull");
+    auto rowsB = b.leaseStore.ListRows("sched-lease1");
+    Assert(rowsB.size() == 2, "both lease rows coexist on B");
+    auto gotB = b.taskRunStore.GetByUuid(uuid);
+    Assert(gotB.has_value() && gotB->epoch == 2 && !gotB->fenced,
+           "B survivor claim = epoch 2, unfenced");
+
+    // Reverse pull: A receives epoch-2 lease + claim; A's own claim fences.
+    const int appliedA = a.PullFrom(b);
+    Assert(appliedA >= 2, "A applied B's rows, got " + std::to_string(appliedA));
+    auto aEff = a.leaseStore.EffectiveLease("sched-lease1");
+    Assert(aEff.has_value() && aEff->epoch == 2 && aEff->holder_node_id == "2",
+           "A converges to epoch 2 / holder 2 (loser defers)");
+    auto gotA = a.taskRunStore.GetByUuid(uuid);
+    Assert(gotA.has_value() && gotA->epoch == 2 && !gotA->fenced,
+           "A survivor view = epoch 2");
+
+    // The loser row is visibly fenced on both nodes (tripwire witness).
+    int fencedOnB = 0, fencedOnA = 0;
+    for (const auto& r : b.taskRunStore.ListForSchedule("sched-lease1", 10))
+        if (r.fenced) fencedOnB++;
+    for (const auto& r : a.taskRunStore.ListForSchedule("sched-lease1", 10))
+        if (r.fenced) fencedOnA++;
+    Assert(fencedOnB == 1, "B fences the epoch-1 duplicate (got "
+           + std::to_string(fencedOnB) + ")");
+    Assert(fencedOnA == 1, "A fences its own superseded claim (got "
+           + std::to_string(fencedOnA) + ")");
+    return 0;
+}
+
+// ── #78 P2b: the fire loop gates lease_required schedules ──
+int TestLeaseGateFireLoop() {
+    std::cerr << "  [P2b] lease gate: acquire/renew/pause/takeover/self-fence...\n";
+    Node a(1);
+    Scheduler sched(&a.dataStore);
+    sched.SetNodeId("1");
+    sched.SetLeaseTtlMs(2500);
+    sched.SetLeaseGraceMs(150);
+    sched.SetClaimVisibilityMs(0);   // tests dispatch on the next pass
+    int dispatched = 0;
+    sched.SetFireCallback([&](const IncomingEvent&) {
+        dispatched++;
+        return "dispatched";
+    });
+
+    // Stub ack layers: mutable peer views the tests manipulate per case.
+    Scheduler::LeasePeerState ps;   // defaults: 0 peers configured
+    sched.SetLeaseAckFn([&](const std::string&, int64_t) { return ps; });
+    Scheduler::ClaimPeerState cs;   // defaults: 0 peers configured
+    sched.SetClaimAckFn([&](const std::string&) { return cs; });
+
+    // Two-phase: claim pass + (aged) dispatch pass.
+    auto pass2 = [&]() {
+        sched.ProcessDueSchedules();
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        sched.ProcessDueSchedules();
+    };
+
+    auto mkDue = [&](const std::string& semantics,
+                     const std::string& pastIso) {
+        ScheduleDescriptor sd;
+        sd.agent_id = "ag";
+        sd.type = ScheduleType::OneShot;
+        sd.next_fire = pastIso;
+        sd.message = "gate probe";
+        sd.semantics = semantics;
+        std::string err;
+        auto id = sched.Create(sd, &err);
+        Assert(!id.empty(), "create schedule: " + err);
+        return id;
+    };
+
+    // (a) at_least_once: no lease needed, fires single-phase.
+    mkDue("at_least_once", "2026-09-14T00:00:00Z");
+    sched.ProcessDueSchedules();
+    Assert(dispatched == 1, "at_least_once fires without lease");
+
+    // (b) lease_required, no lease row, no peers: acquires epoch 1,
+    // two-phase dispatch (claim pass, then aged dispatch pass).
+    std::string idB = mkDue("lease_required", "2026-09-14T00:01:00Z");
+    sched.ProcessDueSchedules();
+    Assert(dispatched == 1, "phase 1: claim only, no dispatch yet");
+    Assert(a.taskRunStore.GetByUuid(idB + "@2026-09-14T00:01:00Z")
+               ->outcome == "running",
+           "claim row pending (running)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    sched.ProcessDueSchedules();
+    Assert(dispatched == 2, "phase 2: dispatch after visibility window");
+    auto eff = sched.LeaseStore().EffectiveLease(idB);
+    Assert(eff.has_value() && eff->epoch == 1 && eff->holder_node_id == "1",
+           "lease row epoch 1 held by node 1");
+
+    // (c) second window, peer present + confirming my claim: dispatch.
+    ps = Scheduler::LeasePeerState{1, true, false, 0};
+    cs = Scheduler::ClaimPeerState{1, true, false, false};
+    ScheduleDescriptor sd2;
+    sd2.agent_id = "ag"; sd2.type = ScheduleType::OneShot;
+    sd2.next_fire = "2026-09-14T00:02:00Z"; sd2.semantics = "lease_required";
+    std::string idC = sched.Create(sd2, nullptr);
+    pass2();
+    Assert(dispatched == 3, "lease_required fires when claim confirmed");
+
+    // (h) foreign SURVIVOR claim exists: stand down, no dispatch, no claim.
+    const std::string uuidH = "sched-h@2026-09-14T00:05:00Z";
+    Assert(a.taskRunStore.TryClaim(uuidH, "sched-h", "ag",
+                                   "2026-09-14T00:05:00Z",
+                                   1760000000000LL, "2", 7),
+           "foreign claim row inserted");
+    ScheduleDescriptor sdH;
+    sdH.agent_id = "ag"; sdH.type = ScheduleType::OneShot;
+    sdH.next_fire = "2026-09-14T00:05:00Z"; sdH.semantics = "lease_required";
+    sdH.id = "sched-h";
+    Assert(!sched.Create(sdH, nullptr).empty(), "create foreign-claim probe");
+    pass2();
+    Assert(dispatched == 3, "foreign survivor claim = stand down");
+    Assert(a.taskRunStore.ListForSchedule("sched-h", 5).size() == 1,
+           "no new claim row for the foreign survivor window");
+
+    // (d) another node holds a VALID lease: paused (no claim, no advance).
+    ps = Scheduler::LeasePeerState{1, false, false, 0};   // peer up, not us
+    const int64_t nowMs = 1760000000000LL;
+    sched.LeaseStore().Acquire("sched-node2", "2", 5, nowMs, 60000);
+    ScheduleDescriptor sdD;
+    sdD.agent_id = "ag"; sdD.type = ScheduleType::OneShot;
+    sdD.next_fire = "2026-09-14T00:03:00Z"; sdD.semantics = "lease_required";
+    std::string idD = sched.Create(sdD, nullptr);
+    // Foreign holder: point the schedule id at the node-2 lease.
+    // (Acquire used a fixed id; create the schedule with the SAME id.)
+    // Simplest: reuse the lease's schedule id as the schedule id.
+    sched.Cancel(idD, nullptr);
+    ScheduleDescriptor sdD2 = sdD;
+    sdD2.id = "sched-node2";
+    std::string errD;
+    Assert(!sched.Create(sdD2, &errD).empty(), "create with matching id");
+    sched.ProcessDueSchedules();
+    Assert(dispatched == 3, "valid foreign lease = paused, no dispatch");
+    Assert(sched.Store().Get("sched-node2")->next_fire == "2026-09-14T00:03:00Z",
+           "paused schedule did not advance");
+
+    // (e) foreign lease expired beyond grace, peer known-down: takeover.
+    ps = Scheduler::LeasePeerState{1, false, true, 0};    // all peers down
+    sched.LeaseStore().Expire("sched-node2");   // expires now
+    std::this_thread::sleep_for(std::chrono::milliseconds(3200)); // retry + grace
+    sched.ProcessDueSchedules();
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    sched.ProcessDueSchedules();
+    Assert(dispatched == 4, "expired foreign lease + peer down = takeover fires");
+    auto eff2 = sched.LeaseStore().EffectiveLease("sched-node2");
+    Assert(eff2.has_value() && eff2->epoch == 6 && eff2->holder_node_id == "1",
+           "takeover epoch 6 (5+1) held by node 1");
+
+    // (f) MY lease expired, peer reachable but not acking: self-fenced.
+    ps = Scheduler::LeasePeerState{1, false, false, 0};
+    const int64_t past = 1760000000000LL - 100000;   // expired long ago
+    sched.LeaseStore().Acquire("sched-mine", "1", 3, past, 30000);
+    ScheduleDescriptor sdF;
+    sdF.agent_id = "ag"; sdF.type = ScheduleType::OneShot;
+    sdF.next_fire = "2026-09-14T00:04:00Z"; sdF.semantics = "lease_required";
+    sdF.id = "sched-mine";
+    Assert(!sched.Create(sdF, nullptr).empty(), "create self-fence probe");
+    std::this_thread::sleep_for(std::chrono::milliseconds(3200)); // retry window
+    pass2();
+    Assert(dispatched == 4, "self-fenced (no ack proof) = paused");
+
+    // (g) same, but peer acks our epoch (no takeover visible): re-acquire.
+    ps = Scheduler::LeasePeerState{1, true, false, 0};
+    std::this_thread::sleep_for(std::chrono::milliseconds(3200));
+    pass2();
+    Assert(dispatched == 5, "acked expired-own lease = re-acquire fires");
+    auto eff3 = sched.LeaseStore().EffectiveLease("sched-mine");
+    Assert(eff3.has_value() && eff3->epoch == 4 && eff3->holder_node_id == "1",
+           "re-acquire epoch 4 (3+1)");
+    return 0;
+}
+
 int main() {
     std::cerr << "\n=== Outbox Sync Tests (#78 P1b) ===\n\n";
     TestTriggerCoverage();
@@ -487,6 +756,8 @@ int main() {
     TestPeerCursors();
     TestIdempotentBoot();
     TestSchedulerTableReplication();
+    TestLeaseReplicationAndFencing();
+    TestLeaseGateFireLoop();
     if (g_failures == 0) std::cerr << "\nAll outbox sync tests passed.\n";
     else std::cerr << "\n" << g_failures << " test assertion(s) FAILED.\n";
     return g_failures == 0 ? 0 : 1;

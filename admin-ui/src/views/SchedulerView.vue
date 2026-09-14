@@ -25,6 +25,7 @@ interface ScheduleItem {
   cron_expr: string;
   timezone: string;
   message: string;
+  semantics: 'at_least_once' | 'lease_required';
   enabled: boolean;
   created_at: string;
   last_fire: string;
@@ -178,6 +179,7 @@ async function saveEdit() {
       max_fires: editForm.value.max_fires,
       schedule_type: editForm.value.schedule_type,
       next_fire: editForm.value.next_fire,
+      semantics: editForm.value.semantics,
     });
     editDialog.value = false;
     await loadSchedules();
@@ -289,6 +291,7 @@ onMounted(() => {
       :headers="[
         { title: 'ID', key: 'id' },
         { title: 'Type', key: 'schedule_type' },
+        { title: 'Execution', key: 'semantics' },
         { title: 'Tag', key: 'tag' },
         { title: 'Next Fire', key: 'next_fire' },
         { title: 'Status', key: 'status' },
@@ -307,6 +310,25 @@ onMounted(() => {
         <v-chip size="small" :color="item.schedule_type === 'recurring' ? 'indigo' : 'teal'" variant="tonal">
           {{ item.schedule_type }}
         </v-chip>
+      </template>
+      <template #item.semantics="{ item }">
+        <v-tooltip location="top" max-width="320">
+          <template #activator="{ props }">
+            <v-chip
+              v-bind="props"
+              size="small"
+              :color="item.semantics === 'lease_required' ? 'amber-darken-2' : 'grey'"
+              variant="tonal"
+            >
+              {{ item.semantics === 'lease_required' ? 'lease-required' : 'at-least-once' }}
+            </v-chip>
+          </template>
+          <span>{{
+            item.semantics === 'lease_required'
+              ? 'Exactly-once across nodes: fires only under a replicated lease — paused while authority is unproven.'
+              : 'At-least-once: fires wherever due; rare duplicate fires merge.'
+          }}</span>
+        </v-tooltip>
       </template>
       <template #item.tag="{ item }">
         <span>{{ item.tag || 'none' }}</span>
@@ -354,6 +376,7 @@ onMounted(() => {
           <td colspan="7">
             <div class="py-2">
               <div><strong>Message:</strong> {{ item.message || 'none' }}</div>
+              <div><strong>Execution:</strong> {{ item.semantics === 'lease_required' ? 'lease-required (exactly-once across nodes)' : 'at-least-once' }}</div>
               <div><strong>Cron:</strong> {{ item.cron_expr || 'n/a' }}</div>
               <div><strong>Timezone:</strong> {{ item.timezone || 'UTC' }}</div>
               <div><strong>Created:</strong> {{ formatDate(item.created_at) }}</div>
@@ -384,6 +407,20 @@ onMounted(() => {
               label="Schedule Type"
               density="compact"
               variant="outlined"
+            />
+          </v-col>
+          <v-col cols="12" sm="6">
+            <v-select
+              v-model="editForm.semantics"
+              :items="[
+                { title: 'at-least-once (analysis)', value: 'at_least_once' },
+                { title: 'lease-required (execution)', value: 'lease_required' }
+              ]"
+              label="Execution Semantics"
+              density="compact"
+              variant="outlined"
+              hint="lease-required: fires only under a replicated lease across nodes; paused while authority is unproven"
+              persistent-hint
             />
           </v-col>
           <v-col cols="12" sm="6">

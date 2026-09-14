@@ -28,6 +28,10 @@ struct ScheduleDescriptor {
     std::string timezone{"UTC"}; // IANA timezone for cron evaluation
     std::string message;         // context delivered on fire
     std::string metadata;        // optional JSON metadata (e.g. gallivanting config)
+    // #78 P2b task semantics: at_least_once (default — claim + dispatch,
+    // duplicates merge) | lease_required (execution-critical — dispatch
+    // only under a valid lease; fail-safe is NOT running).
+    std::string semantics{"at_least_once"};
     bool enabled{true};
     std::string created_at;      // ISO-8601
     std::string last_fire;       // ISO-8601 or empty
@@ -75,7 +79,7 @@ private:
         const std::string& metadata,
         bool enabled, const std::string& createdAt,
         const std::string& lastFire, std::int32_t fireCount,
-        std::int32_t maxFires) const;
+        std::int32_t maxFires, const std::string& semantics) const;
 
     IDataStore* m_store;
 };

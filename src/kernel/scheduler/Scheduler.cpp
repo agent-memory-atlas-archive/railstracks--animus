@@ -8,6 +8,7 @@
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <json/json.h>
 #include <sstream>
 #include <thread>
 
@@ -318,8 +319,9 @@ std::string Scheduler::ComputeNextFire(
 // ──────────────────────────────────────────────────────────────────
 
 Scheduler::Scheduler(IDataStore* dataStore)
-        : m_store(dataStore), m_runStore(dataStore) {
+        : m_store(dataStore), m_runStore(dataStore), m_leaseStore(dataStore) {
     m_runStore.EnsureSchema();
+    m_leaseStore.EnsureSchema();
 }
 
 Scheduler::~Scheduler() {
@@ -462,6 +464,141 @@ void Scheduler::PollLoop() {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────
+// #78 P2b: leases with epoch fencing
+// ──────────────────────────────────────────────────────────────────
+
+bool Scheduler::ReleaseLease(const std::string& scheduleId) {
+    return m_leaseStore.Expire(scheduleId);
+}
+
+Json::Value Scheduler::LeaseStatusJson() const {
+    Json::Value out(Json::objectValue);
+    Json::Value leases(Json::arrayValue);
+    // Distinct schedule_ids with lease rows
+    auto ids = m_leaseStore.ListRows("");
+    std::vector<std::string> seen;
+    for (const auto& row : ids) {
+        if (std::find(seen.begin(), seen.end(), row.schedule_id) != seen.end())
+            continue;
+        seen.push_back(row.schedule_id);
+    }
+    for (const auto& sid : seen) {
+        auto eff = m_leaseStore.EffectiveLease(sid);
+        if (!eff) continue;
+        Json::Value j(Json::objectValue);
+        j["schedule_id"] = eff->schedule_id;
+        j["holder_node_id"] = eff->holder_node_id;
+        j["epoch"] = Json::Int64(eff->epoch);
+        j["acquired_ms"] = Json::Int64(eff->acquired_ms);
+        j["expires_ms"] = Json::Int64(eff->expires_ms);
+        j["last_renew_ms"] = Json::Int64(eff->last_renew_ms);
+        j["expired"] = eff->expires_ms <= NowUnixMs();
+        j["row_count"] = Json::Int64(
+            static_cast<int64_t>(m_leaseStore.ListRows(sid).size()));
+        leases.append(j);
+    }
+    out["leases"] = leases;
+    out["node_id"] = m_nodeId;
+    return out;
+}
+
+std::optional<int64_t> Scheduler::LeaseEpochForDispatch(
+        const ScheduleDescriptor& sched) {
+    const int64_t now = NowUnixMs();
+
+    // Throttle: one lease decision per schedule per retry window. Within
+    // the window a still-valid held lease dispatches; anything else pauses.
+    const bool mine = [&]{ 
+        auto it = m_leaseAttemptMs.find(sched.id);
+        return it != m_leaseAttemptMs.end() && now - it->second < m_leaseRetryEveryMs;
+    }();
+    auto eff = m_leaseStore.EffectiveLease(sched.id);
+    if (mine) {
+        if (eff && eff->holder_node_id == m_nodeId && eff->expires_ms > now)
+            return eff->epoch;
+        return std::nullopt;
+    }
+    m_leaseAttemptMs[sched.id] = now;
+
+    LeasePeerState ps;
+    if (m_leaseAckFn && eff) {
+        ps = m_leaseAckFn(sched.id, eff->epoch);
+    } else if (m_leaseAckFn && !eff) {
+        ps = m_leaseAckFn(sched.id, 0);
+    }
+
+    if (!eff) {
+        // First acquisition — nothing to fence, no ack required.
+        auto l = m_leaseStore.Acquire(sched.id, m_nodeId, 1, now, m_leaseTtlMs);
+        ALOG_INFO("scheduler", "lease acquired: " << sched.id
+                  << " epoch 1 holder " << m_nodeId);
+        return l.epoch;
+    }
+
+    const bool iHold = eff->holder_node_id == m_nodeId;
+    const bool valid = eff->expires_ms > now;
+    const bool noPeers = ps.peersConfigured == 0;
+
+    if (iHold && valid) {
+        // Renew when due. Renewal needs visibility proof: acked by a peer
+        // (it saw my epoch — my renewals replicate), or all peers down
+        // (documented residual risk: keeps liveness when the partner is
+        // dead; partition double-window is bounded + reconciled at heal).
+        if (now >= eff->last_renew_ms + m_leaseRenewEveryMs) {
+            const bool ok = noPeers || ps.anyAcked || ps.allDown;
+            if (ok) {
+                if (m_leaseStore.Renew(eff->id, now, m_leaseTtlMs)) {
+                    return eff->epoch;
+                }
+                // Row vanished (wiped/replaced) — re-read next attempt.
+                return std::nullopt;
+            }
+            ALOG_INFO("scheduler", "lease renewal unacked (peer visible but "
+                      "epoch not confirmed) — holding until expiry: "
+                      << sched.id);
+        }
+        return eff->epoch;
+    }
+
+    if (iHold && !valid) {
+        // Self-fenced: my lease expired unrenewed. Re-acquire ONLY with a
+        // peer exchange proving no survivor took over (peer still sees my
+        // epoch), or all peers down (time-gated), or no peers at all.
+        const bool ok = noPeers || ps.anyAcked || ps.allDown;
+        if (ok) {
+            auto l = m_leaseStore.Acquire(sched.id, m_nodeId, eff->epoch + 1,
+                                          now, m_leaseTtlMs);
+            ALOG_INFO("scheduler", "lease re-acquired after expiry: " << sched.id
+                      << " epoch " << l.epoch << " holder " << m_nodeId);
+            return l.epoch;
+        }
+        // Paused — rate-limited log.
+        auto it = m_pauseLogMs.find(sched.id);
+        if (it == m_pauseLogMs.end() || now - it->second > 10000) {
+            m_pauseLogMs[sched.id] = now;
+            ALOG_WARNING("scheduler", "lease_required schedule paused "
+                "(self-fenced, no peer exchange since expiry): " << sched.id);
+        }
+        return std::nullopt;
+    }
+
+    // Held by another node.
+    if (!valid && eff->expires_ms + m_leaseGraceMs < now &&
+            (noPeers || ps.allDown)) {
+        // Survivor takeover: epoch+1 fencing, time-gated (holder's peer is
+        // known-down; grace covers clock skew + in-flight execution).
+        auto l = m_leaseStore.Acquire(sched.id, m_nodeId, eff->epoch + 1,
+                                      now, m_leaseTtlMs);
+        ALOG_WARNING("scheduler", "LEASE TAKEOVER: " << sched.id
+            << " epoch " << l.epoch << " -> holder " << m_nodeId
+            << " (previous holder " << eff->holder_node_id
+            << ", expired " << (now - eff->expires_ms) << "ms ago)");
+        return l.epoch;
+    }
+    return std::nullopt;   // their lease valid or within grace
+}
+
 void Scheduler::ProcessDueSchedules() {
     const std::string nowIso = IsoFromUnixMs(NowUnixMs());
     const auto due = m_store.GetDueSchedules(nowIso, kDueBatchLimit);
@@ -476,32 +613,125 @@ void Scheduler::ProcessDueSchedules() {
         // schedule must not wedge on an already-processed window.
         const std::string window = schedule.next_fire.empty() ? nowIso : schedule.next_fire;
         const std::string runUuid = schedule.id + "@" + window;
-        const bool claimed = m_runStore.TryClaim(
-            runUuid, schedule.id, schedule.agent_id, window,
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count(),
-            m_nodeId);
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
-        std::string outcome = "no_callback";
-        if (claimed && m_fireCallback) {
-            IncomingEvent event;
-            event.source = "scheduler";
-            event.metadata["schedule_id"] = schedule.id;
-            event.metadata["tag"] = schedule.tag;
-            event.metadata["message"] = schedule.message;
-            event.metadata["metadata"] = schedule.metadata;
-            event.metadata["agent_id"] = schedule.agent_id;
-            outcome = m_fireCallback(event);
-            m_runStore.Finish(runUuid, outcome, "",
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count());
-        } else if (claimed) {
-            m_runStore.Finish(runUuid, outcome, "",
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count());
+        // ── #78 P2b two-phase dispatch for lease_required ────────────
+        // Phase 1 (claim): under a valid lease, insert the claim row and
+        //   PAUSE (no dispatch, no advance) until it has aged past the
+        //   replication round.
+        // Phase 2 (dispatch): lease still valid, claim aged, AND the peer
+        //   survivor view confirms MY claim (or peers provably down).
+        //   The (epoch, id) survivor rule elects ONE winner on both sides;
+        //   the loser sees showsOther and stands down. Fail-safe: any
+        //   ambiguity = not running.
+        if (schedule.semantics == "lease_required") {
+            auto existing = m_runStore.GetByUuid(runUuid);
+
+            if (!existing) {
+                // Fresh window: gate on the lease first.
+                auto epoch = LeaseEpochForDispatch(schedule);
+                if (!epoch) continue;                      // paused
+                if (!m_runStore.TryClaim(runUuid, schedule.id,
+                                         schedule.agent_id, window,
+                                         nowMs, m_nodeId, *epoch)) {
+                    continue;                              // lost (race)
+                }
+                // Claim inserted — hold fire until visible. Fall through
+                // to the pending check BELOW on this same pass? No: age 0
+                // never passes the visibility window. Pause this pass.
+                continue;
+            }
+
+            // A claim row exists (mine or theirs).
+            if (existing->node_id == m_nodeId && !existing->fenced) {
+                if (existing->outcome != "running") {
+                    // Crash between Finish and schedule-advance: the fire
+                    // completed; advance only.
+                    // (fall through to the state update below)
+                } else if (nowMs - existing->started_at_unix_ms
+                               > m_claimVisibilityMs) {
+                    // Aged: confirm visibility and dispatch. NOTE: no
+                    // lease re-gate here — after a first-acquisition race
+                    // the lease holder (max expires_ms) and the claim
+                    // survivor (max id) can be DIFFERENT nodes; the claim
+                    // survivor is the window's authority once elected.
+                    // The lease gates NEW claims (phase 1), not the
+                    // dispatch of an already-elected one.
+                    ClaimPeerState cs;
+                    if (m_claimAckFn)
+                        cs = m_claimAckFn(runUuid);
+                    const bool noPeers = cs.peersConfigured == 0;
+                    if (cs.showsOther) {
+                        continue;   // deterministic winner is elsewhere
+                    }
+                    if (noPeers || cs.allDown || cs.confirmedMine) {
+                        std::string outcome2 = "no_callback";
+                        if (m_fireCallback) {
+                            IncomingEvent event;
+                            event.source = "scheduler";
+                            event.metadata["schedule_id"] = schedule.id;
+                            event.metadata["tag"] = schedule.tag;
+                            event.metadata["message"] = schedule.message;
+                            event.metadata["metadata"] = schedule.metadata;
+                            event.metadata["agent_id"] = schedule.agent_id;
+                            outcome2 = m_fireCallback(event);
+                        }
+                        m_runStore.Finish(runUuid, outcome2, "", nowMs, m_nodeId);
+                        // fall through to state update below
+                    } else {
+                        continue;   // lag / unreachable — pause
+                    }
+                } else {
+                    continue;       // claim too young — pause
+                }
+            } else {
+                // Survivor claim is another node's (or mine but fenced).
+                // Normally the window belongs elsewhere — BUT if the
+                // holder died between claim and dispatch (pending forever,
+                // node provably down, aged past the takeover bound), the
+                // window fails over: fence the stale claim, re-claim at
+                // epoch+1, and run the pending path with the fresh claim.
+                ClaimPeerState cs2;
+                if (m_claimAckFn) cs2 = m_claimAckFn(runUuid);
+                const int64_t staleBefore =
+                    nowMs - (2 * m_claimVisibilityMs + m_leaseGraceMs);
+                if (cs2.allDown && existing->outcome == "running"
+                        && existing->started_at_unix_ms < staleBefore) {
+                    const int64_t newEpoch = m_runStore.TakeOverStaleClaim(
+                        runUuid, schedule.id, schedule.agent_id, window,
+                        nowMs, m_nodeId, staleBefore);
+                    if (newEpoch > 0) {
+                        // Fresh claim: age check fails this pass — the
+                        // next poll runs phase 2 on it.
+                    }
+                }
+                // Stand down this pass either way (the schedule-state
+                // update arrives by replication when the winner advances).
+                continue;
+            }
         } else {
-            ALOG_INFO("scheduler", "skipping already-claimed window: "
-                      << runUuid);
+            // at_least_once: single-phase claim + dispatch (unchanged).
+            const bool claimed = m_runStore.TryClaim(
+                runUuid, schedule.id, schedule.agent_id, window,
+                nowMs, m_nodeId);
+            if (!claimed && !m_runStore.GetByUuid(runUuid)) {
+                continue;   // claim raced but no row visible? unsafe — pause
+            }
+            if (claimed) {
+                std::string outcome = "no_callback";
+                if (m_fireCallback) {
+                    IncomingEvent event;
+                    event.source = "scheduler";
+                    event.metadata["schedule_id"] = schedule.id;
+                    event.metadata["tag"] = schedule.tag;
+                    event.metadata["message"] = schedule.message;
+                    event.metadata["metadata"] = schedule.metadata;
+                    event.metadata["agent_id"] = schedule.agent_id;
+                    outcome = m_fireCallback(event);
+                }
+                m_runStore.Finish(runUuid, outcome, "", nowMs, m_nodeId);
+            }
         }
 
         // Update schedule state
