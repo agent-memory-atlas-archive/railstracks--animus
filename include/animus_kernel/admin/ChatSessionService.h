@@ -20,6 +20,7 @@ namespace animus::kernel {
 
 class AgentStore;
 class ChainRunner;
+class ChannelContextStore;
 class CompactionService;
 class ProviderThrottle;
 class Session;
