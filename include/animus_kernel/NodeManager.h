@@ -71,6 +71,7 @@ public:
     // #73: user_id for a raw token ("" when unbound). Lookup by hash.
     std::string GetUserIdForToken(const std::string& token) const;
     // Validate a token against stored hashes. Returns token ID or -1.
+    int64_t ValidateToken(const std::string& token) const;
     // List all tokens (hash only, not plaintext)
     std::vector<NodeToken> ListTokens() const;
     // Revoke a token by ID
