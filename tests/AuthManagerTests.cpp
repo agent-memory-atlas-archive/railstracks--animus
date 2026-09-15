@@ -37,44 +37,55 @@ std::string MakeTempDbPath() {
     return std::string(tmp) + ".db";
 }
 
-std::unique_ptr<AuthManager> MakeManagerWithUsers(const std::string& dbPath,
-                                                    const std::string& staticToken) {
-    SqliteDataStore* store = new SqliteDataStore(dbPath);
-    AuthStore authStore(store);
-    authStore.EnsureSchema();
+// Auth fixture: owns the store + AuthStore + manager so lifetimes stay
+// valid for the whole test (AuthManager is non-movable; SqliteDataStore and
+// AuthStore must outlive it).
+struct AuthFixture {
+    std::unique_ptr<SqliteDataStore> dataStore;
+    std::unique_ptr<AuthStore> authStore;
+    std::unique_ptr<AuthManager> mgr;
+};
 
-    auto mgr = std::make_unique<AuthManager>();
-    mgr->SetAuthStore(&authStore);
+AuthFixture MakeManagerWithUsers(const std::string& dbPath,
+                                  const std::string& staticToken) {
+    AuthFixture fx;
+    fx.dataStore = std::make_unique<SqliteDataStore>(dbPath);
+    fx.authStore = std::make_unique<AuthStore>(fx.dataStore.get());
+    fx.authStore->EnsureSchema();
+
+    fx.mgr = std::make_unique<AuthManager>();
+    fx.mgr->SetAuthStore(fx.authStore.get());
     if (!staticToken.empty()) {
-        mgr->SetStaticToken(staticToken);
+        fx.mgr->SetStaticToken(staticToken);
     } else {
-        mgr->SetRequireAuth(true);
+        fx.mgr->SetRequireAuth(true);
     }
-    mgr->CreateUser("melvin", "hunter2", "admin");
-    mgr->CreateUser("thomas", "wachtwoord", "viewer");
-    return mgr;
+    fx.mgr.CreateUser("melvin", "hunter2", "admin");
+    fx.mgr.CreateUser("thomas", "wachtwoord", "viewer");
+    return fx;
 }
 
 int TestSessionTokenResolvesUser() {
     std::cerr << "  [auth] session token resolves user...\n";
     const auto dbPath = MakeTempDbPath();
-    auto mgr = MakeManagerWithUsers(dbPath, "");
+    auto fx = MakeManagerWithUsers(dbPath, "");
+    auto& mgr = *fx.mgr;
 
-    auto user = mgr->GetUserByUsername("thomas");
+    auto user = mgr.GetUserByUsername("thomas");
     Assert(user.has_value(), "user exists");
     if (!user) return 1;
 
     std::string rawToken;
-    Assert(mgr->CreateSessionToken(user->id, 3600 * 1000, rawToken),
+    Assert(mgr.CreateSessionToken(user->id, 3600 * 1000, rawToken),
            "session token created");
     Assert(!rawToken.empty(), "raw token non-empty");
 
-    auto [result, userId] = mgr->ValidateToken(rawToken);
+    auto [result, userId] = mgr.ValidateToken(rawToken);
     Assert(result == AuthResult::Ok, "session token validates");
     Assert(userId == user->id, "token resolves to owning user id");
 
     // GetUserById round-trip — what the ws/chat controller calls
-    auto resolved = mgr->GetUserById(userId);
+    auto resolved = mgr.GetUserById(userId);
     Assert(resolved.has_value(), "user resolvable by id");
     Assert(resolved->username == "thomas", "username round-trips");
     Assert(resolved->role == "viewer", "role round-trips");
@@ -84,14 +95,15 @@ int TestSessionTokenResolvesUser() {
 int TestStaticTokenNoUserId() {
     std::cerr << "  [auth] static token carries no user id...\n";
     const auto dbPath = MakeTempDbPath();
-    auto mgr = MakeManagerWithUsers(dbPath, "static-op-token");
+    auto fx = MakeManagerWithUsers(dbPath, "static-op-token");
+    auto& mgr = *fx.mgr;
 
-    auto [result, userId] = mgr->ValidateToken("static-op-token");
+    auto [result, userId] = mgr.ValidateToken("static-op-token");
     Assert(result == AuthResult::Ok, "static token validates");
     Assert(userId.empty(), "static token yields empty user id — "
            "ws/chat must treat this as unauthenticated identity");
 
-    auto [badResult, _] = mgr->ValidateToken("wrong-token");
+    auto [badResult, _] = mgr.ValidateToken("wrong-token");
     Assert(badResult == AuthResult::InvalidToken, "wrong static token rejected");
     return 0;
 }
@@ -99,15 +111,16 @@ int TestStaticTokenNoUserId() {
 int TestExpiredSessionToken() {
     std::cerr << "  [auth] expired session token rejected...\n";
     const auto dbPath = MakeTempDbPath();
-    auto mgr = MakeManagerWithUsers(dbPath, "");
+    auto fx = MakeManagerWithUsers(dbPath, "");
+    auto& mgr = *fx.mgr;
 
-    auto user = mgr->GetUserByUsername("melvin");
+    auto user = mgr.GetUserByUsername("melvin");
     if (!user) { Assert(false, "user missing"); return 1; }
 
     std::string rawToken;
-    Assert(mgr->CreateSessionToken(user->id, -1000, rawToken),
+    Assert(mgr.CreateSessionToken(user->id, -1000, rawToken),
            "token created with negative ttl (already expired)");
-    auto [result, userId] = mgr->ValidateToken(rawToken);
+    auto [result, userId] = mgr.ValidateToken(rawToken);
     Assert(result == AuthResult::InvalidToken, "expired token rejected");
     Assert(userId.empty(), "expired token yields no user id");
     return 0;
@@ -116,8 +129,9 @@ int TestExpiredSessionToken() {
 int TestNoTokenProvided() {
     std::cerr << "  [auth] no token + required auth...\n";
     const auto dbPath = MakeTempDbPath();
-    auto mgr = MakeManagerWithUsers(dbPath, "");
-    auto [result, userId] = mgr->ValidateToken("");
+    auto fx = MakeManagerWithUsers(dbPath, "");
+    auto& mgr = *fx.mgr;
+    auto [result, userId] = mgr.ValidateToken("");
     Assert(result == AuthResult::NoTokenProvided, "empty token flagged");
     Assert(userId.empty(), "no user id");
     return 0;
