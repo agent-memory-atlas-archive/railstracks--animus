@@ -60,8 +60,8 @@ AuthFixture MakeManagerWithUsers(const std::string& dbPath,
     } else {
         fx.mgr->SetRequireAuth(true);
     }
-    fx.mgr.CreateUser("melvin", "hunter2", "admin");
-    fx.mgr.CreateUser("thomas", "wachtwoord", "viewer");
+    fx.mgr->CreateUser("melvin", "hunter2", "admin");
+    fx.mgr->CreateUser("thomas", "wachtwoord", "viewer");
     return fx;
 }
 
