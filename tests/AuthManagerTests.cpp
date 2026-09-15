@@ -127,8 +127,8 @@ int TestAuthNotRequired() {
     std::cerr << "  [auth] auth not required...\n";
     AuthManager mgr;
     // No static token, no store, never configured — auth off.
-    Assert(!mgr->IsAuthRequired(), "auth not required by default");
-    auto [result, userId] = mgr->ValidateToken("anything");
+    Assert(!mgr.IsAuthRequired(), "auth not required by default");
+    auto [result, userId] = mgr.ValidateToken("anything");
     Assert(result == AuthResult::AuthNotRequired, "auth not required result");
     Assert(userId.empty(), "no user id when auth off");
     return 0;
