@@ -1320,6 +1320,7 @@ void AdminServer::RefreshChatSessionServiceDependencies() {
     deps.agentConfig = &m_agentConfig;
     deps.attachmentStore = m_attachmentStore;
     deps.attachmentTokenManager = &m_attachmentTokens;
+    deps.channelContextStore = m_channelContextStore;
     m_chatSessionService.Configure(deps);
 }
 

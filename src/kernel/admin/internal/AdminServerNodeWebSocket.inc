@@ -28,6 +28,7 @@ public:
         std::string nodeName;
         std::string token;
         std::string signingKey;     // plaintext signing key (for HMAC command signing)
+        std::string userId;        // #73: owning user ("" = unbound token)
         bool hmacCapable{false};    // node advertised hmac-v1 capability
         bool authenticated{false};
         std::unordered_map<std::string, std::promise<ToolResult>> pendingCalls;
@@ -67,13 +68,28 @@ public:
         // Look up signing key for this token (for HMAC-signing outgoing commands)
         std::string signingKey = server->m_nodeManager->GetSigningKeyForToken(token);
 
+        // #73: resolve the token's owning user. Node tool traffic runs no
+        // chains today, so this lands in logs + admin UI for now — but the
+        // binding is recorded so any future node-driven dispatch can stamp
+        // the identity into the context card the same way ws/chat does.
+        std::string boundUserId = server->m_nodeManager->GetUserIdForToken(token);
+        std::string boundUsername;
+        if (!boundUserId.empty()) {
+            if (auto user = server->GetAuthManager().GetUserById(boundUserId)) {
+                boundUsername = user->username;
+            }
+        }
+
         auto ctx = std::make_shared<NodeContext>();
         ctx->token = token;
         ctx->signingKey = signingKey;
+        ctx->userId = boundUserId;
         wsConnPtr->setContext(ctx);
 
         std::cerr << "[node-ws] Connection accepted (token id=" << tokenId
-                  << ", hmac=" << (signingKey.empty() ? "disabled" : "enabled") << ")\n";
+                  << ", hmac=" << (signingKey.empty() ? "disabled" : "enabled")
+                  << ", user=" << (boundUsername.empty() ? "unbound" : boundUsername)
+                  << ")\n";
     }
 
     void handleNewMessage(

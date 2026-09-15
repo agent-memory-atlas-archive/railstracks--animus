@@ -352,6 +352,11 @@ bool VkAdapter::FetchLongPollServer() {
 
     if (rt->lp_server.empty() || rt->lp_key.empty()) return false;
 
+    // Info-level readiness witness so operator tooling (debug-daemon.sh
+    // banner) can see the adapter is up — DEBUG lines are compiled out in
+    // release builds and never reach the banner grep.
+    ALOG_INFO("vk", "Long Poll ready for " << rt->channel_name);
+
     if (m_ctx.configStore) {
         m_ctx.configStore->Set("", "channel." + rt->channel_name + ".polling.server", rt->lp_server);
         m_ctx.configStore->Set("", "channel." + rt->channel_name + ".polling.key", rt->lp_key);

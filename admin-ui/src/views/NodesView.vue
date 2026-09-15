@@ -22,18 +22,29 @@ interface NodeToken {
   token_preview: string;
   created_at_unix_ms: number;
   label: string;
+  description?: string;
+  user_id?: string;
+  revoked?: boolean;
+}
+
+interface AdminUser {
+  id: string;
+  username: string;
+  role: string;
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
 
 const nodes = ref<NodeInfo[]>([]);
 const tokens = ref<NodeToken[]>([]);
+const users = ref<AdminUser[]>([]);
 const loading = ref(true);
 const error = ref('');
 const successMsg = ref('');
 const showTokenDialog = ref(false);
 const showCopyDialog = ref(false);
 const newTokenLabel = ref('');
+const newTokenUserId = ref('');
 const createdToken = ref('');
 const copyConfirmed = ref(false);
 const refreshing = ref(false);
@@ -54,6 +65,14 @@ async function fetchData() {
     ]);
     nodes.value = nodesRes.nodes ?? [];
     tokens.value = tokensRes.tokens ?? [];
+    // #73: users for the token→user binding picker (fails silently on
+    // instances without user auth — picker just stays empty).
+    try {
+      const usersRes = await apiGet<AdminUser[]>('/api/v1/users');
+      users.value = Array.isArray(usersRes) ? usersRes : [];
+    } catch {
+      users.value = [];
+    }
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : 'Failed to load node data';
   } finally {
@@ -81,13 +100,17 @@ async function createToken() {
     const res = await apiRequest<{ id: number; token: string; label: string }>(
       'POST',
       '/api/v1/nodes/tokens',
-      { label: newTokenLabel.value || undefined },
+      {
+        description: newTokenLabel.value || undefined,
+        user_id: newTokenUserId.value || undefined,
+      },
     );
     createdToken.value = res.token;
     showTokenDialog.value = false;
     showCopyDialog.value = true;
     copyConfirmed.value = false;
     newTokenLabel.value = '';
+    newTokenUserId.value = '';
     // Refresh token list
     const tokensRes = await apiGet<{ tokens: NodeToken[] }>('/api/v1/nodes/tokens');
     tokens.value = tokensRes.tokens ?? [];
@@ -107,6 +130,26 @@ async function revokeToken(id: number) {
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : 'Failed to revoke token';
   }
+}
+
+async function bindTokenUser(id: number, userId: string) {
+  error.value = '';
+  successMsg.value = '';
+  try {
+    await apiRequest(`/api/v1/nodes/tokens/${id}`, 'PATCH', { user_id: userId });
+    const t = tokens.value.find(t => t.id === id);
+    if (t) t.user_id = userId;
+    successMsg.value = userId ? 'Token bound' : 'Token unbound';
+    setTimeout(() => { successMsg.value = ''; }, 3000);
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : 'Failed to update binding';
+  }
+}
+
+function usernameFor(userId?: string) {
+  if (!userId) return '';
+  const u = users.value.find(u => u.id === userId);
+  return u ? u.username : userId;
 }
 
 function closeCopyDialog() {
@@ -282,10 +325,24 @@ onBeforeUnmount(() => {
             {{ token.token_preview }}
           </v-list-item-title>
           <v-list-item-subtitle>
-            {{ token.label || 'unlabeled' }} · Created {{ formatDate(token.created_at_unix_ms) }}
+            {{ token.description || token.label || 'unlabeled' }}
+            <template v-if="token.user_id"> · user: {{ usernameFor(token.user_id) }}</template>
+            <template v-else> · unbound</template>
+            · Created {{ formatDate(token.created_at_unix_ms) }}
           </v-list-item-subtitle>
 
           <template #append>
+            <v-select
+              v-if="users.length > 0"
+              :model-value="token.user_id || ''"
+              :items="[{ title: '— unbound —', value: '' }, ...users.map(u => ({ title: `${u.username} (${u.role})`, value: u.id }))]"
+              label="owner"
+              variant="outlined"
+              density="compact"
+              hide-details
+              style="max-width: 180px"
+              @update:model-value="(v: string) => bindTokenUser(token.id, v)"
+            />
             <v-btn
               icon="mdi-delete-outline"
               variant="text"
@@ -328,6 +385,16 @@ onBeforeUnmount(() => {
             variant="outlined"
             density="compact"
             @keyup.enter="createToken"
+          />
+          <v-select
+            v-if="users.length > 0"
+            v-model="newTokenUserId"
+            :items="[{ title: '— unbound —', value: '' }, ...users.map(u => ({ title: `${u.username} (${u.role})`, value: u.id }))]"
+            label="Owning user"
+            hint="Whose identity this token carries (#73)"
+            variant="outlined"
+            density="compact"
+            class="mt-3"
           />
         </v-card-text>
         <v-card-actions>

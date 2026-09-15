@@ -6,6 +6,16 @@ public:
         std::string activeSessionId;
         std::shared_ptr<std::atomic<bool>> stopRequested{
             std::make_shared<std::atomic<bool>>(false)};
+        // Authenticated identity of the connected user (#73). Set at
+        // connection time when the WS bearer token resolves to a user
+        // session token; empty for static-token / loopback connections.
+        // Threaded into ChatSessionService::Request and stamped into the
+        // ChannelArrival origin map so the agent's context card names who
+        // it is talking to.
+        std::string authUserId;
+        std::string authUsername;
+        std::string authRole;
+        bool isUserAuth{false};
     };
 
     void handleNewMessage(
@@ -225,6 +235,12 @@ public:
         request.requestedReasoningEffort = requestedReasoningEffort;
         request.requestedReasoningEnabled = requestedReasoningEnabled;
         request.hasReasoningOverride = hasReasoningOverride;
+        if (auto context = wsConnPtr->getContext<ConnectionContext>()) {
+            request.authUserId = context->authUserId;
+            request.authUsername = context->authUsername;
+            request.authRole = context->authRole;
+            request.isUserAuth = context->isUserAuth;
+        }
 
         if (!server->m_chatSessionService.EnqueueStreamingResponse(request)) {
             SendError(wsConnPtr, "job system not available");
@@ -253,6 +269,43 @@ public:
 
         ConnectionContext context;
         context.connectionId = server->m_nextWsConnectionId.fetch_add(1);
+
+        // Identity resolution (#73): resolve the connecting token through
+        // the auth layer so the context card can name the user. The
+        // static-token and loopback paths above authorized the connection
+        // without a user identity — those stay permitted (no regression)
+        // and simply carry an unauthenticated identity. When auth IS
+        // required and no user resolved, this is the loud-absence case the
+        // ticket asks to make visible.
+        const std::string identityToken =
+            ResolveIdentityToken(req, server->m_config.authToken);
+        if (!identityToken.empty()) {
+            auto& authManager = server->GetAuthManager();
+            auto [result, userId] = authManager.ValidateToken(identityToken);
+            if (result == AuthResult::Ok && !userId.empty()) {
+                if (auto user = authManager.GetUserById(userId)) {
+                    context.isUserAuth = true;
+                    context.authUserId = user->id;
+                    context.authUsername = user->username;
+                    context.authRole = user->role;
+                }
+            }
+            if (!context.isUserAuth) {
+                if (authManager.IsAuthRequired()) {
+                    ALOG_WARNING("ws-chat",
+                        "user-authenticated instance but no user identity "
+                        "resolved for ws/chat connection "
+                        << context.connectionId
+                        << " — context card will not name the user");
+                } else {
+                    ALOG_INFO("ws-chat",
+                        "ws/chat connection " << context.connectionId
+                        << " has no user identity (static-token or "
+                           "loopback instance)");
+                }
+            }
+        }
+
         wsConnPtr->setContext(std::make_shared<ConnectionContext>(std::move(context)));
     }
 
@@ -370,6 +423,23 @@ private:
             return IsLoopbackIp(conn->peerAddr().toIp());
         }
         return false;
+    }
+
+    // Identity lookup token for #73: the same token the authorization
+    // check above consumed. Prefers whichever form carried it (query param
+    // first — the admin UI connects with ?token=<session token>; then the
+    // Authorization header, the non-browser client form).
+    static std::string ResolveIdentityToken(
+        const drogon::HttpRequestPtr& req,
+        const std::string& staticToken) {
+        const std::string queryToken = req->getParameter("token");
+        if (!queryToken.empty()) return queryToken;
+        const std::string authHeader = req->getHeader("Authorization");
+        if (authHeader.rfind("Bearer ", 0) == 0) {
+            std::string bearer = authHeader.substr(7);
+            if (!bearer.empty()) return bearer;
+        }
+        return "";
     }
 
     static std::uint64_t GetConnectionId(const drogon::WebSocketConnectionPtr& conn) {
