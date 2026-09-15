@@ -45,6 +45,7 @@ public:
     const KernelConfig::AgentRuntimeConfig* agentConfig{nullptr};
     AttachmentStore* attachmentStore{nullptr};
     AttachmentTokenManager* attachmentTokenManager{nullptr};
+    ChannelContextStore* channelContextStore{nullptr};
    };
 
     struct Request {
@@ -58,6 +59,13 @@ public:
         std::string requestedReasoningEffort;
         bool requestedReasoningEnabled{false};
         bool hasReasoningOverride{false};
+        // Authenticated identity of the WS user (#73). Populated by the
+        // ws/chat controller from the connection context; stamped into the
+        // ChannelArrival origin map so the context card names the user.
+        std::string authUserId;
+        std::string authUsername;
+        std::string authRole;
+        bool isUserAuth{false};
     };
 
     void Configure(const Dependencies& deps);

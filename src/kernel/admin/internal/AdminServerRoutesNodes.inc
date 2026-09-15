@@ -23,14 +23,22 @@
                 return;
             }
 
-            // Parse body for description
+            // Parse body for description + optional user binding (#73)
             std::string description = "node token";
+            std::string userId;
             auto body = req->getJsonObject();
             if (body && body->isMember("description")) {
                 description = (*body)["description"].asString();
             }
+            if (body && body->isMember("label") && description == "node token") {
+                // Admin UI historically sent "label" — accept both.
+                description = (*body)["label"].asString();
+            }
+            if (body && body->isMember("user_id")) {
+                userId = (*body)["user_id"].asString();
+            }
 
-            auto creds = srv->m_nodeManager->GenerateCredentials(description);
+            auto creds = srv->m_nodeManager->GenerateCredentials(description, userId);
             if (creds.token.empty()) {
                 SendJsonError(callback, "failed to generate token", drogon::k500InternalServerError);
                 return;
@@ -66,6 +74,7 @@
                 tObj["id"] = static_cast<Json::Int64>(t.id);
                 tObj["token_hash"] = t.token_hash.substr(0, 8) + "...";
                 tObj["description"] = t.description;
+                tObj["user_id"] = t.user_id;   // #73: owning user ("" = unbound)
                 tObj["created_at_unix_ms"] = static_cast<Json::UInt64>(t.created_at_unix_ms);
                 tObj["revoked"] = t.revoked;
                 arr.append(tObj);
@@ -107,6 +116,56 @@
             }
         },
         {drogon::Delete});
+
+    // PATCH /api/v1/nodes/tokens/{id} — bind token to owning user (#73).
+    // Body {"user_id": "..."}; empty string unbinds.
+    drogon::app().registerHandler(
+        "/api/v1/nodes/tokens/{1}",
+        [](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+           const std::string& tokenIdText) {
+            AdminServer* srv = g_activeAdminServer.load();
+            if (!srv) { SendServerNotActive(callback); return; }
+            if (!srv->m_nodeManager) {
+                SendJsonError(callback, "node manager not available", drogon::k503ServiceUnavailable);
+                return;
+            }
+
+            int64_t tokenId = 0;
+            try { tokenId = std::stoll(tokenIdText); } catch (...) {}
+            if (tokenId <= 0) {
+                SendJsonError(callback, "invalid token id", drogon::k400BadRequest);
+                return;
+            }
+
+            auto body = req->getJsonObject();
+            if (!body || !body->isMember("user_id")) {
+                SendJsonError(callback, "user_id is required", drogon::k400BadRequest);
+                return;
+            }
+            std::string userId = (*body)["user_id"].asString();
+
+            // Validate the target user exists (binding to a nonexistent user
+            // would orphan the token silently).
+            if (!userId.empty()) {
+                auto user = srv->GetAuthManager().GetUserById(userId);
+                if (!user) {
+                    SendJsonError(callback, "user not found", drogon::k404NotFound);
+                    return;
+                }
+            }
+
+            if (srv->m_nodeManager->SetTokenUser(tokenId, userId)) {
+                Json::Value out(Json::objectValue);
+                out["id"] = static_cast<Json::Int64>(tokenId);
+                out["user_id"] = userId;
+                out["status"] = userId.empty() ? "unbound" : "bound";
+                callback(drogon::HttpResponse::newHttpJsonResponse(out));
+            } else {
+                SendJsonError(callback, "failed to update token", drogon::k500InternalServerError);
+            }
+        },
+        {drogon::Patch});
 
     // GET /api/v1/nodes — list connected nodes
     drogon::app().registerHandler(

@@ -724,6 +724,32 @@ if(ANIMUS_BUILD_TESTS)
     )
     add_test(NAME ChannelContextStoreTests COMMAND animus_channel_context_store_tests)
 
+    add_executable(animus_auth_manager_tests
+      tests/AuthManagerTests.cpp
+    )
+    target_link_libraries(animus_auth_manager_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_auth_manager_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_auth_manager_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME AuthManagerTests COMMAND animus_auth_manager_tests)
+
+    add_executable(animus_node_manager_binding_tests
+      tests/NodeManagerBindingTests.cpp
+    )
+    target_link_libraries(animus_node_manager_binding_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_node_manager_binding_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_node_manager_binding_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME NodeManagerBindingTests COMMAND animus_node_manager_binding_tests)
+
     add_executable(animus_datastore_concurrency_tests
       tests/DataStoreConcurrencyTests.cpp
     )
