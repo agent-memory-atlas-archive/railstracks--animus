@@ -167,7 +167,9 @@ ToolDefinition FileTool::GetDefinition() const {
     ToolParameter contentParam;
     contentParam.name = "content";
     contentParam.type = "string";
-    contentParam.description = "Content for write/insert/replace/append actions";
+    contentParam.description =
+        "Content for write/insertLines/replaceLines/appendLines actions. "
+        "Legacy alias for the 'edit' replacement (prefer new_text).";
     contentParam.required = false;
     def.parameters.push_back(contentParam);
 
@@ -177,6 +179,33 @@ ToolDefinition FileTool::GetDefinition() const {
     oldTextParam.description = "Exact text to find and replace for 'edit' action. Must be unique in the file.";
     oldTextParam.required = false;
     def.parameters.push_back(oldTextParam);
+
+    ToolParameter newTextParam;
+    newTextParam.name = "new_text";
+    newTextParam.type = "string";
+    newTextParam.description =
+        "Replacement text for 'edit' action (preferred over the legacy 'content' alias). "
+        "Must be non-empty unless allow_empty_replacement is true.";
+    newTextParam.required = false;
+    def.parameters.push_back(newTextParam);
+
+    ToolParameter allowEmptyReplacementParam;
+    allowEmptyReplacementParam.name = "allow_empty_replacement";
+    allowEmptyReplacementParam.type = "boolean";
+    allowEmptyReplacementParam.description =
+        "Explicitly confirm that 'edit' may delete old_text (replace it with nothing). "
+        "Required for an empty replacement; guards against silent deletion when the "
+        "replacement argument is dropped or misnamed.";
+    allowEmptyReplacementParam.required = false;
+    def.parameters.push_back(allowEmptyReplacementParam);
+
+    ToolParameter allowEmptyWriteParam;
+    allowEmptyWriteParam.name = "allow_empty_write";
+    allowEmptyWriteParam.type = "boolean";
+    allowEmptyWriteParam.description =
+        "Explicitly confirm that 'write' may truncate an existing non-empty file to empty.";
+    allowEmptyWriteParam.required = false;
+    def.parameters.push_back(allowEmptyWriteParam);
 
     ToolParameter offsetParam;
     offsetParam.name = "offset";
@@ -370,13 +399,36 @@ ToolResult FileTool::Execute(const ToolCall& call) {
         return HandleRead(resolved, offset, limit, page, pageSize);
     } else if (action == "write") {
         std::string content = GetStringField(args, "content");
+        if (content.empty() && !GetBoolField(args, "allow_empty_write", false)) {
+            std::error_code ec;
+            if (std::filesystem::exists(resolved, ec)
+                && std::filesystem::file_size(resolved, ec) > 0) {
+                result.success = false;
+                result.error =
+                    "Refusing to overwrite non-empty file with empty content: " + resolved
+                    + ". If truncation is intended, pass allow_empty_write: true.";
+                return result;
+            }
+        }
         return HandleWrite(resolved, content);
     } else if (action == "edit") {
         std::string oldText = GetStringField(args, "old_text");
-        std::string newText = GetStringField(args, "content");
+        std::string newText = GetStringField(args, "new_text");
+        if (newText.empty()) {
+            // Legacy alias: earlier versions read the replacement from 'content'.
+            newText = GetStringField(args, "content");
+        }
         if (oldText.empty()) {
             result.success = false;
             result.error = "Missing required parameter for edit: old_text";
+            return result;
+        }
+        if (newText.empty() && !GetBoolField(args, "allow_empty_replacement", false)) {
+            result.success = false;
+            result.error =
+                "Missing replacement for edit: pass 'new_text' (or legacy 'content'). "
+                "An empty replacement deletes old_text; if deletion is intended, "
+                "pass allow_empty_replacement: true.";
             return result;
         }
         return HandleEdit(resolved, oldText, newText);
@@ -652,6 +704,7 @@ ToolResult FileTool::HandleEdit(const std::string& path, const std::string& oldT
         return result;
     }
 
+    const std::size_t sizeBefore = content.size();
     content.replace(first, oldText.size(), newText);
 
     std::ofstream outFile(path, std::ios::trunc);
@@ -671,7 +724,9 @@ ToolResult FileTool::HandleEdit(const std::string& path, const std::string& oldT
     }
 
     result.success = true;
-    result.output = "File edited successfully: " + path;
+    result.output = "File edited successfully: " + path
+        + " (" + std::to_string(sizeBefore) + " -> " + std::to_string(content.size())
+        + " bytes, replaced 1 occurrence)";
     return result;
 }
 
