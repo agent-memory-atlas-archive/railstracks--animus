@@ -887,6 +887,19 @@ if(ANIMUS_BUILD_TESTS)
     )
     add_test(NAME ChannelsToolTests COMMAND animus_social_tool_tests)
 
+    add_executable(animus_file_tool_tests
+      tests/FileToolTests.cpp
+    )
+    target_link_libraries(animus_file_tool_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_file_tool_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_file_tool_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME FileToolTests COMMAND animus_file_tool_tests)
+
     add_executable(animus_signal_protocol_tests
       tests/SignalProtocolTests.cpp
     )
