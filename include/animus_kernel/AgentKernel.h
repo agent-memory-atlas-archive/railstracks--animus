@@ -102,6 +102,11 @@ private:
     void SendAutoReply(const ChannelManager::ReplyTarget& target,
                        const std::string& text);
 
+    /// Delivery-failure witness (#30): write a session note when a yielded
+    /// channel reply fails to land, so the agent (and admin UI) can see it.
+    void ReportChannelSendFailure(const ChannelReplyTarget& target,
+                                  const std::string& error);
+
     /// Execute a channel dispatch: run the LLM chain on the session and send the reply.
     /// Used by both the direct dispatch path and the MessageQueue flush callback.
     void ExecuteChannelDispatch(
