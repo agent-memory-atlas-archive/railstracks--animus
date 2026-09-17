@@ -31,6 +31,10 @@ struct ChannelContext {
     // Callbacks for routing inbound messages to agent sessions
     ChannelDispatchCallback dispatch;
     ChannelLogCallback logCallback;
+
+    // Send-failure reporting (#30): set by ChannelManager; adapters call it
+    // when a yielded reply fails to land. Null-checked at call sites.
+    ChannelSendFailureCallback sendFailure;
 };
 
 /// Per-adapter runtime state for poller-based connectors.

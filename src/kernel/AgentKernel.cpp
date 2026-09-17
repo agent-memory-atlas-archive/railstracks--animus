@@ -1430,11 +1430,17 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                                const std::string& sessionKey,
                                const std::string& message,
                                const std::string& sessionType,
-                               const ChannelManager::ReplyTarget& replyTarget,
+                               const ChannelManager::ReplyTarget& rt,
                                const std::string& metadata) {
             ALOG_DEBUG("channels:dispatch", "agentId=" << agentId
                       << " sessionKey=" << sessionKey
                       << " type=" << sessionType);
+
+            // Stamp session identity onto the target so send failures can be
+            // written back to the originating session (#30).
+            ChannelManager::ReplyTarget replyTarget = rt;
+            replyTarget.session_key = sessionKey;
+            replyTarget.agent_id = agentId;
 
             // Check if this channel has a minimum response interval configured
             const int interval = GetChannelInterval(replyTarget.channel_name);
@@ -1553,6 +1559,14 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             m_adminServer->SetChannelManager(m_channelManager);
         }
 
+        // Send-failure witness (#30): a yielded reply that does not land
+        // becomes a session note the agent and admin UI can see — not just a
+        // kernel log line.
+        m_channelManager->SetSendFailureCallback(
+            [this](const ChannelReplyTarget& target, const std::string& error) {
+                ReportChannelSendFailure(target, error);
+            });
+
         // Wire ChannelManager into ChannelsTool for list action
         if (m_channelsTool) {
             m_channelsTool->SetChannelManager(m_channelManager);
@@ -1578,6 +1592,28 @@ void AgentKernel::SendAutoReply(const ChannelManager::ReplyTarget& target,
                                    const std::string& text) {
     if (!m_channelManager) return;
     m_channelManager->SendReply(target, text);
+}
+
+void AgentKernel::ReportChannelSendFailure(const ChannelReplyTarget& target,
+                                           const std::string& error) {
+    ALOG_WARNING("channels", "send failure [" << target.channel_type << "] "
+              << error);
+    // Session-visible witness; guarded so delivery notes never crowd out the
+    // agent's own notes at the per-session cap.
+    if (target.session_key.empty() || !m_sessionNotesStore) return;
+    const std::string fullSessionKey = "channel:" + target.session_key;
+    const auto count = m_sessionNotesStore->CountForSession(fullSessionKey, target.agent_id);
+    if (count >= SessionNotesStore::kMaxNotesPerSession) return;
+
+    std::string peer = target.peer_id.empty() ? target.post_id : target.peer_id;
+    std::string brief = error;
+    if (brief.size() > 200) brief = brief.substr(0, 197) + "...";
+    const std::string bullet = "[delivery-failed] " + target.channel_type
+        + " reply to " + target.channel_name + "/" + peer
+        + " was NOT delivered: " + brief
+        + ". The reader did not see it.";
+    m_sessionNotesStore->Create(fullSessionKey, target.agent_id, bullet,
+                                static_cast<int>(count));
 }
 
 int AgentKernel::GetChannelInterval(const std::string& channelName) const {

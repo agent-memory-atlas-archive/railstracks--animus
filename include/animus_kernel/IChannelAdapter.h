@@ -31,6 +31,10 @@ struct ChannelReplyTarget {
     // Email-specific
     std::string email_thread_id;
     std::string email_inbox_id;
+    // Delivery-failure reporting (#30): populated at the dispatch boundary so
+    // send failures can be written back to the originating session.
+    std::string session_key;
+    std::string agent_id;
 };
 
 /// Dispatch callback for routing inbound messages to agent sessions.
@@ -48,6 +52,14 @@ using ChannelLogCallback = std::function<void(
     const std::string& sessionKey,
     const std::string& message,
     const std::string& sessionType)>;
+
+/// Send-failure callback: adapters report yielded replies that did NOT land
+/// (non-2xx, missing credentials) so the failure becomes a session-visible
+/// witness instead of a kernel log line (#30). Populated by the kernel;
+/// adapters check for null before calling.
+using ChannelSendFailureCallback = std::function<void(
+    const ChannelReplyTarget& target,
+    const std::string& error)>;
 
 /// Query callback: returns metadata values for a session matching a JSON key.
 /// Used by channel pollers to determine which external message IDs have already

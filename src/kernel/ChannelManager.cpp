@@ -497,37 +497,10 @@ void ChannelManager::SendReply(const ReplyTarget& target, const std::string& tex
     }
 
     if (target.channel_type == "discord") {
-        std::string channelId;
-        if (!target.peer_id.empty()) channelId = target.peer_id;
-        else if (!target.post_id.empty()) channelId = target.post_id;
-
-        std::string botToken;
-        {
-            std::lock_guard<std::mutex> lock(m_channelsMutex);
-            auto it = m_channels.find(target.channel_name);
-            if (it != m_channels.end())
-                botToken = GetString(it->second.config, "bot_token");
-        }
-        if (botToken.empty() || channelId.empty()) return;
-
-        std::string content = text;
-        if (content.size() > 2000) content = content.substr(0, 1997) + "...";
-
-        Json::Value body;
-        body["content"] = content;
-
-        HttpClient::Request req;
-        req.method = "POST";
-        req.url = "https://discord.com/api/v10/channels/" + channelId + "/messages";
-        req.headers["Authorization"] = "Bot " + botToken;
-        req.headers["Content-Type"] = "application/json";
-        req.body = channel_detail::JsonCompact(body);
-        req.follow_redirects = false;
-
-        auto resp = m_httpClient.Execute(req);
-        if (resp.status_code != 200 && resp.status_code != 201) {
-            ALOG_WARNING("discord", "SendReply failed (" << resp.status_code << ")");
-        }
+        // Discord replies go through DiscordAdapter (registered since #30).
+        // Reaching here means the adapter failed to start for this channel.
+        ALOG_WARNING("discord", "Discord adapter not found for: "
+                  << target.channel_name);
         return;
     }
 
@@ -804,6 +777,12 @@ void ChannelManager::StartChannel(const ChannelState& state) {
                     m_dispatch, m_logCallback
                 });
         }
+        // Forward send failures to the kernel-set callback (read at call time
+        // so wiring order after construction doesn't matter) — #30.
+        m_channelCtx->sendFailure =
+            [this](const ChannelReplyTarget& t, const std::string& err) {
+                if (m_sendFailureCb) m_sendFailureCb(t, err);
+            };
 
         std::unique_ptr<IChannelAdapter> adapter;
         std::string err;
@@ -838,10 +817,40 @@ void ChannelManager::StartChannel(const ChannelState& state) {
         return;
     }
 
-    // --- Legacy connectors (Discord, WhatsApp) ---
-    // These still use PollerState + ChannelManager loop methods.
-    // They will be migrated to adapters in a future refactor.
+    // --- Discord: hybrid (#30) ---
+    // Inbound: legacy gateway poller (DiscordGatewayLoop, deep WebSocket
+    // coupling — migrates later). Outbound: SendReply via DiscordAdapter,
+    // registered here, so there is exactly one send path and the legacy
+    // truncating copy in SendReply is gone. Both halves start below.
     if (state.type == "discord") {
+        if (!m_channelCtx) {
+            m_channelCtx = std::make_unique<ChannelContext>(
+                ChannelContext{
+                    m_httpClient, m_configStore, m_router,
+                    m_dispatch, m_logCallback
+                });
+        }
+        m_channelCtx->sendFailure =
+            [this](const ChannelReplyTarget& t, const std::string& err) {
+                if (m_sendFailureCb) m_sendFailureCb(t, err);
+            };
+
+        {
+            std::string err;
+            auto adapter = std::make_unique<DiscordAdapter>(*m_channelCtx);
+            if (adapter->Start(state, &err)) {
+                std::lock_guard<std::mutex> lock(m_adaptersMutex);
+                m_adapters[state.name] = std::move(adapter);
+                m_adapterTypes[state.name] = state.type;
+                ALOG_INFO("channels", "Started discord adapter (SendReply): "
+                          << state.name);
+            } else {
+                ALOG_WARNING("channels", "Failed to start discord adapter: "
+                          << state.name << " — " << err
+                          << " (replies will not deliver)");
+            }
+        }
+
         auto poller = std::make_unique<PollerState>();
         poller->channel_name = state.name;
         poller->channel_type = state.type;
@@ -909,7 +918,8 @@ void ChannelManager::StartChannel(const ChannelState& state) {
 }
 
 void ChannelManager::StopChannel(const std::string& name) {
-    // Stop adapter-based connector
+    // Stop adapter-based connector. Discord (#30) also runs a gateway poller
+    // under the same name — no early return, fall through to stop both halves.
     {
         std::lock_guard<std::mutex> lock(m_adaptersMutex);
         auto it = m_adapters.find(name);
@@ -918,7 +928,6 @@ void ChannelManager::StopChannel(const std::string& name) {
             m_adapters.erase(it);
             m_adapterTypes.erase(name);
             ALOG_INFO("channels", "Stopped adapter: " << name);
-            return;
         }
     }
 
