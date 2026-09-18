@@ -805,6 +805,15 @@ if(ANIMUS_BUILD_TESTS)
     )
     add_test(NAME ApiPackageStoreTests COMMAND animus_api_package_store_tests)
 
+    add_executable(animus_registry_client_tests
+      tests/RegistryClientTests.cpp
+    )
+    target_link_libraries(animus_registry_client_tests PRIVATE animus_kernel)
+    set_target_properties(animus_registry_client_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME RegistryClientTests COMMAND animus_registry_client_tests)
+
     add_executable(animus_manifest_v1_tests
       tests/ManifestV1Tests.cpp
     )

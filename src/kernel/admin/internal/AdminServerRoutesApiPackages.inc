@@ -8,6 +8,9 @@
 // PUT    /api/v1/api/packages/{id}/state   — {state: {...}} full state write (secrets write-only)
 // DELETE /api/v1/api/packages/{id}         — uninstall (cascades)
 // POST   /api/v1/api/packages/{id}/execute — {command, args, agent_id} — debug surface
+// POST   /api/v1/api/packages/install-from-registry — {registry, name, version?}
+// GET    /api/v1/api/registry/packages?registry=<base> — browse available (#63)
+// GET    /api/v1/api/registry/packages/{name}/versions?registry=<base> — version picker (#63)
 // ============================================================================
 
         // Helper lambda: package summary row
@@ -331,3 +334,110 @@
                 SendJsonResponse(callback, out);
             },
             {drogon::Post});
+
+        // ------------------------------------------------------------------
+        // Registry browse (issue #63) — list available packages + versions
+        //
+        // GET /api/v1/api/registry/packages?registry=<base>&allow_private=<0|1>
+        //   -> {registry, source, count, packages: [summary rows]}
+        // GET /api/v1/api/registry/packages/{name}/versions?registry=<base>&allow_private=<0|1>
+        //   -> {registry, source, name, count, versions: [version rows]}
+        //
+        // Read-only probes of the configured registry. SSRF posture matches
+        // install-from-registry: public URLs only unless allow_private is
+        // explicitly set (operator-configured target, admin-authenticated).
+        // ------------------------------------------------------------------
+
+        // Helper lambda: registry rows as JSON
+        auto registrySummaryJson = [](const registry::RegistryPackageSummary& s) {
+            Json::Value v(Json::objectValue);
+            v["name"] = s.name;
+            v["version"] = s.version;
+            v["semantic_version"] = s.semantic_version;
+            v["description"] = s.description;
+            v["content_hash"] = s.content_hash;
+            v["official"] = s.official;
+            v["published_at"] = s.published_at;
+            return v;
+        };
+        auto registryVersionJson = [](const registry::RegistryPackageVersion& ver) {
+            Json::Value v(Json::objectValue);
+            v["version"] = ver.version;
+            v["semantic_version"] = ver.semantic_version;
+            v["content_hash"] = ver.content_hash;
+            v["published_at"] = ver.published_at;
+            return v;
+        };
+        // Helper lambda: host label for the source chip (federation-ready)
+        auto registrySourceLabel = [](const std::string& base) {
+            std::string s = base;
+            const auto scheme = s.find("://");
+            if (scheme != std::string::npos) s = s.substr(scheme + 3);
+            const auto slash = s.find('/');
+            if (slash != std::string::npos) s = s.substr(0, slash);
+            return s;
+        };
+
+        // GET /api/v1/api/registry/packages
+        drogon::app().registerHandler(
+            "/api/v1/api/registry/packages",
+            [registrySummaryJson, registrySourceLabel](const drogon::HttpRequestPtr& req,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                const std::string registryBase = req->getParameter("registry");
+                if (registryBase.empty()) {
+                    SendJsonError(callback, "missing required query param: registry",
+                        drogon::k400BadRequest);
+                    return;
+                }
+                const bool allowPrivate = req->getParameter("allow_private") == "1";
+                HttpClient http;  // fresh instance: public URLs only (SSRF defaults)
+                auto result = registry::ListRegistryPackages(http, registryBase, allowPrivate);
+                if (!result.ok) {
+                    SendJsonError(callback, result.err, drogon::k502BadGateway);
+                    return;
+                }
+                Json::Value items(Json::arrayValue);
+                for (const auto& s : result.packages) items.append(registrySummaryJson(s));
+                Json::Value body(Json::objectValue);
+                body["registry"] = result.registry;
+                body["source"] = registrySourceLabel(result.registry);
+                body["count"] = static_cast<Json::Int>(result.packages.size());
+                body["packages"] = items;
+                SendJsonResponse(callback, body);
+            },
+            {drogon::Get});
+
+        // GET /api/v1/api/registry/packages/{name}/versions
+        drogon::app().registerHandler(
+            "/api/v1/api/registry/packages/{name}/versions",
+            [registryVersionJson, registrySourceLabel](const drogon::HttpRequestPtr& req,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+               const std::string& name) {
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                const std::string registryBase = req->getParameter("registry");
+                if (registryBase.empty()) {
+                    SendJsonError(callback, "missing required query param: registry",
+                        drogon::k400BadRequest);
+                    return;
+                }
+                const bool allowPrivate = req->getParameter("allow_private") == "1";
+                HttpClient http;  // fresh instance: public URLs only (SSRF defaults)
+                auto result = registry::ListRegistryPackageVersions(http, registryBase, name, allowPrivate);
+                if (!result.ok) {
+                    SendJsonError(callback, result.err, drogon::k502BadGateway);
+                    return;
+                }
+                Json::Value items(Json::arrayValue);
+                for (const auto& v : result.versions) items.append(registryVersionJson(v));
+                Json::Value body(Json::objectValue);
+                body["registry"] = result.registry;
+                body["source"] = registrySourceLabel(result.registry);
+                body["name"] = result.name;
+                body["count"] = static_cast<Json::Int>(result.versions.size());
+                body["versions"] = items;
+                SendJsonResponse(callback, body);
+            },
+            {drogon::Get});
