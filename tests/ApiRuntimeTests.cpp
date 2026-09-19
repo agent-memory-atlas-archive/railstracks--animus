@@ -446,6 +446,17 @@ int TestSandboxStateAndSecrets() {
            "secret written before an error cannot leak via the error message");
     Assert(r7["error"].asString().find("***") != std::string::npos,
            "error path redaction marker present");
+
+    // #23 audit round 3: set-then-return-as-file-path must not leak via the
+    // filespace-escape error (error masked + files array stripped)
+    std::string extra8 = R"({"name": "leakfile", "kind": "action", "description": "d",
+        "script": "function run(ctx) ctx.package.set_state('token', 'X-FILE-LEAK-7') return {files = {{path = '/outside/' .. ctx.package.get_state('token')}}} end"})";
+    InstallFixturePkg(fx5, extra8);
+    auto r8 = fx5.runtime->ExecuteAction("testpkg", "leakfile", "agent", Json::Value());
+    Assert(!r8["success"].asBool(), "leakfile reports failure (path escapes)");
+    Assert(r8["error"].asString().find("X-FILE-LEAK-7") == std::string::npos,
+           "secret-derived escaping file path cannot leak via error message");
+    Assert(!r8.isMember("files"), "rejected files array stripped from error response");
     return 0;
 }
 

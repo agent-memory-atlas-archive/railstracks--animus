@@ -1130,7 +1130,13 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
             auto rootCanon = fs::weakly_canonical(root, nec);
             if (canon.string().find(rootCanon.string()) != 0) {
                 result["success"] = false;
-                result["error"] = "file path escapes package filespace: " + p.string();
+                // Masked through the full redaction basis: a script can smuggle a
+                // secret (get_state or one it just wrote) into an escaping file
+                // path. The rejected files array is stripped entirely — error
+                // responses never echo the offending artifact.
+                result["error"] = masked(
+                    std::string("file path escapes package filespace: ") + p.string());
+                result.removeMember("files");
                 return result;
             }
             Json::Value vf = f;
