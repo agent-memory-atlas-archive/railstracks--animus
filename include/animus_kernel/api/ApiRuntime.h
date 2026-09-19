@@ -10,6 +10,7 @@ namespace animus::kernel {
 
 class ApiPackageStore;
 class HttpClient;
+class SecretsVault;
 
 // ============================================================================
 // ApiRuntime — executes api package commands (build order c)
@@ -35,7 +36,8 @@ public:
         size_t instructionLimit{10'000'000};
     };
 
-    ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg);
+    ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg,
+              SecretsVault* vault = nullptr);
 
     // Executes an action command for an agent. argsJson must be a JSON
     // object (empty object for no-arg commands). Returns the agent-facing
@@ -83,6 +85,7 @@ public:
 
     const Config& config() const { return m_cfg; }
     ApiPackageStore* store() const { return m_store; }
+    SecretsVault* vault() const { return m_vault; }
 
 private:
     Json::Value ExecuteInternal(const std::string& packageName,
@@ -95,6 +98,7 @@ private:
     ApiPackageStore* m_store;
     HttpClient* m_http;
     Config m_cfg;
+    SecretsVault* m_vault{nullptr};
 };
 
 }  // namespace animus::kernel

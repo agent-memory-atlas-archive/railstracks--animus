@@ -28,6 +28,7 @@ class ProviderThrottle;
 class SessionManager;
 class ChainRunner;
 class CompactionService;
+class SecretsVault;
 class SyncStore;
 class PeerSyncService;
 class Scheduler;
@@ -158,6 +159,7 @@ private:
     ChannelContextStore* m_channelContextStore{nullptr}; // trusted channel arrivals (#14)
     ApiPackageStore* m_apiPackageStore{nullptr}; // api package persistence (#26 b)
     ApiRuntime* m_apiRuntime{nullptr};               // api package runtime (#26 c)
+    SecretsVault* m_secretsVault{nullptr};           // encrypted package secrets (#23)
     ApiConnectionManager* m_apiConnManager{nullptr};  // connection driver + dispatch bridge (#26 d)
     AgendaStore* m_agendaStore{nullptr}; // per-agent calendar/agenda
     SessionReportStore* m_sessionReportStore{nullptr}; // per-session temporal reports

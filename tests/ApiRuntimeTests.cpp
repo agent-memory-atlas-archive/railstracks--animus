@@ -3,6 +3,7 @@
 // transport and the ctx.http budget cap.
 
 #include "animus_kernel/api/ApiRuntime.h"
+#include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/SqliteDataStore.h"
 #include "animus_kernel/tools/HttpClient.h"
@@ -14,6 +15,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <filesystem>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -127,6 +129,7 @@ struct Fixture {
     std::string dbPath = MakeDbPath();
     SqliteDataStore db{dbPath};
     ApiPackageStore store{&db};
+    SecretsVault vault{&db, dbPath + ".vaultkey"};
     HttpClient http;
     HttpServer server;
     uint16_t port{0};
@@ -137,9 +140,10 @@ struct Fixture {
         http.SetAllowPrivateAddresses(true);  // fixture servers are loopback
         port = server.Start();
         filesRoot = dbPath + ".files";
+        vault.EnsureSchema();
         ApiRuntime::Config cfg;
         cfg.filesRoot = filesRoot;
-        runtime = std::make_unique<ApiRuntime>(&store, &http, cfg);
+        runtime = std::make_unique<ApiRuntime>(&store, &http, cfg, &vault);
     }
     ~Fixture() {
         server.running = false;
@@ -193,7 +197,21 @@ ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "") {
     }
     ApiPackage pkg = fx.store.InstallFromManifest(manifest);
     fx.store.SetPackageEnabled(pkg.id, true);
-    fx.store.SetPackageState(pkg.id, "{\"token\":\"SECRET-TOKEN-1234\"}");
+    // #23: the fixture token enters through the vault (split-write path —
+    // same seam the admin PUT uses), never as a state literal.
+    {
+        Json::Value state(Json::objectValue);
+        state["token"] = "SECRET-TOKEN-1234";
+        Json::Value schema;
+        std::istringstream schemaStream(pkg.state_schema.empty() ? "{}" : pkg.state_schema);
+        Json::CharReaderBuilder rb;
+        std::string perr;
+        Json::parseFromStream(rb, schemaStream, &schema, &perr);
+        std::string err;
+        fx.vault.SplitStateSecrets(pkg.id, schema, state, err);
+        Json::StreamWriterBuilder wb;
+        fx.store.SetPackageState(pkg.id, Json::writeString(wb, state));
+    }
     return fx.store.GetPackage(pkg.id).value();
 }
 
@@ -314,7 +332,9 @@ int TestPrimaryTransport() {
     Assert(r["success"].asBool() && r["output"].asString().find("path /v2/positions") != std::string::npos,
            "GET json flows to sandbox");
 
-    // missing state key = tool error naming it (script never runs)
+    // missing secret = tool error naming it (script never runs) — #23: the
+    // token lives in the vault now, so the missing-key case is a vault unset.
+    fx.vault.Delete(fx.store.GetPackageByName("testpkg")->id, "token");
     fx.store.SetPackageState(fx.store.GetPackageByName("testpkg")->id,
                              "{\"base_url\":\"http://127.0.0.1:1\"}");
     r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent", none);
@@ -335,7 +355,11 @@ int TestSandboxStateAndSecrets() {
     auto r = fx.runtime->ExecuteAction("testpkg", "set token", "agent", args);
     Assert(r["success"].asBool() && r["output"].asString() == "stored", "set_state ok");
     auto now = fx.store.GetPackage(pkg.id);
-    Assert(now->state.find("NEW-SECRET-9999") != std::string::npos, "state persisted");
+    Assert(now->state.find("NEW-SECRET-9999") == std::string::npos,
+           "#23: secret NOT persisted into state JSON");
+    Assert(fx.vault.Has(pkg.id, "token") &&
+               fx.vault.Get(pkg.id, "token").value_or("") == "NEW-SECRET-9999",
+           "#23: secret stored in vault");
 
     // use the new token in a transport call (get_state path is same store)
     Json::Value none;
@@ -385,6 +409,88 @@ int TestSandboxStateAndSecrets() {
            r4["data"]["e2"].asString().find("framework-reserved") != std::string::npos &&
            r4["data"]["e3"].asString().find("must be of type string") != std::string::npos,
            "violations carry reasons");
+
+    // #23 audit: secret_ref write-through via set_state + mid-invocation redaction
+    Fixture fx5;
+    std::string extra5 = R"({"name": "setref", "kind": "action", "description": "d",
+        "script": "function run(ctx) local ok = ctx.package.set_state('token', {secret_ref='shared'}) return {output=tostring(ok)} end"})";
+    std::string extra5b = R"({"name": "leaknew", "kind": "action", "description": "d",
+        "script": "function run(ctx) local ok = ctx.package.set_state('token', 'X-NEWLY-SET-42') return {output='set='..tostring(ok)..' val='..ctx.package.get_state('token')} end"})";
+    auto pkg5 = InstallFixturePkg(fx5, extra5 + "," + extra5b);
+    std::string vErr;
+    fx5.vault.Set(pkg5.id, "shared", "SHARED-KEY-777", vErr);
+    auto r5 = fx5.runtime->ExecuteAction("testpkg", "setref", "agent", Json::Value());
+    Assert(r5["output"].asString() == "true", "set_state accepts secret_ref indirection");
+    {
+        auto now5 = fx5.store.GetPackage(pkg5.id);
+        Assert(now5->state.find("secret_ref") != std::string::npos,
+               "ref object persisted in state (config, not secret)");
+    }
+    r5 = fx5.runtime->ExecuteAction("testpkg", "fetch positions", "agent", Json::Value());
+    Assert(r5["success"].asBool(), "transport resolves through the ref");
+    Assert(fx5.server.lastAuth.find("Bearer SHARED-KEY-777") != std::string::npos,
+           "ref target value reaches the transport");
+
+    auto r6 = fx5.runtime->ExecuteAction("testpkg", "leaknew", "agent", Json::Value());
+    Assert(r6["output"].asString().find("X-NEWLY-SET-42") == std::string::npos,
+           "secret written mid-invocation is redacted from results");
+    Assert(r6["output"].asString().find("***") != std::string::npos,
+           "redaction marker present");
+
+    // #23 audit round 2: set-then-error must not leak through the error path
+    std::string extra7 = R"({"name": "leakerr", "kind": "action", "description": "d",
+        "script": "function run(ctx) ctx.package.set_state('token', 'X-ERR-LEAK-9') error('failed with '..ctx.package.get_state('token')) end"})";
+    InstallFixturePkg(fx5, extra7);
+    auto r7 = fx5.runtime->ExecuteAction("testpkg", "leakerr", "agent", Json::Value());
+    Assert(!r7["success"].asBool(), "leakerr reports failure");
+    Assert(r7["error"].asString().find("X-ERR-LEAK-9") == std::string::npos,
+           "secret written before an error cannot leak via the error message");
+    Assert(r7["error"].asString().find("***") != std::string::npos,
+           "error path redaction marker present");
+
+    // #23 audit round 3: set-then-return-as-file-path must not leak via the
+    // filespace-escape error (error masked + files array stripped)
+    std::string extra8 = R"({"name": "leakfile", "kind": "action", "description": "d",
+        "script": "function run(ctx) ctx.package.set_state('token', 'X-FILE-LEAK-7') return {files = {{path = '/outside/' .. ctx.package.get_state('token')}}} end"})";
+    InstallFixturePkg(fx5, extra8);
+    auto r8 = fx5.runtime->ExecuteAction("testpkg", "leakfile", "agent", Json::Value());
+    Assert(!r8["success"].asBool(), "leakfile reports failure (path escapes)");
+    Assert(r8["error"].asString().find("X-FILE-LEAK-7") == std::string::npos,
+           "secret-derived escaping file path cannot leak via error message");
+    Assert(!r8.isMember("files"), "rejected files array stripped from error response");
+
+    // #23 audit round 4: sibling-directory containment — prefix-matching path
+    // outside the package root must be rejected (component-aware check)
+    {
+        namespace fs = std::filesystem;
+        const fs::path sibling = fs::path(fx5.filesRoot) / "testpkg-escape";
+        fs::create_directories(sibling);
+        const fs::path sf = sibling / "innocent.txt";
+        { FILE* f = fopen(sf.c_str(), "w"); fputs("sibling", f); fclose(f); }
+        std::string tmpl = R"({"name": "siblingfile", "kind": "action", "description": "d",
+            "script": "function run(ctx) return {files = {{path = '@PATH@'}}} end"})";
+        std::string extra9 = tmpl;
+        extra9.replace(extra9.find("@PATH@"), 6, sf.string());
+        InstallFixturePkg(fx5, extra9);
+        auto r9 = fx5.runtime->ExecuteAction("testpkg", "siblingfile", "agent", Json::Value());
+        Assert(!r9["success"].asBool(), "sibling-directory file rejected (prefix not enough)");
+        Assert(r9["error"].asString().find("escapes package filespace") != std::string::npos,
+               "escape error named");
+        // positive control: a real in-root file still verifies
+        const fs::path rootDir = fs::path(fx5.filesRoot) / "testpkg";
+        fs::create_directories(rootDir);
+        const fs::path okf = rootDir / "ok.txt";
+        { FILE* f = fopen(okf.c_str(), "w"); fputs("ok", f); fclose(f); }
+        std::string extra10 = tmpl;
+        extra10.replace(extra10.find("@PATH@"), 6, okf.string());
+        extra10.replace(extra10.find("siblingfile"), 11, "okfile");
+        InstallFixturePkg(fx5, extra10);
+        auto r10 = fx5.runtime->ExecuteAction("testpkg", "okfile", "agent", Json::Value());
+        Assert(r10["success"].asBool(), "in-root file still accepted");
+        Assert(r10["files"].isArray() && r10["files"].size() == 1 &&
+                   r10["files"][0]["bytes"].asInt64() == 2,
+               "in-root file verified with size");
+    }
     return 0;
 }
 

@@ -1,5 +1,7 @@
 #include "animus_kernel/api/ApiRuntime.h"
 
+#include "animus_kernel/api/SecretsVault.h"
+
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/Log.h"
 #include "animus_kernel/tools/HttpClient.h"
@@ -213,8 +215,10 @@ struct BridgeContext {
     std::string commandName;
     std::string packageId;
     int64_t filesQuotaBytes{256LL * 1024 * 1024};
-    Json::Value state;         // live values (real)
+    Json::Value state;         // live values (real; vault-resolved in memory)
+    Json::Value persistState;  // storage view: secrets stripped (vault owns them)
     Json::Value stateSchema;
+    SecretsVault* vault{nullptr};
     Json::Value args;
     std::vector<std::string> secretValues;
     std::set<std::string> secretKeys;
@@ -354,14 +358,65 @@ int CtxSetState(lua_State* L) {
     BridgeContext* bc = GetBridge(L, 1);
     const char* k = luaL_checkstring(L, 1);
     Json::Value v = LuaToJson(L, 2);
+    // #23: a {secret_ref = name} table is the indirection form for secret-typed
+    // keys — ValidateStateWrite only knows scalars, so vet it here instead:
+    // key must be declared AND secret-typed, ref name must be a valid vault name.
+    std::string refName;
+    const bool secretKey = bc->stateSchema.isObject() && bc->stateSchema.isMember(k) &&
+                           bc->stateSchema[k].get("secret", false).asBool();
+    const bool isRef = secretKey && SecretsVault::IsSecretRef(v, refName) &&
+                       SecretsVault::IsValidSecretName(refName);
     std::string err;
-    if (!ValidateStateWrite(bc->stateSchema, k, v, err)) {
+    if (isRef) {
+        if (!k[0] || k[0] == '_') {
+            lua_pushnil(L);
+            lua_pushstring(L, "key is framework-reserved (leading underscore)");
+            return 2;
+        }
+    } else if (!ValidateStateWrite(bc->stateSchema, k, v, err)) {
         lua_pushnil(L);
         lua_pushstring(L, err.c_str());
         return 2;
     }
+    if (secretKey) {
+        if (isRef) {
+            // Explicit indirection is config — persist the ref object itself.
+            bc->persistState[k] = v;
+            auto resolved = bc->vault ? bc->vault->Get(bc->packageId, refName) : std::nullopt;
+            if (resolved) {
+                bc->state[k] = *resolved;
+                // Refs resolve to secret bytes — they join this invocation's
+                // redaction set so they can't leak via results.
+                bc->secretValues.push_back(*resolved);
+            } else {
+                bc->state.removeMember(k);
+            }
+        } else {
+            std::string setErr;
+            if (!bc->vault || !bc->vault->Set(bc->packageId, k, v.asString(), setErr)) {
+                lua_pushnil(L);
+                lua_pushstring(L, ("secret vault write failed: " + setErr).c_str());
+                return 2;
+            }
+            bc->state[k] = v;               // resolved in-memory view
+            bc->persistState.removeMember(k);  // storage view stays secret-free
+            // Values written during THIS invocation join the redaction set —
+            // a script must not be able to set a secret and echo it back out.
+            bc->secretValues.push_back(v.asString());
+        }
+        // Ref objects persist; plain secret values never do. Only persist when
+        // the storage view actually changed (indirection case).
+        if (bc->store && bc->store->SetPackageState(bc->packageId, JsonWrite(bc->persistState))) {
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+        lua_pushnil(L);
+        lua_pushstring(L, "state persist failed");
+        return 2;
+    }
     bc->state[k] = v;
-    if (bc->store && bc->store->SetPackageState(bc->packageId, JsonWrite(bc->state))) {
+    bc->persistState[k] = v;
+    if (bc->store && bc->store->SetPackageState(bc->packageId, JsonWrite(bc->persistState))) {
         lua_pushboolean(L, 1);
         return 1;
     }
@@ -647,10 +702,13 @@ void BuildCtx(lua_State* L, BridgeContext* bc, const Json::Value& request, bool 
               const Json::Value& eventJson) {
     lua_newtable(L);  // ctx
 
-    // masked state copy (display/branching only; get_state returns real values)
+    // masked state copy (display/branching only; get_state returns real values).
+    // Masks ANY present secret value regardless of JSON type — a stale or
+    // hand-edited non-string under a secret key never reaches scripts raw.
     Json::Value masked = bc->state;
     for (const std::string& k : bc->state.getMemberNames()) {
-        if (bc->secretKeys.count("state." + k) && masked[k].isString()) masked[k] = "***";
+        if (bc->secretKeys.count("state." + k) && !masked[k].isNull())
+            masked[k] = "***";
     }
 
     // ctx.package (single build: name, masked state, get_state, set_state)
@@ -740,8 +798,9 @@ void BuildCtx(lua_State* L, BridgeContext* bc, const Json::Value& request, bool 
 // ApiRuntime
 // ---------------------------------------------------------------------------
 
-ApiRuntime::ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg)
-    : m_store(store), m_http(http), m_cfg(std::move(cfg)) {}
+ApiRuntime::ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg,
+                       SecretsVault* vault)
+    : m_store(store), m_http(http), m_cfg(std::move(cfg)), m_vault(vault) {}
 
 std::string ApiRuntime::Interpolate(const std::string& tmpl, const Json::Value& state,
                                     const Json::Value& args,
@@ -877,11 +936,12 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
                    ", not invocable on this path");
 
     // --- state, secrets, args ------------------------------------------------
-    Json::Value stateSchema, liveState;
+    Json::Value stateSchema, liveState, persistState;
     {
         std::string e;
         ParseJsonText(pkg->state_schema.empty() ? "{}" : pkg->state_schema, stateSchema, e);
         ParseJsonText(pkg->state.empty() ? "{}" : pkg->state, liveState, e);
+        persistState = liveState;  // storage view: pre-defaults, pre-resolution
         // Overlay schema defaults for unset keys (values win over defaults).
         if (stateSchema.isObject()) {
             for (const std::string& k : stateSchema.getMemberNames()) {
@@ -889,6 +949,11 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
                     liveState[k] = stateSchema[k]["default"];
             }
         }
+        // Vault resolution (#23): secret-typed keys resolve from the encrypted
+        // vault (or {"secret_ref": ...} indirection) into this in-memory copy
+        // only — stored state never holds secret bytes. Unset secrets resolve
+        // absent, so the missing-key machinery below names them at first use.
+        if (m_vault) m_vault->ResolveState(pkg->id, stateSchema, liveState);
     }
 
     if (args.isNull()) args = Json::Value(Json::objectValue);
@@ -966,7 +1031,9 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     bc.packageId = pkg->id;
     bc.filesQuotaBytes = pkg->files_quota_mb * 1024LL * 1024LL;
     bc.state = liveState;
+    bc.persistState = persistState;
     bc.stateSchema = stateSchema;
+    bc.vault = m_vault;
     bc.args = args;
     bc.secretValues = secretValues;
     bc.secretKeys = secretKeys;
@@ -1000,17 +1067,30 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
         return err("script must define run(ctx)");
     }
     BuildCtx(L, &bc, request, isHook, eventJson);
+    // Redaction basis for script-produced text: the pre-execution set PLUS
+    // anything the script wrote/resolved into the vault while running — a
+    // set_state followed by error('...' .. get_state(...)) must not smuggle
+    // the new value out through the error path. `bc.secretValues` stays live
+    // until the VM closes, so refresh from it per branch.
+    auto masked = [&](const std::string& s) {
+        std::vector<std::string> all = secretValues;
+        all.insert(all.end(), bc.secretValues.begin(), bc.secretValues.end());
+        return MaskSecrets(s, all);
+    };
     if (lua_pcall(L, 1, 1, 0)) {
         const char* msg = lua_tostring(L, -1);
         result["success"] = false;
-        result["error"] = MaskSecrets(std::string("run error: ") + (msg ? msg : "?"),
-                                       secretValues);
+        result["error"] = masked(std::string("run error: ") + (msg ? msg : "?"));
         lua_close(L);
         return result;
     }
     Json::Value returned = lua_isnil(L, -1) ? Json::Value(Json::objectValue)
                                             : LuaToJson(L, -1);
     lua_close(L);
+    // Fold execution-written secrets into the redaction basis for the success
+    // path (truncate + final mask below); the error path handled its own via
+    // `masked` above.
+    secretValues.insert(secretValues.end(), bc.secretValues.begin(), bc.secretValues.end());
 
     if (!returned.isObject()) {
         result["success"] = false;
@@ -1048,9 +1128,24 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
             std::error_code nec;
             auto canon = fs::weakly_canonical(p, nec);
             auto rootCanon = fs::weakly_canonical(root, nec);
-            if (canon.string().find(rootCanon.string()) != 0) {
+            // Component-aware containment: a string-prefix check would accept
+            // sibling dirs (/…/pkg-escape passes for root /…/pkg). Relative
+            // form must be non-escaping (not absolute, not leading "..");
+            // canonicalization errors reject — boundary unprovable = outside.
+            std::error_code rec;
+            const fs::path rel = fs::relative(canon, rootCanon, rec);
+            const bool escapes = nec || rec || rel.empty() || rel.is_absolute() ||
+                                 rel.native() == ".." ||
+                                 rel.native().rfind("../", 0) == 0;
+            if (escapes) {
                 result["success"] = false;
-                result["error"] = "file path escapes package filespace: " + p.string();
+                // Masked through the full redaction basis: a script can smuggle a
+                // secret (get_state or one it just wrote) into an escaping file
+                // path. The rejected files array is stripped entirely — error
+                // responses never echo the offending artifact.
+                result["error"] = masked(
+                    std::string("file path escapes package filespace: ") + p.string());
+                result.removeMember("files");
                 return result;
             }
             Json::Value vf = f;

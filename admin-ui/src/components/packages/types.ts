@@ -36,6 +36,8 @@ export interface ConnectionRow {
 export interface PackageDetail extends PackageRow {
   state_schema: string;
   state: Record<string, any>;
+  // #23: vault status per declared secret key — names + set flag, never values
+  secrets?: Record<string, { set: boolean; ref?: string }>;
   commands: CommandRow[];
   connections: ConnectionRow[];
 }

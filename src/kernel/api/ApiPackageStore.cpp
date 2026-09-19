@@ -5,6 +5,7 @@
 #include <json/json.h>
 
 #include <atomic>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <ctime>
@@ -655,6 +656,62 @@ bool IsHookEvent(const std::string& e) {
     return e == "on_connect" || e == "on_disconnect" || e == "on_message" || e == "on_error";
 }
 
+// --- #23: credentials are forbidden as literals in package files -------------
+// A literal token in an exchanged package is a leak by construction. Headers
+// whose names mark them as credential carriers must reference state
+// ({{state.…}}) so the value comes from the per-install vault at runtime.
+bool IsCredentialHeaderName(const std::string& name) {
+    std::string lower;
+    for (char c : name)
+        lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "authorization" || lower == "proxy-authorization" || lower == "cookie")
+        return true;
+    const std::array<std::string, 5> needles = {"api-key", "apikey", "token", "secret",
+                                                "password"};
+    for (const auto& n : needles)
+        if (lower.find(n) != std::string::npos) return true;
+    return false;
+}
+
+void LintCredentialHeaders(const Json::Value& headers, const std::string& where, LintError& lint) {
+    if (!headers.isObject()) return;
+    for (const std::string& h : headers.getMemberNames()) {
+        if (!IsCredentialHeaderName(h)) continue;
+        const Json::Value& v = headers[h];
+        if (!v.isString()) continue;
+        const std::string value = v.asString();
+        // Extract every {{...}} token; a credential header must be templated
+        // and every token must follow the runtime grammar (state.* / args.*
+        // dotted paths) — unknown roots like {{env.X}} or malformed braces
+        // fail here instead of exploding (or silently resolving) at runtime.
+        std::vector<std::string> tokens;
+        size_t pos = 0;
+        bool malformed = false;
+        while (true) {
+            const size_t s = value.find("{{", pos);
+            if (s == std::string::npos) break;
+            const size_t e = value.find("}}", s + 2);
+            if (e == std::string::npos) { malformed = true; break; }
+            tokens.push_back(value.substr(s + 2, e - s - 2));
+            pos = e + 2;
+        }
+        bool bad = malformed || tokens.empty();
+        for (const auto& tok : tokens) {
+            const auto dot = tok.find('.');
+            if (dot == std::string::npos ||
+                (tok.substr(0, dot) != "state" && tok.substr(0, dot) != "args")) {
+                bad = true;
+                break;
+            }
+        }
+        if (bad) {
+            lint.Add(where + ": header '" + h + "' must template its value from "
+                     "state.* / args.* ({{state.…}}) — literal or malformed "
+                     "credentials are forbidden in package files (#23)");
+        }
+    }
+}
+
 }  // namespace
 
 void ApiPackageStore::ValidateName(const std::string& name) {
@@ -721,6 +778,17 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
                 lint.Add("state_schema." + key + " must be an object with a string 'type'");
             } else if (def.isMember("secret") && !def["secret"].isBool()) {
                 lint.Add("state_schema." + key + ".secret must be a boolean");
+            } else if (def.get("secret", Json::Value(false)).asBool() &&
+                       def.get("type", Json::Value("")).asString() != "string") {
+                // Secrets are credential strings: the vault stores strings, the
+                // masked-state copy and redaction assume strings. Non-string
+                // secret types are rejected at the door.
+                lint.Add("state_schema." + key + ": secret keys must be of type string");
+            } else if (def.get("secret", Json::Value(false)).asBool() && def.isMember("default")) {
+                // #23: a default on a secret key is a literal credential in an
+                // exchanged file — exactly the leak this ticket forbids.
+                lint.Add("state_schema." + key + ": secret keys must not declare a default "
+                         "(secrets live in the per-install vault, never in package files)");
             }
         }
     }
@@ -782,8 +850,11 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
                 if (c.isMember("request") && !c["request"].isNull()) {
                     if (!c["request"].isObject())
                         lint.Add("action '" + cmd.name + "': request must be an object");
-                    else
+                    else {
                         cmd.request = JsonCompact(c["request"]);
+                        LintCredentialHeaders(c["request"].get("headers", Json::Value(Json::objectValue)),
+                                              "action '" + cmd.name + "'", lint);
+                    }
                 }
                 cmd.event = "";
             } else {
@@ -823,6 +894,7 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
                 lint.Add("connection '" + conn.name + "': headers_template must be an object");
             } else {
                 conn.headers_template = JsonCompact(headers);
+                LintCredentialHeaders(headers, "connection '" + conn.name + "'", lint);
             }
 
             Json::Value hooks = c.get("hooks", Json::Value(Json::objectValue));
