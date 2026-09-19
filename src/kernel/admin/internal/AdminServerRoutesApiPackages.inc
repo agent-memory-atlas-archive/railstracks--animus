@@ -95,6 +95,7 @@
 
                 Json::Value body = pkgSummary(*pkg);
                 body["state_schema"] = pkg->state_schema.empty() ? "{}" : pkg->state_schema;
+                body["egress_hosts"] = pkg->egress_hosts.empty() ? "[]" : pkg->egress_hosts;
                 body["state"] = maskedState(*pkg);
 
                 // #23: declared secrets + vault status (never values).

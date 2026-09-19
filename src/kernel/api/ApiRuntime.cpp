@@ -222,6 +222,7 @@ struct BridgeContext {
     Json::Value args;
     std::vector<std::string> secretValues;
     std::set<std::string> secretKeys;
+    std::vector<std::string> egressHosts;  // #25: package egress scope
     ApiPackageStore* store{nullptr};
     HttpClient* http{nullptr};
     std::string filesRoot;
@@ -435,6 +436,23 @@ Json::Value DoHttp(BridgeContext* bc, const std::string& method, lua_State* L, i
         return out;
     }
     const char* url = luaL_checkstring(L, urlIdx);
+    // #25 egress gate for script-initiated fetches: same package scope as the
+    // transport path. Returned as a normal http-result table (status 0 +
+    // error) so scripts can handle it — but always audited.
+    {
+        std::string egressHost;
+        if (!ApiRuntime::EgressAllowed(bc->egressHosts, url, egressHost)) {
+            ALOG_WARNING("api", "[egress] DENIED " << bc->logPrefix << " -> "
+                         << (egressHost.empty() ? "<malformed url>" : egressHost)
+                         << " (sandbox fetch outside package scope)");
+            Json::Value denied(Json::objectValue);
+            denied["status"] = 0;
+            denied["error"] = "egress denied: host '" +
+                              (egressHost.empty() ? "<malformed>" : egressHost) +
+                              "' is not in this package's egress allowlist";
+            return denied;
+        }
+    }
     HttpClient::Request req;
     req.method = method;
     req.url = url;
@@ -862,6 +880,50 @@ std::string ApiRuntime::Interpolate(const std::string& tmpl, const Json::Value& 
     return out;
 }
 
+std::vector<std::string> ApiRuntime::ParseEgressHosts(const std::string& json) {
+    std::vector<std::string> out;
+    Json::Value arr;
+    std::string err;
+    if (!ParseJsonText(json.empty() ? "[]" : json, arr, err) || !arr.isArray()) return out;
+    for (const auto& h : arr)
+        if (h.isString() && !h.asString().empty()) out.push_back(h.asString());
+    return out;
+}
+
+bool ApiRuntime::EgressAllowed(const std::vector<std::string>& hostPatterns,
+                               const std::string& resolvedUrl, std::string& hostOut) {
+    // Extract host from the resolved URL (no templating left here).
+    const size_t sep = resolvedUrl.find("://");
+    if (sep == std::string::npos) {
+        hostOut = "";
+        return false;  // not an absolute URL — deny
+    }
+    size_t hostStart = sep + 3;
+    size_t hostEnd = hostStart;
+    while (hostEnd < resolvedUrl.size() && resolvedUrl[hostEnd] != '/' &&
+           resolvedUrl[hostEnd] != '?' && resolvedUrl[hostEnd] != '#')
+        ++hostEnd;
+    std::string host = resolvedUrl.substr(hostStart, hostEnd - hostStart);
+    const size_t at = host.rfind('@');
+    if (at != std::string::npos) host = host.substr(at + 1);
+    const size_t colon = host.rfind(':');
+    if (!host.empty() && host[0] != '[' && colon != std::string::npos)
+        host = host.substr(0, colon);
+    std::transform(host.begin(), host.end(), host.begin(), ::tolower);
+    hostOut = host;
+    // Empty scope = deny-all (script-only packages stay network-silent).
+    for (const auto& pat : hostPatterns) {
+        if (pat == host) return true;
+        if (pat.substr(0, 2) == "*.") {
+            const std::string suffix = pat.substr(1);  // ".example.com"
+            if (host.size() > suffix.size() &&
+                host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
 std::string ApiRuntime::MaskSecrets(const std::string& text,
                                     const std::vector<std::string>& secretValues) {
     std::string out = text;
@@ -922,6 +984,7 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     if (!m_store->EffectiveEnabled(pkg->id, agentId))
         return err("package '" + packageName + "' is not enabled for this agent (api enable " +
                    packageName + ")");
+    const std::vector<std::string> egressScope = ParseEgressHosts(pkg->egress_hosts);
     auto cmd = m_store->GetCommand(pkg->id, commandName);
     if (!cmd) {
         std::string avail;
@@ -1002,6 +1065,20 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
             if (!ierr.empty()) return err(ierr);
             hreq.body = body;
         }
+        // #25 egress gate: the resolved URL's host must be in this package's
+        // scope. Audited loudly — every denial names package, command, host.
+        {
+            std::string egressHost;
+            if (!EgressAllowed(egressScope, url, egressHost)) {
+                ALOG_WARNING("api", "[egress] DENIED " << packageName << ":" << commandName
+                             << " -> " << (egressHost.empty() ? "<malformed url>" : egressHost)
+                             << " (package scope has " << egressScope.size()
+                             << " pattern(s); declare egress_hosts in the manifest)");
+                return err("egress denied: host '" +
+                           (egressHost.empty() ? "<malformed>" : egressHost) +
+                           "' is not in this package's egress allowlist");
+            }
+        }
         ALOG_INFO("api", "[" << packageName << ":" << commandName << "] "
                              << method << " " << MaskSecrets(url, secretValues) << " (body "
                              << hreq.body.size() << " B)");
@@ -1037,6 +1114,7 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     bc.args = args;
     bc.secretValues = secretValues;
     bc.secretKeys = secretKeys;
+    bc.egressHosts = egressScope;
     bc.store = m_store;
     bc.http = m_http;
     bc.filesRoot = m_cfg.filesRoot;

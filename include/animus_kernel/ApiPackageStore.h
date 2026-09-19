@@ -33,6 +33,8 @@ struct ApiPackage {
     std::string registry_version;    // semver last downloaded; "" if none
     bool locally_modified{false};
     bool enabled{false};             // install != enable; enabling is explicit
+    std::string egress_hosts;        // JSON array of allowed host patterns (#25);
+                                     // derived from url templates when undeclared
     int64_t dispatch_cooldown_ms{10000};
     int64_t files_quota_mb{256};     // ctx.fs quota (D12)
     std::string state_schema;        // JSON object: key -> {type, default?, secret?}
@@ -116,6 +118,10 @@ public:
     // Absent row -> inherit package default. Effective enablement for agent A
     // = package.enabled AND (no row OR row.enabled).
     void SetAgentEnablement(const std::string& packageId, const std::string& agentId, bool enabled);
+
+    // #25: backfill egress scopes for packages predating the column (derived
+    // from stored url templates + state_schema defaults). Idempotent.
+    void MigrateEgressScopes();
     std::optional<bool> GetAgentEnablement(const std::string& packageId,
                                            const std::string& agentId) const;  // nullopt = no row
     bool ClearAgentEnablement(const std::string& packageId, const std::string& agentId);

@@ -39,6 +39,16 @@ public:
     ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg,
               SecretsVault* vault = nullptr);
 
+    // #25 egress scope helpers shared by action transport, sandbox secondary
+    // fetches, and connection polls.
+    // Parse the stored egress_hosts JSON array into patterns.
+    static std::vector<std::string> ParseEgressHosts(const std::string& json);
+    // Extract the host of a RESOLVED url and match it against the patterns
+    // (exact, or "*.<domain>" subdomain wildcard). hostOut carries the
+    // extracted host for audit lines. Empty pattern set denies everything.
+    static bool EgressAllowed(const std::vector<std::string>& hostPatterns,
+                              const std::string& resolvedUrl, std::string& hostOut);
+
     // Executes an action command for an agent. argsJson must be a JSON
     // object (empty object for no-arg commands). Returns the agent-facing
     // result object: {success, output, data?, files?} on success, or

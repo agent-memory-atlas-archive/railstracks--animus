@@ -278,6 +278,19 @@ ApiConnectionManager::PollOutcome ApiConnectionManager::PollConnection(
             req.url += (req.url.find('?') == std::string::npos ? "?" : "&") + qs;
     }
 
+    // #25 egress gate: connection polls live under the same package scope.
+    {
+        std::string egressHost;
+        const auto scope = ApiRuntime::ParseEgressHosts(pkg.egress_hosts);
+        if (!ApiRuntime::EgressAllowed(scope, req.url, egressHost)) {
+            ALOG_WARNING("api-conn", "[egress] DENIED " << pkg.name << ":" << conn.name
+                         << " poll -> " << (egressHost.empty() ? "<malformed url>" : egressHost)
+                         << " (outside package scope — declare egress_hosts in the manifest)");
+            o.consecutiveErrors = prevErrors + 1;
+            return o;
+        }
+    }
+
     ALOG_INFO("api-conn", "[" << pkg.name << ":" << conn.name << "] poll GET "
                               << ApiRuntime::MaskSecrets(req.url, secretValues));
 
