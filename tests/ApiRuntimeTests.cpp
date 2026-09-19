@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <filesystem>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -457,6 +458,39 @@ int TestSandboxStateAndSecrets() {
     Assert(r8["error"].asString().find("X-FILE-LEAK-7") == std::string::npos,
            "secret-derived escaping file path cannot leak via error message");
     Assert(!r8.isMember("files"), "rejected files array stripped from error response");
+
+    // #23 audit round 4: sibling-directory containment — prefix-matching path
+    // outside the package root must be rejected (component-aware check)
+    {
+        namespace fs = std::filesystem;
+        const fs::path sibling = fs::path(fx5.filesRoot) / "testpkg-escape";
+        fs::create_directories(sibling);
+        const fs::path sf = sibling / "innocent.txt";
+        { FILE* f = fopen(sf.c_str(), "w"); fputs("sibling", f); fclose(f); }
+        std::string tmpl = R"({"name": "siblingfile", "kind": "action", "description": "d",
+            "script": "function run(ctx) return {files = {{path = '@PATH@'}}} end"})";
+        std::string extra9 = tmpl;
+        extra9.replace(extra9.find("@PATH@"), 6, sf.string());
+        InstallFixturePkg(fx5, extra9);
+        auto r9 = fx5.runtime->ExecuteAction("testpkg", "siblingfile", "agent", Json::Value());
+        Assert(!r9["success"].asBool(), "sibling-directory file rejected (prefix not enough)");
+        Assert(r9["error"].asString().find("escapes package filespace") != std::string::npos,
+               "escape error named");
+        // positive control: a real in-root file still verifies
+        const fs::path rootDir = fs::path(fx5.filesRoot) / "testpkg";
+        fs::create_directories(rootDir);
+        const fs::path okf = rootDir / "ok.txt";
+        { FILE* f = fopen(okf.c_str(), "w"); fputs("ok", f); fclose(f); }
+        std::string extra10 = tmpl;
+        extra10.replace(extra10.find("@PATH@"), 6, okf.string());
+        extra10.replace(extra10.find("siblingfile"), 11, "okfile");
+        InstallFixturePkg(fx5, extra10);
+        auto r10 = fx5.runtime->ExecuteAction("testpkg", "okfile", "agent", Json::Value());
+        Assert(r10["success"].asBool(), "in-root file still accepted");
+        Assert(r10["files"].isArray() && r10["files"].size() == 1 &&
+                   r10["files"][0]["bytes"].asInt64() == 2,
+               "in-root file verified with size");
+    }
     return 0;
 }
 

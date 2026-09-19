@@ -1128,7 +1128,16 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
             std::error_code nec;
             auto canon = fs::weakly_canonical(p, nec);
             auto rootCanon = fs::weakly_canonical(root, nec);
-            if (canon.string().find(rootCanon.string()) != 0) {
+            // Component-aware containment: a string-prefix check would accept
+            // sibling dirs (/…/pkg-escape passes for root /…/pkg). Relative
+            // form must be non-escaping (not absolute, not leading "..");
+            // canonicalization errors reject — boundary unprovable = outside.
+            std::error_code rec;
+            const fs::path rel = fs::relative(canon, rootCanon, rec);
+            const bool escapes = nec || rec || rel.empty() || rel.is_absolute() ||
+                                 rel.native() == ".." ||
+                                 rel.native().rfind("../", 0) == 0;
+            if (escapes) {
                 result["success"] = false;
                 // Masked through the full redaction basis: a script can smuggle a
                 // secret (get_state or one it just wrote) into an escaping file
