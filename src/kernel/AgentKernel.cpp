@@ -81,6 +81,7 @@
 #include "animus_kernel/ChannelContextStore.h"
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/api/ApiRuntime.h"
+#include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/api/ApiConnectionManager.h"
 #include "animus_kernel/tools/ApiTool.h"
 #include "animus_kernel/AgendaStore.h"
@@ -172,6 +173,7 @@ AgentKernel::~AgentKernel() {
     if (m_apiConnManager) { m_apiConnManager->Stop(); delete m_apiConnManager; m_apiConnManager = nullptr; }
     delete m_apiRuntime; m_apiRuntime = nullptr;
     delete m_apiPackageStore; m_apiPackageStore = nullptr;
+    delete m_secretsVault; m_secretsVault = nullptr;
     delete m_agendaStore; m_agendaStore = nullptr;
     delete m_sessionReportStore; m_sessionReportStore = nullptr;
     delete m_contextRegistry; m_contextRegistry = nullptr;
@@ -462,6 +464,19 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         // --- API Package Store (#26 data layer, build order b) ---
         // Installs disabled by default; tool/sandbox layers (c/d) consume it.
         m_apiPackageStore = new ApiPackageStore(m_dataStore);
+
+        // --- Secrets Vault (#23) ---
+        // Master key lives OUTSIDE the database (auto-generated key file next
+        // to the data dir, 0600). Legacy literal secrets migrate into the
+        // vault at boot — idempotent, one loud log line per secret moved.
+        m_secretsVault = new SecretsVault(m_dataStore, (m_config.dataDir / "api-vault.key").string());
+        m_secretsVault->EnsureSchema();
+        {
+            std::string migErr;
+            const int migrated = m_secretsVault->MigrateLegacyStateSecrets(*m_apiPackageStore, migErr);
+            if (migrated < 0)
+                ALOG_ERROR("api", "[vault] legacy secret migration failed: " << migErr);
+        }
 
         // --- Agenda Store (per-agent calendar/agenda events) ---
         m_agendaStore = new AgendaStore(m_dataStore);
@@ -1898,7 +1913,7 @@ void AgentKernel::RegisterBuiltinTools(const KernelConfig& config) {
     if (m_apiPackageStore) {
         ApiRuntime::Config apiCfg;
         apiCfg.filesRoot = (m_config.dataDir / "api-files").string();
-        m_apiRuntime = new ApiRuntime(m_apiPackageStore, &m_httpClient, apiCfg);
+        m_apiRuntime = new ApiRuntime(m_apiPackageStore, &m_httpClient, apiCfg, m_secretsVault);
         if (m_adminServer) m_adminServer->SetApiRuntime(m_apiRuntime);
         m_tools.Register(std::make_unique<ApiTool>(m_apiRuntime));
 

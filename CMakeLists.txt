@@ -327,6 +327,7 @@ add_library(animus_kernel
   src/kernel/api/ApiRuntime.cpp
   src/kernel/api/ManifestV1.cpp
   src/kernel/api/RegistryClient.cpp
+  src/kernel/api/SecretsVault.cpp
   src/kernel/api/ApiConnectionManager.cpp
   src/kernel/PromptLogStore.cpp
   src/kernel/auth/AuthStore.cpp
@@ -813,6 +814,15 @@ if(ANIMUS_BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
     )
     add_test(NAME RegistryClientTests COMMAND animus_registry_client_tests)
+
+    add_executable(animus_secrets_vault_tests
+      tests/SecretsVaultTests.cpp
+    )
+    target_link_libraries(animus_secrets_vault_tests PRIVATE animus_kernel)
+    set_target_properties(animus_secrets_vault_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME SecretsVaultTests COMMAND animus_secrets_vault_tests)
 
     add_executable(animus_manifest_v1_tests
       tests/ManifestV1Tests.cpp

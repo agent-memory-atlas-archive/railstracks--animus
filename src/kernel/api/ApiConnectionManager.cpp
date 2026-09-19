@@ -2,6 +2,7 @@
 
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/Log.h"
+#include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/tools/HttpClient.h"
 
 #include <json/json.h>
@@ -190,6 +191,10 @@ Json::Value ApiConnectionManager::BuildPollContext(const ApiPackage& pkg,
                 state[k] = schema[k]["default"];
         }
     }
+    // #23: vault-resolve secret-typed keys into this in-memory context —
+    // url/headers templates then interpolate exactly like the action path.
+    if (m_runtime && m_runtime->vault())
+        m_runtime->vault()->ResolveState(pkg.id, schema, state);
     // Request-side cursor: {{state._cursor.value}} — first tick empty.
     Json::Value cursor(Json::objectValue);
     cursor["value"] = lastCursor;

@@ -3,6 +3,7 @@
 // transport and the ctx.http budget cap.
 
 #include "animus_kernel/api/ApiRuntime.h"
+#include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/SqliteDataStore.h"
 #include "animus_kernel/tools/HttpClient.h"
@@ -127,6 +128,7 @@ struct Fixture {
     std::string dbPath = MakeDbPath();
     SqliteDataStore db{dbPath};
     ApiPackageStore store{&db};
+    SecretsVault vault{&db, dbPath + ".vaultkey"};
     HttpClient http;
     HttpServer server;
     uint16_t port{0};
@@ -137,9 +139,10 @@ struct Fixture {
         http.SetAllowPrivateAddresses(true);  // fixture servers are loopback
         port = server.Start();
         filesRoot = dbPath + ".files";
+        vault.EnsureSchema();
         ApiRuntime::Config cfg;
         cfg.filesRoot = filesRoot;
-        runtime = std::make_unique<ApiRuntime>(&store, &http, cfg);
+        runtime = std::make_unique<ApiRuntime>(&store, &http, cfg, &vault);
     }
     ~Fixture() {
         server.running = false;
@@ -193,7 +196,21 @@ ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "") {
     }
     ApiPackage pkg = fx.store.InstallFromManifest(manifest);
     fx.store.SetPackageEnabled(pkg.id, true);
-    fx.store.SetPackageState(pkg.id, "{\"token\":\"SECRET-TOKEN-1234\"}");
+    // #23: the fixture token enters through the vault (split-write path —
+    // same seam the admin PUT uses), never as a state literal.
+    {
+        Json::Value state(Json::objectValue);
+        state["token"] = "SECRET-TOKEN-1234";
+        Json::Value schema;
+        std::istringstream schemaStream(pkg.state_schema.empty() ? "{}" : pkg.state_schema);
+        Json::CharReaderBuilder rb;
+        std::string perr;
+        Json::parseFromStream(rb, schemaStream, &schema, &perr);
+        std::string err;
+        fx.vault.SplitStateSecrets(pkg.id, schema, state, err);
+        Json::StreamWriterBuilder wb;
+        fx.store.SetPackageState(pkg.id, Json::writeString(wb, state));
+    }
     return fx.store.GetPackage(pkg.id).value();
 }
 
@@ -314,7 +331,9 @@ int TestPrimaryTransport() {
     Assert(r["success"].asBool() && r["output"].asString().find("path /v2/positions") != std::string::npos,
            "GET json flows to sandbox");
 
-    // missing state key = tool error naming it (script never runs)
+    // missing secret = tool error naming it (script never runs) — #23: the
+    // token lives in the vault now, so the missing-key case is a vault unset.
+    fx.vault.Delete(fx.store.GetPackageByName("testpkg")->id, "token");
     fx.store.SetPackageState(fx.store.GetPackageByName("testpkg")->id,
                              "{\"base_url\":\"http://127.0.0.1:1\"}");
     r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent", none);
@@ -335,7 +354,11 @@ int TestSandboxStateAndSecrets() {
     auto r = fx.runtime->ExecuteAction("testpkg", "set token", "agent", args);
     Assert(r["success"].asBool() && r["output"].asString() == "stored", "set_state ok");
     auto now = fx.store.GetPackage(pkg.id);
-    Assert(now->state.find("NEW-SECRET-9999") != std::string::npos, "state persisted");
+    Assert(now->state.find("NEW-SECRET-9999") == std::string::npos,
+           "#23: secret NOT persisted into state JSON");
+    Assert(fx.vault.Has(pkg.id, "token") &&
+               fx.vault.Get(pkg.id, "token").value_or("") == "NEW-SECRET-9999",
+           "#23: secret stored in vault");
 
     // use the new token in a transport call (get_state path is same store)
     Json::Value none;

@@ -5,6 +5,7 @@
 #include <json/json.h>
 
 #include <atomic>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <ctime>
@@ -655,6 +656,36 @@ bool IsHookEvent(const std::string& e) {
     return e == "on_connect" || e == "on_disconnect" || e == "on_message" || e == "on_error";
 }
 
+// --- #23: credentials are forbidden as literals in package files -------------
+// A literal token in an exchanged package is a leak by construction. Headers
+// whose names mark them as credential carriers must reference state
+// ({{state.…}}) so the value comes from the per-install vault at runtime.
+bool IsCredentialHeaderName(const std::string& name) {
+    std::string lower;
+    for (char c : name)
+        lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "authorization" || lower == "proxy-authorization" || lower == "cookie")
+        return true;
+    const std::array<std::string, 5> needles = {"api-key", "apikey", "token", "secret",
+                                                "password"};
+    for (const auto& n : needles)
+        if (lower.find(n) != std::string::npos) return true;
+    return false;
+}
+
+void LintCredentialHeaders(const Json::Value& headers, const std::string& where, LintError& lint) {
+    if (!headers.isObject()) return;
+    for (const std::string& h : headers.getMemberNames()) {
+        if (!IsCredentialHeaderName(h)) continue;
+        const Json::Value& v = headers[h];
+        if (!v.isString()) continue;
+        if (v.asString().find("{{") == std::string::npos) {
+            lint.Add(where + ": header '" + h + "' carries a literal credential — reference "
+                     "state instead ({{state.…}}); secrets never live in package files (#23)");
+        }
+    }
+}
+
 }  // namespace
 
 void ApiPackageStore::ValidateName(const std::string& name) {
@@ -721,6 +752,11 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
                 lint.Add("state_schema." + key + " must be an object with a string 'type'");
             } else if (def.isMember("secret") && !def["secret"].isBool()) {
                 lint.Add("state_schema." + key + ".secret must be a boolean");
+            } else if (def.get("secret", Json::Value(false)).asBool() && def.isMember("default")) {
+                // #23: a default on a secret key is a literal credential in an
+                // exchanged file — exactly the leak this ticket forbids.
+                lint.Add("state_schema." + key + ": secret keys must not declare a default "
+                         "(secrets live in the per-install vault, never in package files)");
             }
         }
     }
@@ -782,8 +818,11 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
                 if (c.isMember("request") && !c["request"].isNull()) {
                     if (!c["request"].isObject())
                         lint.Add("action '" + cmd.name + "': request must be an object");
-                    else
+                    else {
                         cmd.request = JsonCompact(c["request"]);
+                        LintCredentialHeaders(c["request"].get("headers", Json::Value(Json::objectValue)),
+                                              "action '" + cmd.name + "'", lint);
+                    }
                 }
                 cmd.event = "";
             } else {
@@ -823,6 +862,7 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
                 lint.Add("connection '" + conn.name + "': headers_template must be an object");
             } else {
                 conn.headers_template = JsonCompact(headers);
+                LintCredentialHeaders(headers, "connection '" + conn.name + "'", lint);
             }
 
             Json::Value hooks = c.get("hooks", Json::Value(Json::objectValue));

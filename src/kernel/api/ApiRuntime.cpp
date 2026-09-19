@@ -1,5 +1,7 @@
 #include "animus_kernel/api/ApiRuntime.h"
 
+#include "animus_kernel/api/SecretsVault.h"
+
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/Log.h"
 #include "animus_kernel/tools/HttpClient.h"
@@ -213,8 +215,10 @@ struct BridgeContext {
     std::string commandName;
     std::string packageId;
     int64_t filesQuotaBytes{256LL * 1024 * 1024};
-    Json::Value state;         // live values (real)
+    Json::Value state;         // live values (real; vault-resolved in memory)
+    Json::Value persistState;  // storage view: secrets stripped (vault owns them)
     Json::Value stateSchema;
+    SecretsVault* vault{nullptr};
     Json::Value args;
     std::vector<std::string> secretValues;
     std::set<std::string> secretKeys;
@@ -360,8 +364,40 @@ int CtxSetState(lua_State* L) {
         lua_pushstring(L, err.c_str());
         return 2;
     }
+    // #23: secret-typed keys live in the vault, never in persisted state.
+    const bool secretKey = bc->stateSchema.isObject() && bc->stateSchema.isMember(k) &&
+                           bc->stateSchema[k].get("secret", false).asBool();
+    if (secretKey) {
+        std::string refName;
+        if (SecretsVault::IsSecretRef(v, refName)) {
+            // Explicit indirection is config — persist the ref object itself.
+            bc->persistState[k] = v;
+            auto resolved = bc->vault ? bc->vault->Get(bc->packageId, refName) : std::nullopt;
+            if (resolved) bc->state[k] = *resolved;
+            else bc->state.removeMember(k);
+        } else {
+            std::string setErr;
+            if (!bc->vault || !bc->vault->Set(bc->packageId, k, v.asString(), setErr)) {
+                lua_pushnil(L);
+                lua_pushstring(L, ("secret vault write failed: " + setErr).c_str());
+                return 2;
+            }
+            bc->state[k] = v;               // resolved in-memory view
+            bc->persistState.removeMember(k);  // storage view stays secret-free
+        }
+        // Ref objects persist; plain secret values never do. Only persist when
+        // the storage view actually changed (indirection case).
+        if (bc->store && bc->store->SetPackageState(bc->packageId, JsonWrite(bc->persistState))) {
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+        lua_pushnil(L);
+        lua_pushstring(L, "state persist failed");
+        return 2;
+    }
     bc->state[k] = v;
-    if (bc->store && bc->store->SetPackageState(bc->packageId, JsonWrite(bc->state))) {
+    bc->persistState[k] = v;
+    if (bc->store && bc->store->SetPackageState(bc->packageId, JsonWrite(bc->persistState))) {
         lua_pushboolean(L, 1);
         return 1;
     }
@@ -740,8 +776,9 @@ void BuildCtx(lua_State* L, BridgeContext* bc, const Json::Value& request, bool 
 // ApiRuntime
 // ---------------------------------------------------------------------------
 
-ApiRuntime::ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg)
-    : m_store(store), m_http(http), m_cfg(std::move(cfg)) {}
+ApiRuntime::ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg,
+                       SecretsVault* vault)
+    : m_store(store), m_http(http), m_cfg(std::move(cfg)), m_vault(vault) {}
 
 std::string ApiRuntime::Interpolate(const std::string& tmpl, const Json::Value& state,
                                     const Json::Value& args,
@@ -877,11 +914,12 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
                    ", not invocable on this path");
 
     // --- state, secrets, args ------------------------------------------------
-    Json::Value stateSchema, liveState;
+    Json::Value stateSchema, liveState, persistState;
     {
         std::string e;
         ParseJsonText(pkg->state_schema.empty() ? "{}" : pkg->state_schema, stateSchema, e);
         ParseJsonText(pkg->state.empty() ? "{}" : pkg->state, liveState, e);
+        persistState = liveState;  // storage view: pre-defaults, pre-resolution
         // Overlay schema defaults for unset keys (values win over defaults).
         if (stateSchema.isObject()) {
             for (const std::string& k : stateSchema.getMemberNames()) {
@@ -889,6 +927,11 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
                     liveState[k] = stateSchema[k]["default"];
             }
         }
+        // Vault resolution (#23): secret-typed keys resolve from the encrypted
+        // vault (or {"secret_ref": ...} indirection) into this in-memory copy
+        // only — stored state never holds secret bytes. Unset secrets resolve
+        // absent, so the missing-key machinery below names them at first use.
+        if (m_vault) m_vault->ResolveState(pkg->id, stateSchema, liveState);
     }
 
     if (args.isNull()) args = Json::Value(Json::objectValue);
@@ -966,7 +1009,9 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     bc.packageId = pkg->id;
     bc.filesQuotaBytes = pkg->files_quota_mb * 1024LL * 1024LL;
     bc.state = liveState;
+    bc.persistState = persistState;
     bc.stateSchema = stateSchema;
+    bc.vault = m_vault;
     bc.args = args;
     bc.secretValues = secretValues;
     bc.secretKeys = secretKeys;
