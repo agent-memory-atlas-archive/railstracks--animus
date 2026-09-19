@@ -679,9 +679,35 @@ void LintCredentialHeaders(const Json::Value& headers, const std::string& where,
         if (!IsCredentialHeaderName(h)) continue;
         const Json::Value& v = headers[h];
         if (!v.isString()) continue;
-        if (v.asString().find("{{") == std::string::npos) {
-            lint.Add(where + ": header '" + h + "' carries a literal credential — reference "
-                     "state instead ({{state.…}}); secrets never live in package files (#23)");
+        const std::string value = v.asString();
+        // Extract every {{...}} token; a credential header must be templated
+        // and every token must follow the runtime grammar (state.* / args.*
+        // dotted paths) — unknown roots like {{env.X}} or malformed braces
+        // fail here instead of exploding (or silently resolving) at runtime.
+        std::vector<std::string> tokens;
+        size_t pos = 0;
+        bool malformed = false;
+        while (true) {
+            const size_t s = value.find("{{", pos);
+            if (s == std::string::npos) break;
+            const size_t e = value.find("}}", s + 2);
+            if (e == std::string::npos) { malformed = true; break; }
+            tokens.push_back(value.substr(s + 2, e - s - 2));
+            pos = e + 2;
+        }
+        bool bad = malformed || tokens.empty();
+        for (const auto& tok : tokens) {
+            const auto dot = tok.find('.');
+            if (dot == std::string::npos ||
+                (tok.substr(0, dot) != "state" && tok.substr(0, dot) != "args")) {
+                bad = true;
+                break;
+            }
+        }
+        if (bad) {
+            lint.Add(where + ": header '" + h + "' must template its value from "
+                     "state.* / args.* ({{state.…}}) — literal or malformed "
+                     "credentials are forbidden in package files (#23)");
         }
     }
 }
@@ -752,6 +778,12 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
                 lint.Add("state_schema." + key + " must be an object with a string 'type'");
             } else if (def.isMember("secret") && !def["secret"].isBool()) {
                 lint.Add("state_schema." + key + ".secret must be a boolean");
+            } else if (def.get("secret", Json::Value(false)).asBool() &&
+                       def.get("type", Json::Value("")).asString() != "string") {
+                // Secrets are credential strings: the vault stores strings, the
+                // masked-state copy and redaction assume strings. Non-string
+                // secret types are rejected at the door.
+                lint.Add("state_schema." + key + ": secret keys must be of type string");
             } else if (def.get("secret", Json::Value(false)).asBool() && def.isMember("default")) {
                 // #23: a default on a secret key is a literal credential in an
                 // exchanged file — exactly the leak this ticket forbids.

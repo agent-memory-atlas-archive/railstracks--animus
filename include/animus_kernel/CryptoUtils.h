@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <iomanip>
 #include <string>
@@ -135,6 +136,12 @@ inline bool Aes256GcmOpen(const std::vector<unsigned char>& key32,
     if (envelopeHex.size() < 2 || envelopeHex.size() % 2 != 0) {
         error = "open: malformed envelope"; return false;
     }
+    // Size discipline: envelopes come from the vault DB; a hostile/garbage
+    // row must not drive huge allocations. 2 MB hex = 1 MB plaintext ceiling —
+    // credentials are bytes-to-KB, never more.
+    if (envelopeHex.size() > 2 * 1024 * 1024) {
+        error = "open: envelope exceeds size limit"; return false;
+    }
     std::vector<unsigned char> raw;
     raw.reserve(envelopeHex.size() / 2);
     for (size_t i = 0; i < envelopeHex.size(); i += 2) {
@@ -148,6 +155,9 @@ inline bool Aes256GcmOpen(const std::vector<unsigned char>& key32,
     const unsigned char* nonce = raw.data() + 1;
     const unsigned char* ct = raw.data() + 13;
     const size_t ctLen = raw.size() - 13 - 16;
+    if (ctLen > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        error = "open: envelope exceeds size limit"; return false;
+    }
     const unsigned char* tag = ct + ctLen;
 
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();

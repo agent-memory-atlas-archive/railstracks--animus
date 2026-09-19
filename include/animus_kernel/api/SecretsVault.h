@@ -67,6 +67,11 @@ public:
     // True when v is {"secret_ref": "<name>"} (single-member object).
     static bool IsSecretRef(const Json::Value& v, std::string& name);
 
+    // Vault entry names: [A-Za-z0-9_-], 1-63 chars — shared by runtime writes,
+    // split, and the admin routes so indirection targets can never smuggle
+    // path separators, whitespace, or unbounded strings into storage keys.
+    static bool IsValidSecretName(const std::string& name);
+
     // In-place resolution of a live state object: for every secret-typed
     // schema key, replace {"secret_ref":...} or vault-backed absence with the
     // opened value. Unset secret -> key REMOVED from `state` (missing-key

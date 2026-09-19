@@ -358,23 +358,39 @@ int CtxSetState(lua_State* L) {
     BridgeContext* bc = GetBridge(L, 1);
     const char* k = luaL_checkstring(L, 1);
     Json::Value v = LuaToJson(L, 2);
+    // #23: a {secret_ref = name} table is the indirection form for secret-typed
+    // keys — ValidateStateWrite only knows scalars, so vet it here instead:
+    // key must be declared AND secret-typed, ref name must be a valid vault name.
+    std::string refName;
+    const bool secretKey = bc->stateSchema.isObject() && bc->stateSchema.isMember(k) &&
+                           bc->stateSchema[k].get("secret", false).asBool();
+    const bool isRef = secretKey && SecretsVault::IsSecretRef(v, refName) &&
+                       SecretsVault::IsValidSecretName(refName);
     std::string err;
-    if (!ValidateStateWrite(bc->stateSchema, k, v, err)) {
+    if (isRef) {
+        if (!k[0] || k[0] == '_') {
+            lua_pushnil(L);
+            lua_pushstring(L, "key is framework-reserved (leading underscore)");
+            return 2;
+        }
+    } else if (!ValidateStateWrite(bc->stateSchema, k, v, err)) {
         lua_pushnil(L);
         lua_pushstring(L, err.c_str());
         return 2;
     }
-    // #23: secret-typed keys live in the vault, never in persisted state.
-    const bool secretKey = bc->stateSchema.isObject() && bc->stateSchema.isMember(k) &&
-                           bc->stateSchema[k].get("secret", false).asBool();
     if (secretKey) {
-        std::string refName;
-        if (SecretsVault::IsSecretRef(v, refName)) {
+        if (isRef) {
             // Explicit indirection is config — persist the ref object itself.
             bc->persistState[k] = v;
             auto resolved = bc->vault ? bc->vault->Get(bc->packageId, refName) : std::nullopt;
-            if (resolved) bc->state[k] = *resolved;
-            else bc->state.removeMember(k);
+            if (resolved) {
+                bc->state[k] = *resolved;
+                // Refs resolve to secret bytes — they join this invocation's
+                // redaction set so they can't leak via results.
+                bc->secretValues.push_back(*resolved);
+            } else {
+                bc->state.removeMember(k);
+            }
         } else {
             std::string setErr;
             if (!bc->vault || !bc->vault->Set(bc->packageId, k, v.asString(), setErr)) {
@@ -384,6 +400,9 @@ int CtxSetState(lua_State* L) {
             }
             bc->state[k] = v;               // resolved in-memory view
             bc->persistState.removeMember(k);  // storage view stays secret-free
+            // Values written during THIS invocation join the redaction set —
+            // a script must not be able to set a secret and echo it back out.
+            bc->secretValues.push_back(v.asString());
         }
         // Ref objects persist; plain secret values never do. Only persist when
         // the storage view actually changed (indirection case).
@@ -683,10 +702,13 @@ void BuildCtx(lua_State* L, BridgeContext* bc, const Json::Value& request, bool 
               const Json::Value& eventJson) {
     lua_newtable(L);  // ctx
 
-    // masked state copy (display/branching only; get_state returns real values)
+    // masked state copy (display/branching only; get_state returns real values).
+    // Masks ANY present secret value regardless of JSON type — a stale or
+    // hand-edited non-string under a secret key never reaches scripts raw.
     Json::Value masked = bc->state;
     for (const std::string& k : bc->state.getMemberNames()) {
-        if (bc->secretKeys.count("state." + k) && masked[k].isString()) masked[k] = "***";
+        if (bc->secretKeys.count("state." + k) && !masked[k].isNull())
+            masked[k] = "***";
     }
 
     // ctx.package (single build: name, masked state, get_state, set_state)
@@ -1108,6 +1130,9 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     }
 
     // Truncation rule: any string field over the cap gets truncated with marker.
+    // First: fold values written during execution (set_state/ref resolution)
+    // into the redaction set — secrets born mid-invocation are masked too.
+    secretValues.insert(secretValues.end(), bc.secretValues.begin(), bc.secretValues.end());
     std::function<void(Json::Value&)> truncate = [&](Json::Value& v) {
         if (v.isString() && v.asString().size() > m_cfg.stringTruncateBytes) {
             v = v.asString().substr(0, m_cfg.stringTruncateBytes) + "... [truncated " +

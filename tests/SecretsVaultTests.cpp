@@ -125,7 +125,18 @@ int TestCrypto() {
         std::string e2;
         Assert(!off.Set("p1", "k", "v", e2), "disabled vault refuses Set");
         Assert(!off.Get("p1", "k").has_value(), "disabled vault refuses Get");
-        unlink(fx.dbPath.c_str());
+    }
+
+    // malformed key files fail loudly (no silent whitespace eating)
+    {
+        const std::string kp = MakeDbPath() + ".key";
+        FILE* f = fopen(kp.c_str(), "w");
+        fputs("0000000000000000000000000000000000000000000000000000000000000000 \n", f);
+        fclose(f);
+        SqliteDataStore db4{MakeDbPath()};
+        SecretsVault bad{&db4, kp};
+        Assert(!bad.enabled(), "key file with trailing space rejected (not trimmed)");
+        unlink(kp.c_str());
     }
     return 0;
 }
@@ -263,6 +274,14 @@ int TestSplitStateSecrets() {
     Assert(wt["api_key"].isObject() && wt["api_key"].isMember("secret_ref") &&
                !wt["api_key"].isMember("value"),
            "ref kept, literal dropped");
+
+    // malformed ref shapes are errors, never silently normalized
+    Json::Value junk = Parse(R"({"api_key": {"secret_ref": "shared", "junk": true}})");
+    Assert(fx.vault.SplitStateSecrets("p1", schema, junk, err) == -1,
+           "ref object with unexpected member rejected");
+    Json::Value badName = Parse(R"({"api_key": {"secret_ref": "not a name!"}})");
+    Assert(fx.vault.SplitStateSecrets("p1", schema, badName, err) == -1,
+           "invalid ref name rejected");
     return 0;
 }
 
@@ -365,13 +384,29 @@ int TestLintGates() {
             "must not declare a default"),
            "secret default rejected");
 
+    // secret-typed key with a non-string type (masking/vault assume strings)
+    Assert(InstallThrowsWith(fx,
+            ManifestWith(R"({"token": {"type": "object", "secret": true}})",
+                         okAction, okConn),
+            "must be of type string"),
+           "non-string secret type rejected");
+
+    // credential header templated from an unknown root (env.X) — grammar check
+    Assert(InstallThrowsWith(fx,
+            ManifestWith(okSchema, R"({"name": "fetch", "kind": "action", "description": "d",
+                "request": {"method": "GET", "url": "{{state.base}}/x",
+                            "headers": {"Authorization": "***}}"}},
+                "script": "function run(ctx) return {output='ok'} end"})", okConn),
+            "state.* / args.*"),
+           "unknown-root template in auth header rejected");
+
     // literal Authorization in action request headers
     Assert(InstallThrowsWith(fx,
             ManifestWith(okSchema, R"({"name": "fetch", "kind": "action", "description": "d",
                 "request": {"method": "GET", "url": "{{state.base}}/x",
                             "headers": {"Authorization": "Bearer sk-live-literal"}},
                 "script": "function run(ctx) return {output='ok'} end"})", okConn),
-            "literal credential"),
+            "forbidden in package files"),
            "literal auth header rejected (action)");
 
     // literal X-Api-Key in connection headers_template (substring family)
@@ -381,7 +416,7 @@ int TestLintGates() {
                 "headers_template": {"X-Api-Key": "abc123"},
                 "poll": {"cursor_path": "next", "interval_s": 5, "dispatch": {"command": "fetch"}},
                 "hooks": {}})"),
-            "literal credential"),
+            "forbidden in package files"),
            "literal api-key header rejected (connection)");
 
     // templated credential header stays installable (re-check via schema w/o default)

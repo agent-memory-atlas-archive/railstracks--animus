@@ -608,6 +608,15 @@
                         drogon::k400BadRequest);
                     return;
                 }
+                // Name discipline: slug-shaped only. Not restricted to schema-declared
+                // keys — shared vault entries (secret_ref targets) are a deliberate
+                // capability — but they must be valid vault names.
+                if (!SecretsVault::IsValidSecretName(name)) {
+                    SendJsonError(callback,
+                        "secret name must match [A-Za-z0-9_-], 1-63 chars",
+                        drogon::k400BadRequest);
+                    return;
+                }
                 std::string setErr;
                 if (!vault->Set(id, name, value, setErr)) {
                     SendJsonError(callback, "vault write failed: " + setErr,

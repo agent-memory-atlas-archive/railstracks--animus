@@ -408,6 +408,33 @@ int TestSandboxStateAndSecrets() {
            r4["data"]["e2"].asString().find("framework-reserved") != std::string::npos &&
            r4["data"]["e3"].asString().find("must be of type string") != std::string::npos,
            "violations carry reasons");
+
+    // #23 audit: secret_ref write-through via set_state + mid-invocation redaction
+    Fixture fx5;
+    std::string extra5 = R"({"name": "setref", "kind": "action", "description": "d",
+        "script": "function run(ctx) local ok = ctx.package.set_state('token', {secret_ref='shared'}) return {output=tostring(ok)} end"})";
+    std::string extra5b = R"({"name": "leaknew", "kind": "action", "description": "d",
+        "script": "function run(ctx) local ok = ctx.package.set_state('token', 'X-NEWLY-SET-42') return {output='set='..tostring(ok)..' val='..ctx.package.get_state('token')} end"})";
+    auto pkg5 = InstallFixturePkg(fx5, extra5 + "," + extra5b);
+    std::string vErr;
+    fx5.vault.Set(pkg5.id, "shared", "SHARED-KEY-777", vErr);
+    auto r5 = fx5.runtime->ExecuteAction("testpkg", "setref", "agent", Json::Value());
+    Assert(r5["output"].asString() == "true", "set_state accepts secret_ref indirection");
+    {
+        auto now5 = fx5.store.GetPackage(pkg5.id);
+        Assert(now5->state.find("secret_ref") != std::string::npos,
+               "ref object persisted in state (config, not secret)");
+    }
+    r5 = fx5.runtime->ExecuteAction("testpkg", "fetch positions", "agent", Json::Value());
+    Assert(r5["success"].asBool(), "transport resolves through the ref");
+    Assert(fx5.server.lastAuth.find("Bearer SHARED-KEY-777") != std::string::npos,
+           "ref target value reaches the transport");
+
+    auto r6 = fx5.runtime->ExecuteAction("testpkg", "leaknew", "agent", Json::Value());
+    Assert(r6["output"].asString().find("X-NEWLY-SET-42") == std::string::npos,
+           "secret written mid-invocation is redacted from results");
+    Assert(r6["output"].asString().find("***") != std::string::npos,
+           "redaction marker present");
     return 0;
 }
 

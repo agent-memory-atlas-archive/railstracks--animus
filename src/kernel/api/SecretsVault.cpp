@@ -5,10 +5,14 @@
 #include "animus_kernel/Log.h"
 #include "animus_kernel/SchemaHelpers.h"
 
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <sstream>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace animus::kernel {
 
@@ -38,19 +42,34 @@ SecretsVault::SecretsVault(IDataStore* store, const std::string& keyPath)
     }
 }
 
+bool SecretsVault::IsValidSecretName(const std::string& name) {
+    if (name.empty() || name.size() > 63) return false;
+    for (char c : name) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 bool SecretsVault::LoadOrCreateKey(std::string& error) {
     std::ifstream in(m_keyPath);
     if (in.good()) {
         std::string hex((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        // Trim whitespace/newlines.
-        while (!hex.empty() && (hex.back() == '\n' || hex.back() == '\r' || hex.back() == ' '))
+        // Trim exactly one trailing newline (CRLF tolerated); anything else is
+        // a malformed file and gets rejected below — not silently eaten.
+        if (!hex.empty() && (hex.back() == '\n' || hex.back() == '\r')) {
             hex.pop_back();
+            if (!hex.empty() && (hex.back() == '\n' || hex.back() == '\r')) hex.pop_back();
+        }
         if (hex.size() != 64) {
             error = "key file '" + m_keyPath + "' must hold 64 hex chars (32 bytes), found " +
                     std::to_string(hex.size());
             return false;
         }
-        m_key.reserve(32);
+        // Parse into a temporary; commit to m_key only after full validation.
+        std::vector<unsigned char> parsed;
+        parsed.reserve(32);
         for (size_t i = 0; i < 64; i += 2) {
             auto nib = [](char c) -> int {
                 if (c >= '0' && c <= '9') return c - '0';
@@ -63,23 +82,47 @@ bool SecretsVault::LoadOrCreateKey(std::string& error) {
                 error = "key file '" + m_keyPath + "' contains non-hex characters";
                 return false;
             }
-            m_key.push_back(static_cast<unsigned char>((hi << 4) | lo));
+            parsed.push_back(static_cast<unsigned char>((hi << 4) | lo));
         }
+        m_key = std::move(parsed);
         ALOG_INFO("api", "[vault] master key loaded from " << m_keyPath);
         return true;
     }
 
-    // First use — generate.
+    // First use — generate. Exclusive, no-follow create with tight mode from
+    // the first syscall: no symlink pre-placement, no umask window.
     const std::string keyHex = crypto::RandomHex(32);  // 32 bytes -> 64 hex chars
     {
-        std::ofstream out(m_keyPath, std::ios::trunc);
-        if (!out.good()) {
-            error = "cannot create key file '" + m_keyPath + "'";
+        const int fd = ::open(m_keyPath.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+        if (fd < 0) {
+            if (errno == EEXIST) {
+                // Lost a creation race (or a pre-existing regular file appeared
+                // between the load attempt and now) — reload instead of clobber.
+                in.close();
+                in.clear();
+                in.open(m_keyPath);
+                if (in.good()) return LoadOrCreateKey(error);
+                error = "key file '" + m_keyPath + "' appeared but cannot be read";
+            } else {
+                error = "cannot create key file '" + m_keyPath + "' (" + std::strerror(errno) + ")";
+            }
             return false;
         }
-        out << keyHex << "\n";
+        const std::string blob = keyHex + "\n";
+        size_t off = 0;
+        while (off < blob.size()) {
+            const ssize_t n = ::write(fd, blob.data() + off, blob.size() - off);
+            if (n <= 0) {
+                ::close(fd);
+                ::unlink(m_keyPath.c_str());  // never leave a partial key
+                error = "short write creating key file '" + m_keyPath + "'";
+                return false;
+            }
+            off += static_cast<size_t>(n);
+        }
+        ::fsync(fd);  // losing this file loses every vault secret — make it durable
+        ::close(fd);
     }
-    ::chmod(m_keyPath.c_str(), 0600);
     m_key.reserve(32);
     for (size_t i = 0; i < 64; i += 2) {
         m_key.push_back(static_cast<unsigned char>(
@@ -300,8 +343,21 @@ int SecretsVault::SplitStateSecrets(const std::string& packageId,
         // Split path accepts the admin write-through form {"secret_ref": name,
         // "value": literal} — strict IsSecretRef (resolution) rejects extra
         // members, so detect the ref shape directly here.
-        if (v.isObject() && v.isMember("secret_ref") && v["secret_ref"].isString()) {
+        if (v.isObject() && v.isMember("secret_ref")) {
+            // Strict shape: {"secret_ref"} or {"secret_ref", "value"} — nothing
+            // else. Malformed objects are an error, never silently normalized.
+            if (!v["secret_ref"].isString() || v.size() > 2 ||
+                (v.size() == 2 && !v.isMember("value"))) {
+                error = "state key '" + k + "': malformed secret_ref object "
+                        "(expected {secret_ref: name} or {secret_ref: name, value: literal})";
+                return -1;
+            }
             refName = v["secret_ref"].asString();
+            if (!IsValidSecretName(refName)) {
+                error = "state key '" + k + "': secret_ref name '" + refName +
+                        "' is not a valid vault entry name ([A-Za-z0-9_-], 1-63)";
+                return -1;
+            }
             // Admin write-through form: {"secret_ref": name, "value": literal}
             if (v.isMember("value") && v["value"].isString()) {
                 const std::string literal = v["value"].asString();
@@ -371,8 +427,14 @@ int SecretsVault::MigrateLegacyStateSecrets(ApiPackageStore& packages, std::stri
             wb["indentation"] = "";
             wb["commentStyle"] = "None";
             if (!packages.SetPackageState(pkg.id, Json::writeString(wb, next))) {
-                error = "package '" + pkg.name + "': state rewrite failed";
-                return -1;
+                // This package keeps its literals (still valid in-memory) and its
+                // vault copies (identical values) — consistent, retried next boot.
+                // Continue with the other packages; one bad row must not stall
+                // the whole sweep.
+                ALOG_ERROR("api", "[vault] migration: state rewrite failed for package '"
+                           << pkg.name << "' — secrets already vaulted, state keeps literals; "
+                           << "will retry next boot");
+                continue;
             }
         }
     }
