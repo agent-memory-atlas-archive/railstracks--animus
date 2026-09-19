@@ -1067,17 +1067,30 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
         return err("script must define run(ctx)");
     }
     BuildCtx(L, &bc, request, isHook, eventJson);
+    // Redaction basis for script-produced text: the pre-execution set PLUS
+    // anything the script wrote/resolved into the vault while running — a
+    // set_state followed by error('...' .. get_state(...)) must not smuggle
+    // the new value out through the error path. `bc.secretValues` stays live
+    // until the VM closes, so refresh from it per branch.
+    auto masked = [&](const std::string& s) {
+        std::vector<std::string> all = secretValues;
+        all.insert(all.end(), bc.secretValues.begin(), bc.secretValues.end());
+        return MaskSecrets(s, all);
+    };
     if (lua_pcall(L, 1, 1, 0)) {
         const char* msg = lua_tostring(L, -1);
         result["success"] = false;
-        result["error"] = MaskSecrets(std::string("run error: ") + (msg ? msg : "?"),
-                                       secretValues);
+        result["error"] = masked(std::string("run error: ") + (msg ? msg : "?"));
         lua_close(L);
         return result;
     }
     Json::Value returned = lua_isnil(L, -1) ? Json::Value(Json::objectValue)
                                             : LuaToJson(L, -1);
     lua_close(L);
+    // Fold execution-written secrets into the redaction basis for the success
+    // path (truncate + final mask below); the error path handled its own via
+    // `masked` above.
+    secretValues.insert(secretValues.end(), bc.secretValues.begin(), bc.secretValues.end());
 
     if (!returned.isObject()) {
         result["success"] = false;
@@ -1130,9 +1143,6 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     }
 
     // Truncation rule: any string field over the cap gets truncated with marker.
-    // First: fold values written during execution (set_state/ref resolution)
-    // into the redaction set — secrets born mid-invocation are masked too.
-    secretValues.insert(secretValues.end(), bc.secretValues.begin(), bc.secretValues.end());
     std::function<void(Json::Value&)> truncate = [&](Json::Value& v) {
         if (v.isString() && v.asString().size() > m_cfg.stringTruncateBytes) {
             v = v.asString().substr(0, m_cfg.stringTruncateBytes) + "... [truncated " +

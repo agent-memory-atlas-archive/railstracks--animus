@@ -53,9 +53,37 @@ bool SecretsVault::IsValidSecretName(const std::string& name) {
 }
 
 bool SecretsVault::LoadOrCreateKey(std::string& error) {
-    std::ifstream in(m_keyPath);
-    if (in.good()) {
-        std::string hex((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // Secure load: no symlink following, regular files only, read from the
+    // verified descriptor. A symlinked or non-regular "key file" is rejected
+    // rather than read — the load path deserves the same discipline the
+    // creation path already has (O_EXCL|O_NOFOLLOW).
+    int keyFd = ::open(m_keyPath.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (keyFd < 0 && errno != ENOENT) {
+        error = "cannot open key file '" + m_keyPath + "' (" + std::strerror(errno) + ")";
+        return false;
+    }
+    if (keyFd >= 0) {
+        struct stat st {};
+        if (::fstat(keyFd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            ::close(keyFd);
+            error = "key file '" + m_keyPath + "' is not a regular file";
+            return false;
+        }
+        if ((st.st_mode & 077) != 0) {
+            ALOG_WARNING("api", "[vault] key file " << m_keyPath << " is group/other "
+                      "accessible (mode " << std::oct << (st.st_mode & 0777) << std::dec
+                      << ") — expected 0600; refusing nothing, but tighten it");
+        }
+        std::string hex;
+        char rbuf[4096];
+        ssize_t n = 0;
+        while ((n = ::read(keyFd, rbuf, sizeof rbuf)) > 0)
+            hex.append(rbuf, static_cast<size_t>(n));
+        ::close(keyFd);
+        if (n < 0) {
+            error = "read error on key file '" + m_keyPath + "'";
+            return false;
+        }
         // Trim exactly one trailing newline (CRLF tolerated); anything else is
         // a malformed file and gets rejected below — not silently eaten.
         if (!hex.empty() && (hex.back() == '\n' || hex.back() == '\r')) {
@@ -96,13 +124,9 @@ bool SecretsVault::LoadOrCreateKey(std::string& error) {
         const int fd = ::open(m_keyPath.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
         if (fd < 0) {
             if (errno == EEXIST) {
-                // Lost a creation race (or a pre-existing regular file appeared
-                // between the load attempt and now) — reload instead of clobber.
-                in.close();
-                in.clear();
-                in.open(m_keyPath);
-                if (in.good()) return LoadOrCreateKey(error);
-                error = "key file '" + m_keyPath + "' appeared but cannot be read";
+                // Lost a creation race (or a pre-existing file appeared between
+                // the load attempt and now) — reload instead of clobber.
+                return LoadOrCreateKey(error);
             } else {
                 error = "cannot create key file '" + m_keyPath + "' (" + std::strerror(errno) + ")";
             }
@@ -358,7 +382,22 @@ int SecretsVault::SplitStateSecrets(const std::string& packageId,
                         "' is not a valid vault entry name ([A-Za-z0-9_-], 1-63)";
                 return -1;
             }
-            // Admin write-through form: {"secret_ref": name, "value": literal}
+            // Admin write-through form: {"secret_ref": name, "value": literal}.
+            // If a value member is present it must be a non-empty, non-masked
+            // string — malformed input is an error, never silently normalized
+            // to a bare ref (that would discard the intended write).
+            if (v.isMember("value")) {
+                if (!v["value"].isString()) {
+                    error = "state key '" + k + "': secret_ref 'value' must be a string";
+                    return -1;
+                }
+                const std::string& wv = v["value"].asString();
+                if (wv.empty() || wv == "***") {
+                    error = "state key '" + k + "': secret_ref 'value' is empty/masked — "
+                            "refusing to vault a placeholder";
+                    return -1;
+                }
+            }
             if (v.isMember("value") && v["value"].isString()) {
                 const std::string literal = v["value"].asString();
                 if (!literal.empty() && literal != "***") {
@@ -427,10 +466,17 @@ int SecretsVault::MigrateLegacyStateSecrets(ApiPackageStore& packages, std::stri
             wb["indentation"] = "";
             wb["commentStyle"] = "None";
             if (!packages.SetPackageState(pkg.id, Json::writeString(wb, next))) {
-                // This package keeps its literals (still valid in-memory) and its
-                // vault copies (identical values) — consistent, retried next boot.
-                // Continue with the other packages; one bad row must not stall
-                // the whole sweep.
+                // DOCUMENTED TEMPORARY INVARIANT VIOLATION: this package's
+                // secrets remain as literals in its state JSON while the vault
+                // already holds encrypted copies (identical values). Not
+                // transactional across the two stores by design — the vault
+                // write is idempotent and the sweep retries next boot, so the
+                // violation window is [failed rewrite, next successful boot].
+                // This is no worse than pre-#23 state and strictly better than
+                // losing the secret by deleting-first. Availability over strict
+                // atomicity, chosen deliberately (audit exchange 2026-09-19).
+                // Consistent, retried next boot; continue with the other
+                // packages — one bad row must not stall the whole sweep.
                 ALOG_ERROR("api", "[vault] migration: state rewrite failed for package '"
                            << pkg.name << "' — secrets already vaulted, state keeps literals; "
                            << "will retry next boot");

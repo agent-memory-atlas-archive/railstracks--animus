@@ -435,6 +435,17 @@ int TestSandboxStateAndSecrets() {
            "secret written mid-invocation is redacted from results");
     Assert(r6["output"].asString().find("***") != std::string::npos,
            "redaction marker present");
+
+    // #23 audit round 2: set-then-error must not leak through the error path
+    std::string extra7 = R"({"name": "leakerr", "kind": "action", "description": "d",
+        "script": "function run(ctx) ctx.package.set_state('token', 'X-ERR-LEAK-9') error('failed with '..ctx.package.get_state('token')) end"})";
+    InstallFixturePkg(fx5, extra7);
+    auto r7 = fx5.runtime->ExecuteAction("testpkg", "leakerr", "agent", Json::Value());
+    Assert(!r7["success"].asBool(), "leakerr reports failure");
+    Assert(r7["error"].asString().find("X-ERR-LEAK-9") == std::string::npos,
+           "secret written before an error cannot leak via the error message");
+    Assert(r7["error"].asString().find("***") != std::string::npos,
+           "error path redaction marker present");
     return 0;
 }
 

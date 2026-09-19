@@ -138,6 +138,29 @@ int TestCrypto() {
         Assert(!bad.enabled(), "key file with trailing space rejected (not trimmed)");
         unlink(kp.c_str());
     }
+
+    // symlinked key file is refused, not followed, and never clobbered
+    {
+        const std::string real = MakeDbPath() + ".realkey";
+        FILE* f = fopen(real.c_str(), "w");
+        fputs("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\n", f);
+        fclose(f);
+        const std::string link = MakeDbPath() + ".linkkey";
+        unlink(link.c_str());
+        if (symlink(real.c_str(), link.c_str()) == 0) {
+            SqliteDataStore db5{MakeDbPath()};
+            SecretsVault viaLink{&db5, link};
+            Assert(!viaLink.enabled(), "symlinked key file rejected (O_NOFOLLOW)");
+            struct stat sl {};
+            Assert(lstat(link.c_str(), &sl) == 0 && S_ISLNK(sl.st_mode),
+                   "symlink untouched (no clobber)");
+            // regular file at the real path still loads fine
+            SecretsVault direct{&db5, real};
+            Assert(direct.enabled(), "regular key file loads after refusal");
+        }
+        unlink(link.c_str());
+        unlink(real.c_str());
+    }
     return 0;
 }
 
@@ -282,6 +305,12 @@ int TestSplitStateSecrets() {
     Json::Value badName = Parse(R"({"api_key": {"secret_ref": "not a name!"}})");
     Assert(fx.vault.SplitStateSecrets("p1", schema, badName, err) == -1,
            "invalid ref name rejected");
+    Json::Value nonStr = Parse(R"({"api_key": {"secret_ref": "shared", "value": 123}})");
+    Assert(fx.vault.SplitStateSecrets("p1", schema, nonStr, err) == -1,
+           "non-string write-through value rejected");
+    Json::Value maskedVal = Parse(R"({"api_key": {"secret_ref": "shared", "value": "***"}})");
+    Assert(fx.vault.SplitStateSecrets("p1", schema, maskedVal, err) == -1,
+           "masked write-through value rejected");
     return 0;
 }
 
