@@ -5,6 +5,8 @@
 #include "animus_kernel/Log.h"
 #include "animus_kernel/SchemaHelpers.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -171,6 +173,127 @@ void SecretsVault::EnsureSchema() {
             UNIQUE (package_id, name)
         );
     )");
+}
+
+// ── #93 P3a: agent-scoped secrets ──────────────────────────────────────
+
+bool SecretsVault::IsRefValue(const std::string& raw, std::string& name) {
+    if (raw.size() < 17 || raw.front() != '{') return false;
+    Json::CharReaderBuilder rb;
+    std::string errs;
+    Json::Value v;
+    std::istringstream ss(raw);
+    if (!Json::parseFromStream(rb, ss, &v, &errs)) return false;
+    return IsSecretRef(v, name);
+}
+
+bool SecretsVault::VaultAgentValue(const std::string& agentId, const std::string& name,
+                                   const std::string& value, std::string& error) {
+    if (!enabled()) {
+        error = "vault disabled (no master key) — refusing to store plaintext";
+        return false;
+    }
+    if (!IsValidSecretName(name)) {
+        error = "invalid secret name '" + name + "'";
+        return false;
+    }
+    std::string setErr;
+    if (!Set(AgentScope(agentId), name, value, setErr)) {
+        error = "vault write failed: " + setErr;
+        return false;
+    }
+    return true;
+}
+
+std::string SecretsVault::ResolveAgentValue(const std::string& agentId,
+                                            const std::string& rawValue) const {
+    std::string refName;
+    if (!IsRefValue(rawValue, refName)) return rawValue;
+    auto opened = Get(AgentScope(agentId), refName);
+    return opened ? *opened : std::string{};
+}
+
+int SecretsVault::MigrateAgentConfigSecrets(std::string& error) {
+    // Credential-shaped agent_config values (plaintext bot tokens, api keys)
+    // -> vault entries under the agent scope, values replaced by
+    // {"secret_ref":"<name>"} object strings. Idempotent: values already
+    // carrying refs are skipped (IsRefValue), non-credential keys untouched.
+    static const std::vector<std::string> credentialSuffixes = {
+        "api_key", "access_token", "bot_token", "app_token", "app_password",
+        "client_secret", "refresh_token", "server_password", "access_jwt",
+        "refresh_jwt", "api_secret", "secret", "password",
+    };
+    int migrated = 0;
+    auto stmt = m_store->Prepare(
+        "SELECT agent_id, key, value FROM agent_config ORDER BY agent_id, key");
+    if (!stmt) {
+        error = "agent_config read failed";
+        return -1;
+    }
+    struct Row { std::string agentId, key, value; };
+    std::vector<Row> rows;
+    while (stmt->Step()) rows.push_back({stmt->ColumnText(0), stmt->ColumnText(1),
+                                         stmt->ColumnText(2)});
+    for (const auto& r : rows) {
+        if (r.value.empty()) continue;
+        std::string lower;
+        std::transform(r.key.begin(), r.key.end(), std::back_inserter(lower),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        bool credentialShaped = false;
+        for (const auto& suffix : credentialSuffixes) {
+            std::string::size_type pos = lower.rfind(suffix);
+            if (pos != std::string::npos && pos + suffix.size() == lower.size()) {
+                credentialShaped = true;
+                break;
+            }
+        }
+        if (!credentialShaped) continue;
+        std::string probeName;
+        if (IsRefValue(r.value, probeName)) continue;  // already vaulted
+        if (r.value.front() == '{') continue;          // JSON object — not a credential literal
+        if (!enabled()) {
+            error = "vault disabled — refusing to leave credential plaintext in place";
+            return -1;
+        }
+        std::string name;
+        for (char c : r.key) {
+            if (IsValidSecretName(std::string(1, c))) name += c;
+            else if (!name.empty() && name.back() != '_') name += '_';
+        }
+        while (!name.empty() && name.back() == '_') name.pop_back();
+        if (name.empty() || name.size() > 63) {
+            ALOG_WARNING("api", "[vault] skipping credential key '" << r.key
+                         << "' — cannot derive a valid vault name");
+            continue;
+        }
+        std::string vaultErr;
+        if (!VaultAgentValue(r.agentId, name, r.value, vaultErr)) {
+            error = "migration of '" + r.key + "' failed: " + vaultErr;
+            return -1;
+        }
+        Json::Value ref(Json::objectValue);
+        ref["secret_ref"] = name;
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        const std::string refStr = Json::writeString(wb, ref);
+        auto upd = m_store->Prepare(
+            "UPDATE agent_config SET value = ? WHERE agent_id = ? AND key = ?");
+        if (!upd) {
+            error = "agent_config update prepare failed";
+            return -1;
+        }
+        upd->BindText(1, refStr);
+        upd->BindText(2, r.agentId);
+        upd->BindText(3, r.key);
+        if (!upd->ExecDML()) {
+            error = "agent_config update failed";
+            return -1;
+        }
+        ALOG_INFO("api", "[vault] migrated agent credential '" << r.key
+                   << "' (agent '" << r.agentId << "') into the vault");
+        ++migrated;
+    }
+    return migrated;
 }
 
 bool SecretsVault::Seal(const std::string& plaintext, std::string& envelopeHex,

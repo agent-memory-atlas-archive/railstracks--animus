@@ -1,8 +1,14 @@
 #include "animus_kernel/AgentConfigStore.h"
 #include "animus_kernel/IDataStore.h"
 #include "animus_kernel/SchemaHelpers.h"
+#include "animus_kernel/Log.h"
+#include "animus_kernel/api/SecretsVault.h"
+
+#include <algorithm>
+#include <cctype>
 
 #include <iostream>
+#include <json/json.h>
 #include <sstream>
 
 namespace animus::kernel {
@@ -50,7 +56,7 @@ void AgentConfigStore::EnsureSchema() {
 // Single key operations
 // ============================================================================
 
-std::string AgentConfigStore::Get(const std::string& agentId,
+std::string AgentConfigStore::GetRaw(const std::string& agentId,
                                    const std::string& key) const {
     // Check cache first
     auto agentIt = m_cache.find(agentId);
@@ -81,9 +87,59 @@ std::string AgentConfigStore::Get(const std::string& agentId,
     return value;
 }
 
+std::string AgentConfigStore::Get(const std::string& agentId,
+                                   const std::string& key) const {
+    std::string raw = GetRaw(agentId, key);
+    if (m_vault) return m_vault->ResolveAgentValue(agentId, raw);
+    return raw;
+}
+
+bool AgentConfigStore::IsCredentialKey(const std::string& key) {
+    static const std::vector<std::string> suffixes = {
+        "api_key", "access_token", "bot_token", "app_token", "app_password",
+        "client_secret", "refresh_token", "server_password", "access_jwt",
+        "refresh_jwt", "api_secret", "secret", "password",
+    };
+    std::string lower;
+    std::transform(key.begin(), key.end(), std::back_inserter(lower),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const auto& s : suffixes) {
+        std::string::size_type pos = lower.rfind(s);
+        if (pos != std::string::npos && pos + s.size() == lower.size()) return true;
+    }
+    return false;
+}
+
 void AgentConfigStore::Set(const std::string& agentId,
                             const std::string& key,
                             const std::string& value) {
+    // #93 P3a: credential-shaped values are vaulted, never stored raw. The
+    // row carries a {"secret_ref":"<name>"} object string instead; Get()
+    // resolves it transparently. Vault disabled -> plaintext passthrough
+    // (single-box legacy behavior, loud at boot by the migration sweep).
+    if (m_vault && !value.empty() && IsCredentialKey(key)) {
+        std::string probeName;
+        if (!SecretsVault::IsRefValue(value, probeName) && value.front() != '{') {
+            std::string name;
+            for (char c : key) {
+                if (SecretsVault::IsValidSecretName(std::string(1, c))) name += c;
+                else if (!name.empty() && name.back() != '_') name += '_';
+            }
+            while (!name.empty() && name.back() == '_') name.pop_back();
+            std::string err;
+            if (!name.empty() && name.size() <= 63 &&
+                m_vault->VaultAgentValue(agentId, name, value, err)) {
+                Json::Value ref(Json::objectValue);
+                ref["secret_ref"] = name;
+                Json::StreamWriterBuilder wb;
+                wb["indentation"] = "";
+                Set(agentId, key, Json::writeString(wb, ref));  // re-set as ref
+                return;
+            }
+            ALOG_WARNING("config", "[vault] could not vault credential '" << key
+                         << "' (" << err << ") — storing plaintext (legacy behavior)");
+        }
+    }
     // Write to DB first
     if (m_store) {
         const char* nowFunc = (m_store->Dialect() == DataStoreDialect::PostgreSQL)

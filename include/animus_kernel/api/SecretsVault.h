@@ -44,6 +44,17 @@ public:
 
     void EnsureSchema();
 
+    // ── #93 P3a: agent-scoped secrets (channel/provider credentials) ────
+    // The vault is namespaced by a free-form "package_id" string; nothing
+    // inside requires it to be a package UUID. Agent secrets live in the
+    // same table under the reserved namespace "agent:<agent_id>" (":" is
+    // impossible in package ids, so the namespaces can't collide).
+    // Channel credentials stored as {"secret_ref": "<name>"} in
+    // agent_config resolve against namespace "agent:<agent_id>" here.
+    static std::string AgentScope(const std::string& agentId) {
+        return "agent:" + agentId;
+    }
+
     bool Set(const std::string& packageId, const std::string& name,
              const std::string& value, std::string& error);
     // Opens the sealed value. Never logged by callers.
@@ -99,6 +110,37 @@ public:
     // state rewritten without them. Loud log line per migrated secret.
     // Returns migrated count or -1 on error.
     int MigrateLegacyStateSecrets(ApiPackageStore& packages, std::string& error);
+
+    // ── #93 P3a: agent_config secret_ref integration ─────────────────────
+    // agent_config values may be {"secret_ref": "<name>"} — resolved from
+    // the agent scope at read time, transparent to every config.get caller.
+    // Never resolves into a cached plaintext value: the AgentConfigStore
+    // consults the vault at Get() when the raw value carries a ref.
+
+    // True when a raw agent_config VALUE string is a serialized secret_ref
+    // object ({"secret_ref":"name"}) — the config store stores refs as
+    // strings; this parses and validates them.
+    static bool IsRefValue(const std::string& raw, std::string& name);
+
+    // Convenience for callers holding config JSON: writes the secret into
+    // the vault under the agent scope and replaces the value with a ref.
+    // Returns false + error on vault misuse (disabled, bad name).
+    bool VaultAgentValue(const std::string& agentId, const std::string& name,
+                         const std::string& value, std::string& error);
+
+    // Resolves a raw agent_config value: if it is a secret_ref object
+    // string, opens the vault entry (agent scope). Returns the raw value
+    // when it is not a ref. Unset ref entry -> empty string (missing-secret
+    // hard errors fire at use sites; config.get stays non-throwing).
+    std::string ResolveAgentValue(const std::string& agentId,
+                                  const std::string& rawValue) const;
+
+    // One-time, idempotent: migrate plaintext channel-credential values in
+    // agent_config into the vault (agent scope), replacing them with
+    // secret_ref objects. Keys that look like credentials (heuristic over
+    // the ChannelManager credential-key list) and non-empty values become
+    // refs. Loud log per migrated secret. Returns migrated count or -1.
+    int MigrateAgentConfigSecrets(std::string& error);
 
     // Seal/open exposure for tests.
     bool Seal(const std::string& plaintext, std::string& envelopeHex, std::string& error) const;

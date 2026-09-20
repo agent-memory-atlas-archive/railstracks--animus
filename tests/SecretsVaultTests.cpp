@@ -17,6 +17,7 @@
 
 #include "animus_kernel/api/SecretsVault.h"
 
+#include "animus_kernel/AgentConfigStore.h"
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/SqliteDataStore.h"
 
@@ -464,6 +465,153 @@ int TestLintGates() {
 
 }  // namespace
 
+// ── #93 P3a: agent-scoped secrets (channel/provider credentials) ─────────
+
+void TestAgentScope() {
+    std::cerr << "  [agent-scope] namespacing, ref write/read, disabled vault...\n";
+    // Agent secrets live in the SAME vault under "agent:<id>" — the colon
+    // cannot appear in package ids, so the namespaces cannot collide. A
+    // package with the same secret name never sees an agent secret and
+    // vice versa.
+    std::string dbPath = MakeDbPath();
+    SqliteDataStore db{dbPath};
+    ApiPackageStore store{&db};
+    SecretsVault vault{&db, dbPath + ".vault.key"};
+    store.EnsureSchema();
+    vault.EnsureSchema();
+
+    std::string err;
+    Assert(vault.VaultAgentValue("default", "telegram_bot_token", "tok-123", err),
+           "vault agent write");
+    Assert(vault.Has(vault.AgentScope("default"), "telegram_bot_token"),
+           "agent entry visible under agent scope");
+    Assert(!vault.Has("some-package-id", "telegram_bot_token"),
+           "agent entry NOT visible under an arbitrary package scope");
+    auto got = vault.ResolveAgentValue("default",
+        "{\"secret_ref\":\"telegram_bot_token\"}");
+    Assert(got == "tok-123", "ResolveAgentValue opens the ref");
+    Assert(vault.ResolveAgentValue("default", "plain-value") == "plain-value",
+           "non-ref value passes through untouched");
+    // Cross-agent isolation
+    Assert(vault.ResolveAgentValue("other", "{\"secret_ref\":\"telegram_bot_token\"}")
+               .empty(),
+           "agent scope isolates per agent");
+
+    // Disabled vault: VaultAgentValue fails closed
+    SqliteDataStore db2{MakeDbPath()};
+    SecretsVault disabled{&db2, ""};   // empty key path = disabled
+    std::string derr;
+    Assert(!disabled.VaultAgentValue("default", "name", "value", derr),
+           "disabled vault refuses agent writes");
+}
+
+void TestConfigStoreIntegration() {
+    std::cerr << "  [config-store] write intercept, transparent resolution, raw read...\n";
+    std::string dbPath = MakeDbPath();
+    SqliteDataStore db{dbPath};
+    SecretsVault vault{&db, dbPath + ".vault.key"};
+    vault.EnsureSchema();
+    AgentConfigStore config{&db};
+    config.SetVault(&vault);
+
+    // Credential-shaped Set -> row carries a ref object, not plaintext
+    config.Set("default", "channels.telegram:main.bot_token", "AAA-plaintext");
+    std::string raw = config.GetRaw("default", "channels.telegram:main.bot_token");
+    Assert(raw.find("secret_ref") != std::string::npos,
+           "credential Set stored as secret_ref object");
+    Assert(raw.find("AAA-plaintext") == std::string::npos,
+           "plaintext never lands in the row");
+    Assert(config.Get("default", "channels.telegram:main.bot_token") == "AAA-plaintext",
+           "Get resolves the ref transparently");
+
+    // Non-credential Set -> plaintext passthrough
+    config.Set("default", "channels.telegram:main.group_id", "12345");
+    Assert(config.Get("default", "channels.telegram:main.group_id") == "12345",
+           "non-credential value untouched");
+    Assert(config.GetRaw("default", "channels.telegram:main.group_id") == "12345",
+           "non-credential raw == resolved");
+
+    // Heuristic boundary: 'handle' and 'did' (bluesky) are NOT credential-shaped
+    config.Set("default", "channels.bluesky:personal.handle", "@kestrel");
+    Assert(config.GetRaw("default", "channels.bluesky:personal.handle") == "@kestrel",
+           "non-credential key stores raw");
+
+    // Overwrite with a new plaintext -> same vault name, new value
+    config.Set("default", "channels.telegram:main.bot_token", "BBB-rotated");
+    Assert(config.Get("default", "channels.telegram:main.bot_token") == "BBB-rotated",
+           "credential rotation resolves to the new value");
+    Assert(config.GetRaw("default", "channels.telegram:main.bot_token")
+               .find("BBB-rotated") == std::string::npos,
+           "rotated plaintext still not in the row");
+}
+
+void TestAgentMigration() {
+    std::cerr << "  [agent-migration] sweep, idempotence, non-credentials untouched...\n";
+    std::string dbPath = MakeDbPath();
+    SqliteDataStore db{dbPath};
+    SecretsVault vault{&db, dbPath + ".vault.key"};
+    vault.EnsureSchema();
+    AgentConfigStore config0{&db};   // creates agent_config (pre-P3a shape:
+    config0.SetVault(&vault);        // table exists, values still plaintext)
+
+    // Seed plaintext credentials directly (pre-P3a database shape)
+    {
+        auto ins = db.Prepare(
+            "INSERT INTO agent_config (agent_id, key, value) VALUES (?, ?, ?)");
+        ins->BindText(1, "default");
+        ins->BindText(2, "channels.telegram:main.bot_token");
+        ins->BindText(3, "legacy-plaintext-tok");
+        ins->ExecDML();
+        auto ins2 = db.Prepare(
+            "INSERT INTO agent_config (agent_id, key, value) VALUES (?, ?, ?)");
+        ins2->BindText(1, "buffett");
+        ins2->BindText(2, "channels.discord:trading.api_key");
+        ins2->BindText(3, "legacy-key-456");
+        ins2->ExecDML();
+        auto ins3 = db.Prepare(
+            "INSERT INTO agent_config (agent_id, key, value) VALUES (?, ?, ?)");
+        ins3->BindText(1, "default");
+        ins3->BindText(2, "channels.irc:libera.nick");
+        ins3->BindText(3, "kestrel");
+        ins3->ExecDML();
+    }
+    std::string err;
+    const int migrated = vault.MigrateAgentConfigSecrets(err);
+    Assert(migrated == 2, "two credential rows migrated (nick untouched), got " +
+                              std::to_string(migrated));
+    Assert(err.empty(), "no migration error");
+
+    AgentConfigStore config{&db};
+    config.SetVault(&vault);
+    Assert(config.Get("default", "channels.telegram:main.bot_token") ==
+               "legacy-plaintext-tok",
+           "migrated credential still resolves via vault");
+    Assert(config.Get("buffett", "channels.discord:trading.api_key") == "legacy-key-456",
+           "second agent migrated too");
+    Assert(config.Get("default", "channels.irc:libera.nick") == "kestrel",
+           "non-credential untouched by sweep");
+
+    // Idempotence: second sweep migrates nothing
+    const int again = vault.MigrateAgentConfigSecrets(err);
+    Assert(again == 0, "second sweep migrates zero, got " + std::to_string(again));
+
+    // Raw rows carry refs, not plaintext
+    std::string raw = config.GetRaw("default", "channels.telegram:main.bot_token");
+    Assert(raw.find("legacy-plaintext-tok") == std::string::npos,
+           "plaintext gone from the raw row");
+}
+
+void TestDisabledVaultPassthrough() {
+    std::cerr << "  [disabled-vault] config store without a vault = legacy behavior...\n";
+    std::string dbPath = MakeDbPath();
+    SqliteDataStore db{dbPath};
+    AgentConfigStore config{&db};   // NO SetVault — single-box legacy shape
+
+    config.Set("default", "channels.telegram:main.bot_token", "plain");
+    Assert(config.Get("default", "channels.telegram:main.bot_token") == "plain",
+           "no vault -> plaintext round-trip (legacy)");
+}
+
 int main() {
     std::cerr << "SecretsVault tests:\n";
     TestCrypto();
@@ -472,6 +620,10 @@ int main() {
     TestSplitStateSecrets();
     TestMigration();
     TestLintGates();
+    TestAgentScope();
+    TestConfigStoreIntegration();
+    TestAgentMigration();
+    TestDisabledVaultPassthrough();
     if (g_failures == 0) {
         std::cerr << "SecretsVault tests: ALL PASSED\n";
         return 0;
