@@ -584,12 +584,18 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         // #93 P3a: the config store resolves/vaults credential-shaped values
         // through the same vault the api packages use (agent:<id> scope).
         m_configStore->SetVault(m_secretsVault);
+        // #93 P3 slice 3: provider persistence rides the replicated config
+        // store (kv rows under "__providers"; api keys + auth blobs vaulted).
+        m_adminServer->SetProviderConfigStore(m_configStore);
         // #93 P3: replication coherence — remote agent_config applies
-        // invalidate this store's cache (sync writes bypass the API).
+        // invalidate this store's cache (sync writes bypass the API), and
+        // "__providers" rows additionally rebuild the in-memory provider
+        // model (a peer changed provider config).
         if (m_syncStore)
             m_syncStore->SetApplyNotifier(
                 [this](const std::string& t, const std::string& k) {
                     m_configStore->OnSyncApplied(t, k);
+                    m_adminServer->OnProviderConfigSyncApplied(t, k);
                 });
         {
             std::string agentMigErr;

@@ -1,4 +1,5 @@
 #include "animus_kernel/admin/ProviderManager.h"
+#include "animus_kernel/AgentConfigStore.h"
 
 #include <algorithm>
 #include <cctype>
@@ -680,6 +681,13 @@ bool ProviderManager::ValidateProviderPayload(
             if (error) *error = "provider_id must be 1-64 characters";
             return false;
         }
+        // "__" is the reserved config-store namespace (__providers rows,
+        // __kernel__ rows) — a provider id starting with it would collide
+        // with structural keys in the replicated agent_config space.
+        if (id.rfind("__", 0) == 0) {
+            if (error) *error = "provider_id must not start with '__' (reserved namespace)";
+            return false;
+        }
         for (char c : id) {
             if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != ' ') {
                 if (error) {
@@ -1087,6 +1095,254 @@ bool ProviderManager::TestProviderConnectivity(
         *statusOut = state.status;
     }
     return true;
+}
+
+
+
+
+// ── #93 P3 slice 3: store-backed persistence ─────────────────────────────
+// See ProviderManager.h for the kv layout and boot-import contract.
+
+namespace {
+constexpr const char* kProviderConfigAgent = "__providers";
+
+std::string CfgRow(const std::string& id) { return "cfg." + id; }
+std::string ApiKeyRow(const std::string& id) { return "cfg." + id + ".api_key"; }
+std::string AuthRow(const std::string& id) { return "cfg." + id + ".auth_secret"; }
+constexpr const char* kDefaultRow = "__default";
+}  // namespace
+
+void ProviderManager::ConfigureStore(AgentConfigStore* store) {
+    m_configStore = store;
+}
+
+bool ProviderManager::LoadProviders(std::string* error) {
+    if (!m_configStore) return LoadFromDisk(error);
+
+    // Store mode. The empty-check reads through the (thread-safe) config
+    // store without our mutex; the import path calls LoadFromDisk and
+    // SaveProviders, which take the mutex themselves.
+    const auto rows = m_configStore->GetAll(kProviderConfigAgent);
+    bool sawProviderRow = false;
+    for (const auto& [k, v] : rows) {
+        if (k == kDefaultRow) continue;
+        if (k.rfind("cfg.", 0) == 0) { sawProviderRow = true; break; }
+    }
+
+    if (!sawProviderRow) {
+        // Empty store. Legacy files present? -> one-time import; after
+        // this the store is the source of truth and files are ignored.
+        const std::filesystem::path p(m_providerStorage.providersFilePath);
+        if (m_providerStorage.persistToDisk && !m_providerStorage.providersFilePath.empty() &&
+            std::filesystem::exists(p)) {
+            if (!LoadFromDisk(error)) return false;
+            if (!SaveProviders(error)) return false;
+            // Import auth blobs for providers that carry one (non-api_key
+            // auth: oauth etc.). Failures are loud but non-fatal — the
+            // config is in; auth can be re-supplied via the admin UI.
+            for (const auto& id : ListProviderIdsForAuthImport()) {
+                Json::Value auth;
+                std::string authErr;
+                // LoadAuthFromDisk returns the whole-file ROOT (callers
+                // index by provider id); extract this provider's slice.
+                if (LoadAuthFromDisk(id, &auth, &authErr) && auth.isObject() &&
+                    auth.isMember(id)) {
+                    std::string saveErr;
+                    if (!SaveAuthProvider(id, auth[id], &saveErr)) {
+                        std::cerr << "[provider-manager] auth import failed for '"
+                                  << id << "': " << saveErr << std::endl;
+                    }
+                }
+            }
+            std::cerr << "[provider-manager] imported provider config from "
+                      << p.string() << " into the replicated store" << std::endl;
+            return true;
+        }
+        // Empty store, no legacy file: fresh install.
+        std::lock_guard<std::mutex> lock(m_providerMutex);
+        m_providersByName.clear();
+        m_defaultProvider.clear();
+        return true;
+    }
+
+    // Rebuild from rows (carrying over runtime state of survivors).
+    std::lock_guard<std::mutex> lock(m_providerMutex);
+
+    std::unordered_map<std::string, ProviderState> next;
+    std::unordered_map<std::string, std::string> apiKeys;
+    for (const auto& [k, v] : rows) {
+        if (k == kDefaultRow || k.rfind("cfg.", 0) != 0) continue;
+        if (k.size() > 8 && k.compare(k.size() - 8, 8, ".api_key") == 0) {
+            apiKeys[k.substr(4, k.size() - 4 - 8)] = v;
+            continue;
+        }
+        if (k.size() > 12 && k.compare(k.size() - 12, 12, ".auth_secret") == 0) {
+            continue;  // loaded on demand via LoadAuthProvider
+        }
+        const std::string id = k.substr(4);
+        ProviderState state;
+        Json::CharReaderBuilder rb;
+        std::string errs;
+        std::istringstream ss(v);
+        Json::Value entry;
+        if (!Json::parseFromStream(rb, ss, &entry, &errs) || !entry.isObject()) {
+            std::cerr << "[provider-manager] skipping malformed provider row '"
+                      << id << "': " << errs << std::endl;
+            continue;
+        }
+        state.providerId = id;
+        state.providerType = entry.get("provider_type", "").asString();
+        state.baseUrl = entry.get("base_url", "").asString();
+        state.defaultModel = entry.get("default_model", "").asString();
+        state.defaultContextWindow = entry.get("default_context_window", 128000).asUInt();
+        state.authType = entry.get("auth_type", "api_key").asString();
+        state.concurrency = entry.get("concurrency", 1).asInt();
+        state.authFile = entry.get("auth_file", "").asString();
+        if (entry.isMember("extra") && entry["extra"].isObject()) {
+            for (const auto& ek : entry["extra"].getMemberNames()) {
+                state.extra[ek] = entry["extra"][ek].asString();
+            }
+        }
+        if (entry.isMember("model_context_windows") && entry["model_context_windows"].isObject()) {
+            for (const auto& mk : entry["model_context_windows"].getMemberNames()) {
+                state.modelContextWindows[mk] =
+                    entry["model_context_windows"][mk].asUInt();
+            }
+        }
+        // Runtime state carries over from the previous in-memory model
+        // when the provider survived (health is node-local).
+        auto prev = m_providersByName.find(id);
+        if (prev != m_providersByName.end()) {
+            state.status = prev->second.status;
+            state.lastError = prev->second.lastError;
+            state.lastTestedUnixMs = prev->second.lastTestedUnixMs;
+            state.capabilities = prev->second.capabilities;
+        }
+        next[id] = std::move(state);
+    }
+    for (auto& [id, key] : apiKeys) {
+        auto it = next.find(id);
+        if (it != next.end() && it->second.authType == "api_key") {
+            it->second.apiKey = key;   // GetAll already resolved the ref
+        }
+    }
+    m_providersByName = std::move(next);
+    m_defaultProvider = rows.count(kDefaultRow) ? rows.at(kDefaultRow) : std::string();
+    if (!m_providersByName.empty() &&
+        m_providersByName.find(m_defaultProvider) == m_providersByName.end()) {
+        m_defaultProvider = m_providersByName.begin()->first;
+    }
+    return true;
+}
+
+std::vector<std::string> ProviderManager::ListProviderIdsForAuthImport() const {
+    std::vector<std::string> ids;
+    std::lock_guard<std::mutex> lock(m_providerMutex);
+    for (const auto& [id, state] : m_providersByName) {
+        if (state.authType != "api_key") ids.push_back(id);
+    }
+    return ids;
+}
+
+bool ProviderManager::SaveProviders(std::string* error) const {
+    if (!m_configStore) return SaveToDisk(error);
+    std::lock_guard<std::mutex> lock(m_providerMutex);
+
+    std::vector<std::string> liveRowPrefixes;  // "cfg.<id>" per provider
+    for (const auto& [id, state] : m_providersByName) {
+        Json::Value entry(Json::objectValue);
+        entry["provider_type"] = state.providerType;
+        entry["base_url"] = state.baseUrl;
+        entry["default_model"] = state.defaultModel;
+        entry["default_context_window"] = static_cast<Json::UInt>(state.defaultContextWindow);
+        entry["auth_type"] = state.authType;
+        entry["concurrency"] = state.concurrency;
+        if (!state.authFile.empty()) entry["auth_file"] = state.authFile;
+        if (!state.extra.empty()) {
+            Json::Value extra(Json::objectValue);
+            for (const auto& [k, v] : state.extra) extra[k] = v;
+            entry["extra"] = extra;
+        }
+        if (!state.modelContextWindows.empty()) {
+            Json::Value mcw(Json::objectValue);
+            for (const auto& [m, w] : state.modelContextWindows) mcw[m] = static_cast<Json::UInt>(w);
+            entry["model_context_windows"] = mcw;
+        }
+        // NOTE: no api_key here — it lives in its own row so the
+        // credential-suffix interception vaults it ("cfg.<id>.api_key").
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        m_configStore->Set(kProviderConfigAgent, CfgRow(id), Json::writeString(wb, entry));
+
+        if (state.authType == "api_key" && !state.apiKey.empty()) {
+            m_configStore->Set(kProviderConfigAgent, ApiKeyRow(id), state.apiKey);
+        } else {
+            m_configStore->Delete(kProviderConfigAgent, ApiKeyRow(id));
+        }
+        liveRowPrefixes.push_back(CfgRow(id));
+    }
+    m_configStore->Set(kProviderConfigAgent, kDefaultRow, m_defaultProvider);
+
+    // Reconcile: delete rows of providers no longer in memory (handles
+    // DeleteProvider -> SaveProviders, which orphans cfg.<id>* rows).
+    for (const auto& k : m_configStore->ListKeys(kProviderConfigAgent)) {
+        if (k == kDefaultRow || k.rfind("cfg.", 0) != 0) continue;
+        const std::string id = (k.find(".api_key") == std::string::npos &&
+                                k.find(".auth_secret") == std::string::npos)
+                                   ? k.substr(4)
+                                   : std::string();
+        if (id.empty()) continue;
+        if (m_providersByName.find(id) == m_providersByName.end()) {
+            m_configStore->DeleteByPrefix(kProviderConfigAgent, CfgRow(id) + ".");
+            m_configStore->Delete(kProviderConfigAgent, CfgRow(id));
+        }
+    }
+    return true;
+}
+
+bool ProviderManager::LoadAuthProvider(const std::string& providerId, Json::Value* out, std::string* error) const {
+    if (!m_configStore) return LoadAuthFromDisk(providerId, out, error);
+    const std::string raw = m_configStore->Get(kProviderConfigAgent, AuthRow(providerId));
+    if (raw.empty()) {
+        if (error) *error = "no auth stored for provider: " + providerId;
+        return false;
+    }
+    Json::CharReaderBuilder rb;
+    std::string errs;
+    std::istringstream ss(raw);
+    Json::Value stored;
+    if (!Json::parseFromStream(rb, ss, &stored, &errs)) {
+        if (error) *error = "auth payload malformed for provider " + providerId + ": " + errs;
+        return false;
+    }
+    // The file API is asymmetric: saves take the per-provider object,
+    // loads return the whole-file root (callers index by provider id).
+    // Rows store the per-provider slice; reassemble the root shape here
+    // so every caller is unchanged.
+    if (out) {
+        *out = Json::Value(Json::objectValue);
+        (*out)[providerId] = std::move(stored);
+    }
+    return true;
+}
+
+bool ProviderManager::SaveAuthProvider(const std::string& providerId, const Json::Value& auth, std::string* error) const {
+    if (!m_configStore) return SaveAuthToDisk(providerId, auth, error);
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    // ".auth_secret" suffix -> the credential-suffix interception vaults
+    // the whole serialized blob (field names like a bare "token" would
+    // slip past any per-field heuristic — the suffix makes it structural).
+    m_configStore->Set(kProviderConfigAgent, AuthRow(providerId), Json::writeString(wb, auth));
+    return true;
+}
+
+void ProviderManager::ReloadFromStore() {
+    if (!m_configStore) return;
+    std::string err;
+    if (!LoadProviders(&err)) {
+        std::cerr << "[provider-manager] reload from store failed: " << err << std::endl;
+    }
 }
 
 } // namespace animus::kernel

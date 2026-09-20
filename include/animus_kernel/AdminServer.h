@@ -123,6 +123,17 @@ public:
     bool LoadConstitutionFromDisk(std::string* error);
     bool LoadInterfacesFromDisk(std::string* error);
     bool TriggerModelClientReinitialization(std::string* error);
+    // #93 P3 slice 3: attach the replicated config store — provider
+    // persistence switches from providers.json/auth.json to agent_config
+    // kv rows (replicated; secrets via vault). No-op attachments keep the
+    // legacy file behavior.
+    void SetProviderConfigStore(AgentConfigStore* store);
+
+    // #93 P3 slice 3: SyncStore apply-notifier relay — a remote
+    // agent_config apply under "__providers" rebuilds the in-memory
+    // provider model (provider config changed on a peer).
+    void OnProviderConfigSyncApplied(const std::string& table, const std::string& rowKey);
+
     bool LoadProvidersFromDisk(std::string* error);
     bool SaveProvidersToDisk(std::string* error) const;
     bool LoadAuthFromDisk(const std::string& providerId, Json::Value* out, std::string* error) const;

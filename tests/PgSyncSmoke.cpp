@@ -5,6 +5,8 @@
 #include "animus_kernel/PgDataStore.h"
 #include "animus_kernel/IdRanges.h"
 #include "animus_kernel/SyncStore.h"
+#include "animus_kernel/AgentConfigStore.h"
+#include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/Log.h"
 
 #include <cstdlib>
@@ -73,7 +75,15 @@ int main() {
         // no triggers installed at all on PG).
         db->Exec("CREATE TABLE agent_config (agent_id TEXT NOT NULL, "
                  "key TEXT NOT NULL, value TEXT NOT NULL DEFAULT '', "
-                 "PRIMARY KEY (agent_id, key))");
+                 "updated_at TEXT NOT NULL DEFAULT (now()::text), "
+                 "PRIMARY KEY (agent_id, key))");   // matches store schema: Set writes updated_at
+        // #93 P3 slice 3: the vault table joins the fixture (ciphertext
+        // replicates; the master key does NOT — verified nodes share it).
+        db->Exec("CREATE TABLE api_package_secrets (id TEXT PRIMARY KEY, "
+                 "package_id TEXT NOT NULL, name TEXT NOT NULL, "
+                 "ciphertext TEXT NOT NULL, created_at_unix_ms BIGINT NOT NULL, "
+                 "updated_at_unix_ms BIGINT NOT NULL, "
+                 "UNIQUE (package_id, name))");
     }
 
     std::string err;
@@ -210,6 +220,45 @@ int main() {
         bool sawConfig = false;
         for (const auto& d : digests) if (d.table == "agent_config") sawConfig = true;
         Check(sawConfig, "agent_config present in PG digests");
+    }
+
+    // ── #93 P3 slice 3: provider config + vaulted key replicate ────────
+    // The scratch-node story in miniature: both nodes share one vault
+    // master key (verified-node key distribution is manual, per #93); A
+    // holds provider config with a vaulted api_key; a scratch B pulls
+    // everything and resolves the key with the replicated ciphertext.
+    {
+        std::cerr << "  [P3-s3] provider config replicates (vaulted key)\n";
+        const std::string sharedKeyPath = "/tmp/animus_pgsmoke_shared.key";
+        SecretsVault vaultA(&dbA, sharedKeyPath);
+        vaultA.EnsureSchema();
+        SecretsVault vaultB(&dbB, sharedKeyPath);
+        vaultB.EnsureSchema();   // loads the same key file
+        AgentConfigStore cfgA(&dbA);
+        cfgA.SetVault(&vaultA);
+        AgentConfigStore cfgB(&dbB);
+        cfgB.SetVault(&vaultB);
+
+        cfgA.Set("__providers", "cfg.zai",
+                 "{\"provider_type\":\"zai\",\"auth_type\":\"api_key\",\"concurrency\":2}");
+        cfgA.Set("__providers", "cfg.zai.api_key", "sk-pg-live-42");
+        cfgA.Set("__providers", "__default", "zai");
+
+        auto out = syncA.FetchOutboxSince(0, 1000);
+        int applied = 0, secretRows = 0;
+        for (const auto& r : out) {
+            if (!syncB.ApplyRemoteChange(r)) continue;
+            applied++;
+            if (r.table_name == "api_package_secrets") secretRows++;
+        }
+        Check(applied >= 3, "scratch join applied provider rows, got " +
+                                   std::to_string(applied));
+        Check(secretRows >= 1, "vault ciphertext replicated to B");
+        Check(cfgB.Get("__providers", "cfg.zai.api_key") == "sk-pg-live-42",
+              "api_key resolves on B (shared key decrypts replicated ciphertext)");
+        Check(cfgB.GetRaw("__providers", "cfg.zai.api_key").find("secret_ref") !=
+                  std::string::npos,
+              "B's row still carries a ref, not plaintext");
     }
 
     // Tear down: kill pool connections first, then drop the scratch DBs.
