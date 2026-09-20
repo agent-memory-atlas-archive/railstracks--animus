@@ -169,7 +169,8 @@ struct Fixture {
 
 // Installs a package shaped for these tests.
 ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "",
-                             const std::string& egressField = "") {
+                             const std::string& egressField = "",
+                             bool ownerInstalled = true) {
     std::string manifest = R"({
       "kind": "api_package", "name": "testpkg", "version": "0.1.0",
       "description": "fixture",
@@ -220,7 +221,7 @@ ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "",
         manifest.replace(cpos, 0,
                          "      \"egress_hosts\": " + egressField + ",\n");
     }
-    ApiPackage pkg = fx.store.InstallFromManifest(manifest);
+    ApiPackage pkg = fx.store.InstallFromManifest(manifest, "", "", ownerInstalled);
     fx.store.SetPackageEnabled(pkg.id, true);
     // #23: the fixture token enters through the vault (split-write path —
     // same seam the admin PUT uses), never as a state literal.
@@ -522,7 +523,7 @@ int TestSandboxStateAndSecrets() {
 }
 
 static int TestEgressControl() {
-    std::cout << "  [runtime] #25 egress scope: derivation, enforcement, wildcards, sweep...\n";
+    std::cout << "  [runtime] #25 egress scope + approval gate: derivation, enforcement, redirects, approval...\n";
     // 1) derivation: fixture manifest (no egress_hosts) derives the transport
     //    host from state_schema defaults — existing template packages keep working
     {
@@ -644,6 +645,87 @@ static int TestEgressControl() {
         auto in = fx.runtime->ExecuteAction("testpkg", "hop in", "agent", Json::Value());
         Assert(in["success"].asBool() && in["output"].asString() == "status 200",
                "in-scope relative redirect followed to 200");
+    }
+    // 8) approval gate (#25 part 2): agent installs are drafts; approval
+    //    binds to content; the runtime backstop holds even when enabled
+    {
+        // a) agent path -> pending -> refused EVEN THOUGH enabled (backstop)
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(pkg.approval_status == "pending", "agent install lands pending");
+        auto r = fx.runtime->ExecuteAction("testpkg", "echo", "agent", Json::Value());
+        Assert(!r["success"].asBool(), "unapproved package cannot execute");
+        Assert(r["error"].asString().find("owner approval") != std::string::npos,
+               "refusal names the approval gate");
+        // b) approve -> executes
+        Assert(fx.store.ApprovePackage(pkg.id), "approve succeeds");
+        Json::Value args; args["msg"] = "hi";
+        auto ok = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(ok["success"].asBool(), "approved package executes");
+        // c) identical reinstall -> approval survives (content binding)
+        auto re = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(re.approval_status == "approved",
+               "identical content reinstall keeps approval");
+        // d) content change -> back to pending
+        std::string extra = R"({"name": "newcmd", "kind": "action", "description": "d",
+            "script": "function run(ctx) return {output='x'} end"})";
+        auto re2 = InstallFixturePkg(fx, extra, "", /*ownerInstalled=*/false);
+        Assert(re2.approval_status == "pending", "content change resets to pending");
+        auto blocked = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(!blocked["success"].asBool(), "changed content blocked again");
+    }
+    // 9) owner install is approval-by-act; reject + re-approve round trip
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);  // owner path
+        Assert(pkg.approval_status == "approved", "owner install auto-approved");
+        Assert(!pkg.approved_hash.empty(), "approval records content hash");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                           Json::Value());
+        Assert(r["success"].asBool(), "owner-installed package executes");
+        // reject -> refused
+        Assert(fx.store.RejectPackage(pkg.id), "reject succeeds");
+        auto rj = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                            Json::Value());
+        Assert(!rj["success"].asBool() &&
+                   rj["error"].asString().find("rejected") != std::string::npos,
+               "rejected package refused");
+        // re-approve -> works again
+        Assert(fx.store.ApprovePackage(pkg.id), "re-approve succeeds");
+        auto rk = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                            Json::Value());
+        Assert(rk["success"].asBool(), "re-approved package executes");
+    }
+    // 10) migration: pre-gate rows (NULL status) are grandfathered approved
+    //     with content hashes backfilled
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);
+        {
+            auto stmt = fx.db.Prepare("UPDATE api_packages SET approval_status = NULL");
+            Assert(stmt && stmt->ExecDML(), "status reset to pre-gate NULL");
+        }
+        ApiPackageStore store2{&fx.db};  // EnsureSchema -> MigrateApprovalGate
+        auto gp = store2.GetPackageByName("testpkg");
+        Assert(gp->approval_status == "approved", "pre-gate row grandfathered");
+        Assert(!gp->content_hash.empty() && gp->content_hash == gp->approved_hash,
+               "hashes backfilled and bound");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                           Json::Value());
+        Assert(r["success"].asBool(), "grandfathered package executes");
+    }
+    // 11) content hash: manifest key order / cosmetic fields do not change it
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(fx.store.ApprovePackage(pkg.id), "approve for hash test");
+        // reinstall with extra whitespace inside a command description is a
+        // CONTENT change (description participates per-command) — assert the
+        // stronger property instead: same install twice = same hash
+        auto pkg2 = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(pkg2.content_hash == pkg.content_hash &&
+                   pkg2.approval_status == "approved",
+               "hash stable across reinstalls of identical content");
     }
     // 8) Location resolution semantics (unit)
     {

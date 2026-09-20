@@ -196,8 +196,8 @@ std::string ApiTool::HandlePackage(const std::vector<std::string>& tokens) {
         pkg.version = "0.1.0";
         store->CreatePackage(pkg);  // throws on duplicate/reserved handled by store
         ALOG_INFO("api", "[api] package created: " << name);
-        return "created '" + name + "' (disabled). add commands with the registry or "
-               "InstallFromManifest; enable with 'api enable " + name + "'.";
+        return "created '" + name + "' (disabled, pending owner approval — the owner "
+               "reviews and approves it via the admin API before it can run).";
     }
     if (verb == "delete") {
         auto pkg = store->GetPackageByName(name);
@@ -275,6 +275,11 @@ std::string ApiTool::HandleEnable(const std::string& name, bool enable) {
     auto* store = m_runtime->store();
     auto pkg = store->GetPackageByName(name);
     if (!pkg) return "unknown package '" + name + "'. " + AvailablePackagesLine();
+    if (enable && pkg->approval_status != "approved")
+        return "package '" + name + "' is " +
+               (pkg->approval_status == "rejected" ? "rejected" : "pending") +
+               " — awaiting owner approval. The owner approves it via the admin API; "
+               "agent-side enabling is blocked until then.";
     store->SetPackageEnabled(pkg->id, enable);
     ALOG_INFO("api", "[api] package " << (enable ? "enabled" : "disabled") << ": " << name);
     // Runtime apply for passive connections arrives in build order (d);

@@ -71,7 +71,8 @@ RegistryInstallResult InstallFromRegistry(ApiPackageStore& store,
                                            const std::string& registryBase,
                                            const std::string& name,
                                            const std::string& version = "" /* latest */,
-                                           bool allowPrivate = false);
+                                           bool allowPrivate = false,
+                                           bool ownerInstalled = false);
 
 // Fetch only (list/detail probes, UI "what's available"): returns raw body.
 HttpClient::Response FetchPackageManifest(HttpClient& http,
