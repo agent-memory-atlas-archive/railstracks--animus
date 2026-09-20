@@ -222,8 +222,10 @@ struct BridgeContext {
     Json::Value args;
     std::vector<std::string> secretValues;
     std::set<std::string> secretKeys;
+    std::vector<std::string> egressHosts;  // #25: package egress scope
     ApiPackageStore* store{nullptr};
     HttpClient* http{nullptr};
+    ApiRuntime* runtime{nullptr};  // owns ExecuteScoped (per-hop redirect gate)
     std::string filesRoot;
     size_t fsReadCap{1024 * 1024};
     size_t stringTruncate{16 * 1024};
@@ -435,6 +437,23 @@ Json::Value DoHttp(BridgeContext* bc, const std::string& method, lua_State* L, i
         return out;
     }
     const char* url = luaL_checkstring(L, urlIdx);
+    // #25 egress gate for script-initiated fetches: same package scope as the
+    // transport path. Returned as a normal http-result table (status 0 +
+    // error) so scripts can handle it — but always audited.
+    {
+        std::string egressHost;
+        if (!ApiRuntime::EgressAllowed(bc->egressHosts, url, egressHost)) {
+            ALOG_WARNING("api", "[egress] DENIED " << bc->logPrefix << " -> "
+                         << (egressHost.empty() ? "<malformed url>" : egressHost)
+                         << " (sandbox fetch outside package scope)");
+            Json::Value denied(Json::objectValue);
+            denied["status"] = 0;
+            denied["error"] = "egress denied: host '" +
+                              (egressHost.empty() ? "<malformed>" : egressHost) +
+                              "' is not in this package's egress allowlist";
+            return denied;
+        }
+    }
     HttpClient::Request req;
     req.method = method;
     req.url = url;
@@ -455,7 +474,12 @@ Json::Value DoHttp(BridgeContext* bc, const std::string& method, lua_State* L, i
         lua_pop(L, 1);
     }
     bc->httpUsed++;
-    HttpClient::Response resp = bc->http->Execute(req);
+    // #25: sandbox fetches follow redirects under the same per-hop scope
+    // checks as the primary transport.
+    HttpClient::Response resp =
+        bc->http ? ApiRuntime::ExecuteScoped(bc->http, bc->egressHosts, req,
+                                             bc->logPrefix + " (sandbox)")
+                 : HttpClient::Response{};
     out["status"] = resp.status_code;
     {
         Json::Value headers(Json::objectValue);
@@ -862,6 +886,140 @@ std::string ApiRuntime::Interpolate(const std::string& tmpl, const Json::Value& 
     return out;
 }
 
+std::vector<std::string> ApiRuntime::ParseEgressHosts(const std::string& json) {
+    std::vector<std::string> out;
+    Json::Value arr;
+    std::string err;
+    if (!ParseJsonText(json.empty() ? "[]" : json, arr, err) || !arr.isArray()) return out;
+    for (const auto& h : arr)
+        if (h.isString() && !h.asString().empty()) out.push_back(h.asString());
+    return out;
+}
+
+bool ApiRuntime::EgressAllowed(const std::vector<std::string>& hostPatterns,
+                               const std::string& resolvedUrl, std::string& hostOut) {
+    // Extract host from the resolved URL (no templating left here).
+    const size_t sep = resolvedUrl.find("://");
+    if (sep == std::string::npos) {
+        hostOut = "";
+        return false;  // not an absolute URL — deny
+    }
+    size_t hostStart = sep + 3;
+    size_t hostEnd = hostStart;
+    while (hostEnd < resolvedUrl.size() && resolvedUrl[hostEnd] != '/' &&
+           resolvedUrl[hostEnd] != '?' && resolvedUrl[hostEnd] != '#')
+        ++hostEnd;
+    std::string host = resolvedUrl.substr(hostStart, hostEnd - hostStart);
+    const size_t at = host.rfind('@');
+    if (at != std::string::npos) host = host.substr(at + 1);
+    const size_t colon = host.rfind(':');
+    if (!host.empty() && host[0] != '[' && colon != std::string::npos)
+        host = host.substr(0, colon);
+    std::transform(host.begin(), host.end(), host.begin(), ::tolower);
+    hostOut = host;
+    // Empty scope = deny-all (script-only packages stay network-silent).
+    for (const auto& pat : hostPatterns) {
+        if (pat == host) return true;
+        if (pat.substr(0, 2) == "*.") {
+            const std::string suffix = pat.substr(1);  // ".example.com"
+            if (host.size() > suffix.size() &&
+                host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+std::string ApiRuntime::ResolveRedirectUrl(const std::string& requestUrl,
+                                           const std::string& location) {
+    if (location.empty()) return "";
+    if (location.find("://") != std::string::npos) return location;
+    const size_t sep = requestUrl.find("://");
+    if (sep == std::string::npos) return "";
+    const size_t pathStart = requestUrl.find('/', sep + 3);
+    const std::string origin = pathStart == std::string::npos
+                                   ? requestUrl
+                                   : requestUrl.substr(0, pathStart);
+    if (location[0] == '/') return origin + location;
+    const std::string basePath = pathStart == std::string::npos
+                                     ? "/"
+                                     : requestUrl.substr(pathStart);
+    if (location[0] == '?') {
+        std::string base = basePath;
+        const size_t q = base.find('?');
+        if (q != std::string::npos) base = base.substr(0, q);
+        return origin + base + location;
+    }
+    const size_t slash = basePath.rfind('/');
+    return origin + basePath.substr(0, slash + 1) + location;
+}
+
+HttpClient::Response ApiRuntime::ExecuteScoped(HttpClient* http,
+                                               const std::vector<std::string>& hostPatterns,
+                                               HttpClient::Request req,
+                                               const std::string& auditPrefix) {
+    std::string auditChain;
+    for (int hop = 0;; ++hop) {
+        std::string host;
+        if (!EgressAllowed(hostPatterns, req.url, host)) {
+            ALOG_WARNING("api", "[egress] DENIED " << auditPrefix << " -> "
+                         << (host.empty() ? "<malformed url>" : host) << auditChain
+                         << " (outside package scope)");
+            HttpClient::Response denied;
+            denied.status_code = 0;
+            denied.error = "egress denied: host '" +
+                           (host.empty() ? "<malformed>" : host) +
+                           "' is not in this package's egress allowlist" +
+                           (hop > 0 ? " (redirect target)" : "");
+            return denied;
+        }
+        auditChain += " -> " + host;
+        HttpClient::Request hopReq = req;
+        hopReq.follow_redirects = false;  // every hop is decided HERE, not by curl
+        HttpClient::Response resp = http->Execute(hopReq);
+        const int code = resp.status_code;
+        const bool isRedirect = code == 301 || code == 302 || code == 303 ||
+                                code == 307 || code == 308;
+        if (resp.error.empty() && isRedirect) {
+            std::string loc;
+            for (const auto& [k, v] : resp.headers) {
+                if (k == "Location" || k == "location") { loc = v; break; }
+            }
+            if (loc.empty()) return resp;  // malformed redirect: surface raw
+            const std::string next = ResolveRedirectUrl(req.url, loc);
+            if (next.empty()) return resp;
+            if (hop + 1 > kMaxRedirectHops) {
+                HttpClient::Response looped;
+                looped.status_code = 0;
+                looped.error = "redirect chain exceeded " +
+                               std::to_string(kMaxRedirectHops) + " hops";
+                return looped;
+            }
+            std::string nextHost;
+            EgressAllowed(hostPatterns, next, nextHost);  // parse only; loop re-checks
+            if (!nextHost.empty() && nextHost != host) {
+                // never forward credentials across hosts
+                req.headers.erase("Authorization");
+                req.headers.erase("authorization");
+                req.headers.erase("Proxy-Authorization");
+                req.headers.erase("proxy-authorization");
+                req.headers.erase("Cookie");
+                req.headers.erase("cookie");
+            }
+            if (code == 303 ||
+                ((code == 301 || code == 302) &&
+                 (req.method == "POST" || req.method == "PUT" ||
+                  req.method == "PATCH" || req.method == "DELETE"))) {
+                req.method = "GET";
+                req.body.clear();
+            }
+            req.url = next;
+            continue;
+        }
+        return resp;
+    }
+}
+
 std::string ApiRuntime::MaskSecrets(const std::string& text,
                                     const std::vector<std::string>& secretValues) {
     std::string out = text;
@@ -922,6 +1080,7 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     if (!m_store->EffectiveEnabled(pkg->id, agentId))
         return err("package '" + packageName + "' is not enabled for this agent (api enable " +
                    packageName + ")");
+    const std::vector<std::string> egressScope = ParseEgressHosts(pkg->egress_hosts);
     auto cmd = m_store->GetCommand(pkg->id, commandName);
     if (!cmd) {
         std::string avail;
@@ -1002,10 +1161,29 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
             if (!ierr.empty()) return err(ierr);
             hreq.body = body;
         }
+        // #25 egress gate: the resolved URL's host must be in this package's
+        // scope. Audited loudly — every denial names package, command, host.
+        {
+            std::string egressHost;
+            if (!EgressAllowed(egressScope, url, egressHost)) {
+                ALOG_WARNING("api", "[egress] DENIED " << packageName << ":" << commandName
+                             << " -> " << (egressHost.empty() ? "<malformed url>" : egressHost)
+                             << " (package scope has " << egressScope.size()
+                             << " pattern(s); declare egress_hosts in the manifest)");
+                return err("egress denied: host '" +
+                           (egressHost.empty() ? "<malformed>" : egressHost) +
+                           "' is not in this package's egress allowlist");
+            }
+        }
         ALOG_INFO("api", "[" << packageName << ":" << commandName << "] "
                              << method << " " << MaskSecrets(url, secretValues) << " (body "
                              << hreq.body.size() << " B)");
-        HttpClient::Response resp = m_http->Execute(hreq);
+        // redirects followed under the same scope (#25 audit: per-hop checks)
+        HttpClient::Response resp =
+            ExecuteScoped(m_http, egressScope, hreq,
+                          packageName + ":" + commandName + " (transport)");
+        if (resp.status_code == 0 && resp.error.rfind("egress denied", 0) == 0)
+            return err(resp.error);  // scope violation, not a status the script sees
         request = Json::Value(Json::objectValue);
         request["status"] = resp.status_code;
         Json::Value headers(Json::objectValue);
@@ -1037,6 +1215,8 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     bc.args = args;
     bc.secretValues = secretValues;
     bc.secretKeys = secretKeys;
+    bc.egressHosts = egressScope;
+    bc.runtime = this;
     bc.store = m_store;
     bc.http = m_http;
     bc.filesRoot = m_cfg.filesRoot;

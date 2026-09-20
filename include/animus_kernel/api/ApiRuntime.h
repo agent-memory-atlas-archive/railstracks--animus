@@ -1,5 +1,6 @@
 #pragma once
 
+#include "animus_kernel/tools/HttpClient.h"
 #include <json/json.h>
 
 #include <set>
@@ -38,6 +39,31 @@ public:
 
     ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg,
               SecretsVault* vault = nullptr);
+
+    // #25 egress scope helpers shared by action transport, sandbox secondary
+    // fetches, and connection polls.
+    // Parse the stored egress_hosts JSON array into patterns.
+    static std::vector<std::string> ParseEgressHosts(const std::string& json);
+    // Extract the host of a RESOLVED url and match it against the patterns
+    // (exact, or "*.<domain>" subdomain wildcard). hostOut carries the
+    // extracted host for audit lines. Empty pattern set denies everything.
+    static bool EgressAllowed(const std::vector<std::string>& hostPatterns,
+                              const std::string& resolvedUrl, std::string& hostOut);
+
+    // #25: manual redirect following under the package egress scope. curl's
+    // CURLOPT_FOLLOWLOCATION moves the conversation without re-checking the
+    // package allowlist, so redirects are followed here — every hop passes
+    // EgressAllowed, credentials are dropped on cross-host hops, chains cap
+    // at kMaxRedirectHops. Denied hops return {status 0, egress-denied error}.
+    static constexpr int kMaxRedirectHops = 5;
+    static HttpClient::Response ExecuteScoped(HttpClient* http,
+                                               const std::vector<std::string>& hostPatterns,
+                                               HttpClient::Request req,
+                                               const std::string& auditPrefix);
+    // Resolves a Location header against the request URL. "" when the
+    // location cannot be resolved (caller surfaces the raw redirect).
+    static std::string ResolveRedirectUrl(const std::string& requestUrl,
+                                          const std::string& location);
 
     // Executes an action command for an agent. argsJson must be a JSON
     // object (empty object for no-arg commands). Returns the agent-facing

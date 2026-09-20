@@ -87,6 +87,65 @@ ApiPackageStore::ApiPackageStore(IDataStore* store) : m_store(store) {
     EnsureSchema();
 }
 
+namespace {
+
+// Host-pattern shape: lowercase host possibly with one leading "*." wildcard.
+// No scheme, port, path, userinfo — scope is a DOMAIN, not a URL.
+bool IsValidHostPattern(const std::string& p) {
+    if (p.empty() || p.size() > 253) return false;
+    for (char c : p)
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+              c == '*'))
+            return false;
+    if (p.find('*') != std::string::npos && p.substr(0, 2) != "*.")
+        return false;  // wildcard only as a whole leading label
+    if (p.front() == '.' || p.back() == '.' || p.find("..") != std::string::npos)
+        return false;  // no empty DNS labels (leading/trailing/double dots)
+    return true;
+}
+
+// Extract the host from a (possibly templated) URL after substituting
+// {{state.<key>}} tokens with their schema string defaults. Returns "" when
+// the host is not statically derivable.
+std::string ExtractHostFromTemplate(const std::string& tmpl, const Json::Value& stateSchema) {
+    std::string s = tmpl;
+    if (stateSchema.isObject()) {
+        for (const std::string& k : stateSchema.getMemberNames()) {
+            const Json::Value& def = stateSchema[k];
+            if (!def.isObject() || !def.isMember("default") || !def["default"].isString())
+                continue;
+            const std::string token = "{{state." + k + "}}";
+            size_t pos;
+            while ((pos = s.find(token)) != std::string::npos)
+                s.replace(pos, token.size(), def["default"].asString());
+        }
+    }
+    const size_t sep = s.find("://");
+    if (sep == std::string::npos) return "";
+    size_t hostStart = sep + 3;
+    size_t hostEnd = hostStart;
+    while (hostEnd < s.size() && s[hostEnd] != '/' && s[hostEnd] != '?' && s[hostEnd] != '#')
+        ++hostEnd;
+    std::string host = s.substr(hostStart, hostEnd - hostStart);
+    const size_t at = host.rfind('@');   // strip userinfo if present
+    if (at != std::string::npos) host = host.substr(at + 1);
+    const size_t colon = host.rfind(':'); // strip port (naive; [::1]:80 handled)
+    if (!host.empty() && host[0] != '[' && colon != std::string::npos)
+        host = host.substr(0, colon);
+    if (host.find('{') != std::string::npos || host.find('}') != std::string::npos)
+        return "";  // still templated beyond schema defaults
+    std::transform(host.begin(), host.end(), host.begin(), ::tolower);
+    return IsValidHostPattern(host) ? host : "";
+}
+
+std::string JsonHostArray(const std::vector<std::string>& hosts) {
+    Json::Value arr(Json::arrayValue);
+    for (const auto& h : hosts) arr.append(h);
+    return JsonCompact(arr);
+}
+
+} // namespace
+
 void ApiPackageStore::EnsureSchema() {
     if (!m_store) return;
 
@@ -106,10 +165,18 @@ void ApiPackageStore::EnsureSchema() {
             files_quota_mb INTEGER NOT NULL DEFAULT 256,
             state_schema TEXT NOT NULL DEFAULT '{}',
             state TEXT NOT NULL DEFAULT '{}',
+            egress_hosts TEXT,
             created_at_unix_ms INTEGER NOT NULL,
             updated_at_unix_ms INTEGER NOT NULL
         );
     )");
+
+    // #25 migration: legacy rows keep NULL (the sweep sentinel — an explicit
+    // manifest "egress_hosts": [] must never be confused with a pre-scope
+    // row). See MigrateEgressScopes below for the one-shot backfill pass.
+    if (!schema::ColumnExists(m_store, "api_packages", "egress_hosts"))
+        schema::CreateTable(m_store,
+            "ALTER TABLE api_packages ADD COLUMN egress_hosts TEXT");
 
     schema::CreateTable(m_store, R"(
         CREATE TABLE IF NOT EXISTS api_package_agents (
@@ -153,6 +220,54 @@ void ApiPackageStore::EnsureSchema() {
             UNIQUE (package_id, name)
         );
     )");
+
+    // #25 sweep LAST: it reads api_package_commands/api_package_connections,
+    // so every table it depends on must exist before it runs.
+    MigrateEgressScopes();
+}
+
+void ApiPackageStore::MigrateEgressScopes() {
+    // #25 backfill: rows predating egress scoping have NULL (empty string
+    // here). Deny-by-default would hard-break them on upgrade, so derive each
+    // scope from the STORED rows (commands' request url templates, connection
+    // templates, state_schema defaults) — same derivation as fresh installs.
+    // One-shot by construction: the sweep always writes a value (possibly
+    // '[]' = derived-deny-all), so a row is NULL at most once. A manifest
+    // that explicitly declares "egress_hosts": [] stores '[]' and is NEVER
+    // re-derived — declared deny-all survives restarts.
+    for (const auto& pkg : ListPackages()) {
+        if (!pkg.egress_hosts.empty()) continue;
+        Json::Value stateSchema;
+        std::string schemaErr;
+        ParseJson(pkg.state_schema.empty() ? "{}" : pkg.state_schema, stateSchema, schemaErr);
+        if (!stateSchema.isObject()) stateSchema = Json::Value(Json::objectValue);
+        std::vector<std::string> derived;
+        auto pushUnique = [&](const std::string& url) {
+            const std::string host = ExtractHostFromTemplate(url, stateSchema);
+            if (host.empty()) return;
+            for (const auto& d : derived)
+                if (d == host) return;
+            if (derived.size() < 32) derived.push_back(host);
+        };
+        for (const auto& cmd : ListCommands(pkg.id)) {
+            if (cmd.request.empty()) continue;
+            Json::Value rq;
+            std::string reqErr;
+            ParseJson(cmd.request, rq, reqErr);
+            if (rq.isObject() && rq.isMember("url") && rq["url"].isString())
+                pushUnique(rq["url"].asString());
+        }
+        for (const auto& conn : ListConnections(pkg.id))
+            if (!conn.url_template.empty()) pushUnique(conn.url_template);
+        auto stmt = m_store->Prepare(
+            "UPDATE api_packages SET egress_hosts = ? WHERE id = ?");
+        if (!stmt) continue;
+        stmt->BindText(1, JsonHostArray(derived));
+        stmt->BindText(2, pkg.id);
+        stmt->ExecDML();
+        ALOG_INFO("api", "[egress] derived scope for legacy package '" << pkg.name
+                   << "': " << JsonHostArray(derived));
+    }
 }
 
 int64_t ApiPackageStore::NowUnixMs() {
@@ -185,6 +300,7 @@ ApiPackage RowToPackage(const std::unique_ptr<IStatement>& stmt) {
     p.files_quota_mb = stmt->ColumnInt64(11);
     p.state_schema = stmt->ColumnText(12);
     p.state = stmt->ColumnText(13);
+    p.egress_hosts = stmt->ColumnText(16);
     p.created_at_unix_ms = stmt->ColumnInt64(14);
     p.updated_at_unix_ms = stmt->ColumnInt64(15);
     return p;
@@ -193,7 +309,8 @@ ApiPackage RowToPackage(const std::unique_ptr<IStatement>& stmt) {
 const char* kPackageColumns =
     "id, name, display_name, description, keywords, version, registry_source, "
     "registry_version, locally_modified, enabled, dispatch_cooldown_ms, "
-    "files_quota_mb, state_schema, state, created_at_unix_ms, updated_at_unix_ms";
+    "files_quota_mb, state_schema, state, created_at_unix_ms, updated_at_unix_ms, "
+    "egress_hosts";
 
 ApiPackageCommand RowToCommand(const std::unique_ptr<IStatement>& stmt) {
     ApiPackageCommand c;
@@ -243,8 +360,8 @@ ApiPackage ApiPackageStore::CreatePackage(const ApiPackage& pkg) {
         "INSERT INTO api_packages (id, name, display_name, description, keywords, "
         "version, registry_source, registry_version, locally_modified, enabled, "
         "dispatch_cooldown_ms, files_quota_mb, state_schema, state, "
-        "created_at_unix_ms, updated_at_unix_ms) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        "created_at_unix_ms, updated_at_unix_ms, egress_hosts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!stmt) throw std::runtime_error("api_packages insert prepare failed");
     stmt->BindText(1, id);
     stmt->BindText(2, pkg.name);
@@ -262,6 +379,7 @@ ApiPackage ApiPackageStore::CreatePackage(const ApiPackage& pkg) {
     stmt->BindText(14, pkg.state.empty() ? "{}" : pkg.state);
     stmt->BindInt64(15, now);
     stmt->BindInt64(16, now);
+    stmt->BindText(17, pkg.egress_hosts.empty() ? "[]" : pkg.egress_hosts);
     stmt->ExecDML();
     stmt->Finalize();
 
@@ -305,7 +423,7 @@ bool ApiPackageStore::UpdatePackageMeta(const ApiPackage& pkg) {
         "UPDATE api_packages SET display_name = ?, description = ?, keywords = ?, "
         "version = ?, registry_source = ?, registry_version = ?, locally_modified = ?, "
         "dispatch_cooldown_ms = ?, files_quota_mb = ?, state_schema = ?, "
-        "updated_at_unix_ms = ? WHERE id = ?");
+        "egress_hosts = ?, updated_at_unix_ms = ? WHERE id = ?");
     if (!stmt) return false;
     stmt->BindText(1, pkg.display_name);
     stmt->BindText(2, pkg.description);
@@ -317,8 +435,9 @@ bool ApiPackageStore::UpdatePackageMeta(const ApiPackage& pkg) {
     stmt->BindInt64(8, pkg.dispatch_cooldown_ms);
     stmt->BindInt64(9, pkg.files_quota_mb);
     stmt->BindText(10, pkg.state_schema.empty() ? "{}" : pkg.state_schema);
-    stmt->BindInt64(11, NowUnixMs());
-    stmt->BindText(12, pkg.id);
+    stmt->BindText(11, pkg.egress_hosts.empty() ? "[]" : pkg.egress_hosts);
+    stmt->BindInt64(12, NowUnixMs());
+    stmt->BindText(13, pkg.id);
     stmt->ExecDML();
     stmt->Finalize();
     return true;
@@ -724,6 +843,7 @@ void ApiPackageStore::ValidateName(const std::string& name) {
                                  "files, download, upload, enable, disable, status)");
 }
 
+
 ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
                                                const std::string& registrySource,
                                                const std::string& registryVersion) {
@@ -938,6 +1058,53 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
         }
     }
 
+    // #25 egress scope: declared egress_hosts win; otherwise derive from the
+    // static parts of all url templates ({{state.*}} resolved from schema
+    // string defaults). Deny-by-default at runtime; derivation keeps the
+    // default safe without breaking template-based packages.
+    Json::Value egressArr(Json::arrayValue);
+    bool egressDeclared = m.isMember("egress_hosts");
+    if (egressDeclared) {
+        const Json::Value& eh = m["egress_hosts"];
+        if (!eh.isArray()) {
+            lint.Add("egress_hosts must be an array of host patterns");
+        } else if (eh.size() > 32) {
+            lint.Add("egress_hosts: at most 32 patterns");
+        } else {
+            for (const auto& h : eh) {
+                if (!h.isString() || !IsValidHostPattern(h.asString())) {
+                    lint.Add("egress_hosts: invalid host pattern '" +
+                             (h.isString() ? h.asString() : std::string("<non-string>")) +
+                             "' (lowercase host, optional leading '*.', no scheme/port/path)");
+                    break;
+                }
+            }
+            if (lint.Ok()) egressArr = eh;
+        }
+    }
+    std::vector<std::string> derived;
+    if (!egressDeclared) {
+        auto pushUnique = [&](const std::string& url) {
+            const std::string host = ExtractHostFromTemplate(url, stateSchema);
+            if (host.empty()) return;
+            for (const auto& d : derived)
+                if (d == host) return;
+            if (derived.size() < 32) derived.push_back(host);
+        };
+        if (jcmds.isArray()) {
+            for (const auto& c : jcmds) {
+                const Json::Value& rq = c.get("request", Json::Value(Json::Value::nullSingleton()));
+                if (rq.isObject() && rq.isMember("url") && rq["url"].isString())
+                    pushUnique(rq["url"].asString());
+            }
+        }
+        if (jconns.isArray()) {
+            for (const auto& c : jconns)
+                if (c.isObject() && c.isMember("url_template") && c["url_template"].isString())
+                    pushUnique(c["url_template"].asString());
+        }
+    }
+
     if (!lint.Ok()) lint.Throw("manifest lint failed");
 
     // Upgrade-in-place: same name -> replace commands/connections/meta while
@@ -964,6 +1131,7 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
     pkg.dispatch_cooldown_ms = cooldown;
     pkg.files_quota_mb = quota;
     pkg.state_schema = JsonCompact(stateSchema);
+    pkg.egress_hosts = egressDeclared ? JsonCompact(egressArr) : JsonHostArray(derived);
     if (existing) {
         pkg.id = existing->id;
         pkg.created_at_unix_ms = existing->created_at_unix_ms;

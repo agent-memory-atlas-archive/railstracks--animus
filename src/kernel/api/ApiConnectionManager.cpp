@@ -1,6 +1,7 @@
 #include "animus_kernel/api/ApiConnectionManager.h"
 
 #include "animus_kernel/ApiPackageStore.h"
+#include "animus_kernel/api/ApiRuntime.h"
 #include "animus_kernel/Log.h"
 #include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/tools/HttpClient.h"
@@ -278,10 +279,26 @@ ApiConnectionManager::PollOutcome ApiConnectionManager::PollConnection(
             req.url += (req.url.find('?') == std::string::npos ? "?" : "&") + qs;
     }
 
+    // #25 egress gate: connection polls live under the same package scope.
+    {
+        std::string egressHost;
+        const auto scope = ApiRuntime::ParseEgressHosts(pkg.egress_hosts);
+        if (!ApiRuntime::EgressAllowed(scope, req.url, egressHost)) {
+            ALOG_WARNING("api-conn", "[egress] DENIED " << pkg.name << ":" << conn.name
+                         << " poll -> " << (egressHost.empty() ? "<malformed url>" : egressHost)
+                         << " (outside package scope — declare egress_hosts in the manifest)");
+            o.consecutiveErrors = prevErrors + 1;
+            return o;
+        }
+    }
+
     ALOG_INFO("api-conn", "[" << pkg.name << ":" << conn.name << "] poll GET "
                               << ApiRuntime::MaskSecrets(req.url, secretValues));
 
-    HttpClient::Response resp = m_http->Execute(req);
+    // #25: polls follow redirects under the same per-hop package scope
+    HttpClient::Response resp =
+        ApiRuntime::ExecuteScoped(m_http, ApiRuntime::ParseEgressHosts(pkg.egress_hosts),
+                                  req, pkg.name + ":" + conn.name + " (poll)");
     if (resp.status_code != 200) {
         o.consecutiveErrors = prevErrors + 1;
         ALOG_WARNING("api-conn", "[" << pkg.name << ":" << conn.name << "] poll status "
