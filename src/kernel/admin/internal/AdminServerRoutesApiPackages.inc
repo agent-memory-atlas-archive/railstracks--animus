@@ -28,6 +28,7 @@
             v["registry_version"] = p.registry_version;
             v["locally_modified"] = p.locally_modified;
             v["enabled"] = p.enabled;
+            v["approval_status"] = p.approval_status.empty() ? "pending" : p.approval_status;
             v["keywords"] = p.keywords;
             v["created_at"] = static_cast<Json::Int64>(p.created_at_unix_ms);
             v["updated_at"] = static_cast<Json::Int64>(p.updated_at_unix_ms);
@@ -184,7 +185,10 @@
                 Json::StreamWriterBuilder wb;
                 std::string manifest = Json::writeString(wb, body);
                 try {
-                    ApiPackage pkg = server->m_apiPackageStore->InstallFromManifest(manifest);
+                    // Owner-uploaded manifests are approved at install (the
+                    // owner is present and acting) — agent-side installs are not.
+                    ApiPackage pkg = server->m_apiPackageStore->InstallFromManifest(
+                        manifest, "", "", /*ownerInstalled=*/true);
                     Json::Value out = pkgSummary(pkg);
                     out["installed_disabled"] = true;
                     SendJsonResponse(callback, out);
@@ -216,6 +220,17 @@
                         drogon::k400BadRequest);
                     return;
                 }
+                if (body["enabled"].asBool()) {
+                    auto pkg = server->m_apiPackageStore->GetPackage(id);
+                    if (pkg && pkg->approval_status != "approved") {
+                        SendJsonError(callback,
+                            std::string("package is ") +
+                                (pkg->approval_status == "rejected" ? "rejected" : "pending") +
+                                " — approve it first (POST .../approve)",
+                            drogon::k409Conflict);
+                        return;
+                    }
+                }
                 if (!server->m_apiPackageStore->SetPackageEnabled(id, body["enabled"].asBool())) {
                     SendJsonError(callback, "package not found", drogon::k404NotFound);
                     return;
@@ -225,6 +240,54 @@
                 SendJsonResponse(callback, out);
             },
             {drogon::Put});
+
+        // POST /api/v1/api/packages/{id}/approve  (owner approval, #25)
+        drogon::app().registerHandler(
+            "/api/v1/api/packages/{id}/approve",
+            [](const drogon::HttpRequestPtr& req,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+               const std::string& id) {
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                if (!server->m_apiPackageStore) {
+                    SendJsonError(callback, "api package store not available",
+                        drogon::k503ServiceUnavailable);
+                    return;
+                }
+                if (!server->m_apiPackageStore->ApprovePackage(id)) {
+                    SendJsonError(callback, "package not found", drogon::k404NotFound);
+                    return;
+                }
+                Json::Value out(Json::objectValue);
+                out["ok"] = true;
+                out["approval_status"] = "approved";
+                SendJsonResponse(callback, out);
+            },
+            {drogon::Post});
+
+        // POST /api/v1/api/packages/{id}/reject  (owner rejection, #25)
+        drogon::app().registerHandler(
+            "/api/v1/api/packages/{id}/reject",
+            [](const drogon::HttpRequestPtr& req,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+               const std::string& id) {
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                if (!server->m_apiPackageStore) {
+                    SendJsonError(callback, "api package store not available",
+                        drogon::k503ServiceUnavailable);
+                    return;
+                }
+                if (!server->m_apiPackageStore->RejectPackage(id)) {
+                    SendJsonError(callback, "package not found", drogon::k404NotFound);
+                    return;
+                }
+                Json::Value out(Json::objectValue);
+                out["ok"] = true;
+                out["approval_status"] = "rejected";
+                SendJsonResponse(callback, out);
+            },
+            {drogon::Post});
 
         // PUT /api/v1/api/packages/{id}/state
         drogon::app().registerHandler(
@@ -376,7 +439,8 @@
                     *server->m_apiPackageStore, http,
                     body["registry"].asString(), body["name"].asString(),
                     body.get("version", "").asString(),
-                    body.get("allow_private", false).asBool());
+                    body.get("allow_private", false).asBool(),
+                    /*ownerInstalled=*/true);  // admin route = owner acting
                 if (!result.ok) {
                     SendJsonError(callback, result.err, drogon::k502BadGateway);
                     return;

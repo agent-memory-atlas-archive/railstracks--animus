@@ -35,6 +35,12 @@ struct ApiPackage {
     bool enabled{false};             // install != enable; enabling is explicit
     std::string egress_hosts;        // JSON array of allowed host patterns (#25);
                                      // derived from url templates when undeclared
+    std::string approval_status;     // #25 gate: "pending" | "approved" | "rejected";
+                                     // "" (NULL) = pre-gate row, grandfathered by sweep
+    std::string content_hash;        // SHA256 of the canonical content projection;
+                                     // approval binds to content, not name
+    std::string approved_hash;       // content_hash at approval time; content change
+                                     // resets the package to pending
     int64_t dispatch_cooldown_ms{10000};
     int64_t files_quota_mb{256};     // ctx.fs quota (D12)
     std::string state_schema;        // JSON object: key -> {type, default?, secret?}
@@ -86,6 +92,18 @@ public:
     bool UpdatePackageMeta(const ApiPackage& pkg);
 
     bool SetPackageEnabled(const std::string& id, bool enabled);
+
+    // #25 approval gate. Owner-only transitions (admin surface):
+    // Approve records the package's CURRENT content hash; any later content
+    // change (reinstall with different manifest) returns it to pending.
+    bool ApprovePackage(const std::string& id);
+    bool RejectPackage(const std::string& id);
+
+    // Canonical content fingerprint: same package content -> same hash across
+    // install paths (manifest text order/whitespace do not participate).
+    static std::string ComputeContentHash(const ApiPackage& pkg,
+                                          const std::vector<ApiPackageCommand>& cmds,
+                                          const std::vector<ApiPackageConnection>& conns);
     // Persists a full state object (validation is the sandbox layer's job;
     // the store only checks it parses as a JSON object). Returns false if
     // the package is missing or the payload is not a JSON object.
@@ -122,6 +140,7 @@ public:
     // #25: backfill egress scopes for packages predating the column (derived
     // from stored url templates + state_schema defaults). Idempotent.
     void MigrateEgressScopes();
+    void MigrateApprovalGate();
     std::optional<bool> GetAgentEnablement(const std::string& packageId,
                                            const std::string& agentId) const;  // nullopt = no row
     bool ClearAgentEnablement(const std::string& packageId, const std::string& agentId);
@@ -135,7 +154,8 @@ public:
     // Throws std::runtime_error with a descriptive message on any violation.
     ApiPackage InstallFromManifest(const std::string& manifestJson,
                                    const std::string& registrySource = "",
-                                   const std::string& registryVersion = "");
+                                   const std::string& registryVersion = "",
+                                   bool ownerInstalled = false);
 
     // Validates a package name (slug + reserved words). Throws with a
     // descriptive message. Used by CreatePackage and the api tool.

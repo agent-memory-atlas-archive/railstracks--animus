@@ -95,6 +95,9 @@ int ApiConnectionManager::PollOnce() {
     int n = 0;
     for (const auto& pkg : m_store->ListPackages()) {
         if (!pkg.enabled) continue;
+        // #25: unapproved packages never even poll — approval gates network
+        // activity itself, not just dispatch.
+        if (pkg.approval_status != "approved") continue;
         for (const auto& conn : m_store->ListConnections(pkg.id)) {
             if (!conn.enabled) continue;
             std::string key = pkg.id + ":" + conn.name;
@@ -148,6 +151,9 @@ void ApiConnectionManager::Tick() {
 
     for (const auto& pkg : m_store->ListPackages()) {
         if (!pkg.enabled) continue;
+        // #25: unapproved packages never even poll — approval gates network
+        // activity itself, not just dispatch.
+        if (pkg.approval_status != "approved") continue;
         for (const auto& conn : m_store->ListConnections(pkg.id)) {
             if (!conn.enabled) continue;
 

@@ -174,7 +174,8 @@ RegistryInstallResult InstallFromRegistry(ApiPackageStore& store,
                                            const std::string& registryBase,
                                            const std::string& name,
                                            const std::string& version,
-                                           bool allowPrivate) {
+                                           bool allowPrivate,
+                                           bool ownerInstalled) {
     RegistryInstallResult result;
 
     // 1. Fetch
@@ -236,7 +237,8 @@ RegistryInstallResult InstallFromRegistry(ApiPackageStore& store,
     try {
         result.pkg = store.InstallFromManifest(manifestJson, TrimTrailingSlash(registryBase),
                                                semanticVersion.empty() ? processed.manifest.get("version", "").asString()
-                                                                       : semanticVersion);
+                                                                       : semanticVersion,
+                                               ownerInstalled);
     } catch (const std::exception& e) {
         result.err = std::string("install failed: ") + e.what();
         return result;

@@ -1080,6 +1080,21 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     if (!m_store->EffectiveEnabled(pkg->id, agentId))
         return err("package '" + packageName + "' is not enabled for this agent (api enable " +
                    packageName + ")");
+    // #25 approval gate — the runtime backstop: unapproved packages execute
+    // nothing (actions, hooks, sandbox), regardless of the enable flag. The
+    // admin/tool enable refusals are UX; THIS check is the boundary.
+    if (pkg->approval_status != "approved") {
+        const std::string state = pkg->approval_status == "rejected"
+                                      ? "was rejected by the owner"
+                                      : (pkg->approval_status.empty()
+                                             ? "is awaiting owner approval"
+                                             : "is " + pkg->approval_status +
+                                                   " (awaiting owner approval)");
+        ALOG_WARNING("api", "[approval] DENIED execute " << packageName << ":"
+                     << commandName << " (" << state << ")");
+        return err("package '" + packageName + "' " + state +
+                   " — execution blocked until the owner approves it via the admin API");
+    }
     const std::vector<std::string> egressScope = ParseEgressHosts(pkg->egress_hosts);
     auto cmd = m_store->GetCommand(pkg->id, commandName);
     if (!cmd) {
