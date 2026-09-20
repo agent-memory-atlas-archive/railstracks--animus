@@ -727,6 +727,116 @@ static int TestEgressControl() {
                    pkg2.approval_status == "approved",
                "hash stable across reinstalls of identical content");
     }
+    // 12) #106 audit: post-approval MUTATIONS invalidate; restore re-approves
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);  // owner install -> approved
+        Assert(pkg.approval_status == "approved", "baseline approved");
+        // mutate the command surface via the store API
+        auto cmds = fx.store.ListCommands(pkg.id);
+        for (auto& c : cmds)
+            if (c.name == "echo") c.script = "function run(ctx) return {output='TAMPERED'} end";
+        fx.store.ReplaceCommands(pkg.id, cmds);
+        auto drifted = fx.store.GetPackageByName("testpkg");
+        Assert(drifted->approval_status == "pending", "mutation resets to pending");
+        Json::Value args; args["msg"] = "hi";
+        auto denied = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(!denied["success"].asBool() &&
+                   denied["error"].asString().find("owner approval") != std::string::npos,
+               "mutated content refused at execute");
+        // restore the approved bytes -> auto re-approval
+        std::string manifest = R"({"kind":"api_package","name":"testpkg","version":"0.1.0",
+          "description":"fixture","state_schema":{"token":{"type":"string","secret":true}},
+          "commands":[],"connections":[]})";
+        (void)manifest;
+        auto cmds2 = fx.store.ListCommands(pkg.id);
+        (void)cmds2;
+        // simplest restore path: reinstall the ORIGINAL manifest (agent-side)
+        auto restored = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(restored.approval_status == "approved",
+               "content restored to approved bytes re-approves");
+        auto ok = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(ok["success"].asBool(), "restored content executes");
+        // single-command delete also invalidates
+        auto cmds3 = fx.store.ListCommands(pkg.id);
+        for (const auto& c : cmds3)
+            if (c.name == "post order") { fx.store.DeleteCommand(c.id); break; }
+        auto afterDel = fx.store.GetPackageByName("testpkg");
+        Assert(afterDel->approval_status == "pending", "command delete resets to pending");
+    }
+    // 13) #106 audit: runtime verify catches DIRECT DB tampering
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);
+        Assert(pkg.approval_status == "approved", "approved before tamper");
+        auto cmds = fx.store.ListCommands(pkg.id);
+        std::string cid;
+        for (const auto& c : cmds)
+            if (c.name == "echo") cid = c.id;
+        {
+            auto stmt = fx.db.Prepare("UPDATE api_package_commands SET script = ? WHERE id = ?");
+            Assert(stmt != nullptr, "tamper stmt");
+            stmt->BindText(1, "function run(ctx) return {output='EVIL'} end");
+            stmt->BindText(2, cid);
+            Assert(stmt->ExecDML(), "tamper applied");
+        }
+        Json::Value args; args["msg"] = "hi";
+        auto r = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(!r["success"].asBool() &&
+                   r["error"].asString().find("changed since approval") != std::string::npos,
+               "tampered script refused by runtime verify");
+        auto after = fx.store.GetPackageByName("testpkg");
+        Assert(after->approval_status == "pending", "verify self-healed to pending");
+    }
+    // 14) v2 canonicalization: equivalent content keeps approval
+    {
+        Fixture fx;
+        // order A
+        auto pkg = InstallFixturePkg(fx, "",
+            R"(["api.alpaca.markets", "files.alpaca.markets"])");
+        Assert(pkg.approval_status == "approved", "baseline approved (egress A)");
+        // order B — same set, different order; agent-side reinstall
+        auto re = InstallFixturePkg(fx, "",
+            R"(["files.alpaca.markets", "api.alpaca.markets"])",
+            /*ownerInstalled=*/false);
+        Assert(re.approval_status == "approved",
+               "egress reorder does not re-pend (v2 set canonicalization)");
+    }
+    // 15) v1 -> v2 hash migration: verified rows re-bind, drifted rows pend
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);
+        Assert(pkg.approval_status == "approved" && pkg.hash_algo == "v2", "v2 baseline");
+        // simulate a v1-era row: hashes under the legacy algorithm, algo NULL
+        auto cmds = fx.store.ListCommands(pkg.id);
+        auto conns = fx.store.ListConnections(pkg.id);
+        auto gp = fx.store.GetPackageByName("testpkg");
+        const std::string legacy = fx.store.ComputeContentHashLegacy(*gp, cmds, conns);
+        Assert(legacy != pkg.approved_hash, "legacy hash differs from v2 (sanity)");
+        {
+            auto stmt = fx.db.Prepare(
+                "UPDATE api_packages SET hash_algo = NULL, content_hash = ?, approved_hash = ?");
+            stmt->BindText(1, legacy);
+            stmt->BindText(2, legacy);
+            Assert(stmt->ExecDML(), "row reset to v1 era");
+        }
+        ApiPackageStore store2{&fx.db};  // runs MigrateHashV2
+        auto m = store2.GetPackageByName("testpkg");
+        Assert(m->approval_status == "approved" && m->hash_algo == "v2",
+               "v1-verified row re-bound under v2, still approved");
+        Assert(m->approved_hash == m->content_hash && m->content_hash != legacy,
+               "re-bound hashes are v2");
+        // drifted v1 row: approved_hash matches NEITHER legacy nor v2 -> pending
+        {
+            auto stmt = fx.db.Prepare(
+                "UPDATE api_packages SET hash_algo = NULL, approved_hash = 'deadbeef'");
+            Assert(stmt->ExecDML(), "row drifted");
+        }
+        ApiPackageStore store3{&fx.db};
+        auto d = store3.GetPackageByName("testpkg");
+        Assert(d->approval_status == "pending" && d->hash_algo == "v2",
+               "v1-drifted row reset to pending");
+    }
     // 8) Location resolution semantics (unit)
     {
         Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y", "https://b.test/z") ==

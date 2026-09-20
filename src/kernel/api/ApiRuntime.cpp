@@ -1095,6 +1095,15 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
         return err("package '" + packageName + "' " + state +
                    " — execution blocked until the owner approves it via the admin API");
     }
+    // #106 audit backstop: approval binds to content — independently verify
+    // the stored content still matches approved_hash. Catches any mutation
+    // path that skipped RefreshApproval (including direct DB writes);
+    // mismatches self-heal to pending via RefreshApproval inside.
+    if (!m_store->VerifyApprovalBinding(pkg->id))
+        return err("package '" + packageName +
+                   "' content changed since approval — returned to pending; the owner "
+                   "must re-approve it (or the content must be restored to the "
+                   "approved bytes)");
     const std::vector<std::string> egressScope = ParseEgressHosts(pkg->egress_hosts);
     auto cmd = m_store->GetCommand(pkg->id, commandName);
     if (!cmd) {
