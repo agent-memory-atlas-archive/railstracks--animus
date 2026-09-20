@@ -398,6 +398,19 @@ bool SyncStore::InstallTriggersFor(const std::string& table, std::string* error)
         return false;
     }
 
+    // #93 P3: row identity expression. Single-row-id tables use NEW.id /
+    // OLD.id; composite-key tables (agent_config) use the escaped pair
+    // NEW.agent_id || x'1F' || NEW.key — the outbox row_id stays a single
+    // TEXT value, so the whole (version, outbox, LWW, echo) machinery is
+    // untouched.
+    const bool composite = IsCompositeKeyTable(table);
+    const std::string rowId = composite
+        ? "(NEW.agent_id || char(31) || NEW.key)"
+        : "NEW.id";
+    const std::string rowIdOld = composite
+        ? "(OLD.agent_id || char(31) || OLD.key)"
+        : "OLD.id";
+
     if (m_store->Dialect() == DataStoreDialect::SQLite) {
         // Full-row JSON payload from the live column list.
         std::ostringstream jo;
@@ -419,26 +432,29 @@ bool SyncStore::InstallTriggersFor(const std::string& table, std::string* error)
         // the SELECT to disambiguate the upsert clause (SQLite parser rule).
         const std::string outboxInsert =
             "INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms) "
-            "SELECT " + SqliteStampOrigin(table, "NEW.id") + ", '" + table +
-            "', CAST(NEW.id AS TEXT), 'upsert', " + payload + ", " +
-            SqliteStampMs(table, "NEW.id") + "; ";
+            "SELECT " + SqliteStampOrigin(table, rowId) + ", '" + table +
+            "', CAST(" + rowId + " AS TEXT), 'upsert', " + payload + ", " +
+            SqliteStampMs(table, rowId) + "; ";
         const std::string versionUpsert =
             "INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node) "
-            "SELECT '" + table + "', CAST(NEW.id AS TEXT), "
+            "SELECT '" + table + "', CAST(" + rowId + " AS TEXT), "
             "(SELECT unix_ms FROM sync_outbox WHERE id = last_insert_rowid()), " +
-            SqliteStampOrigin(table, "NEW.id") + " WHERE NEW.id IS NOT NULL "
+            SqliteStampOrigin(table, rowId) + " WHERE " + rowId + " IS NOT NULL "
             "ON CONFLICT (table_name, row_id) DO UPDATE SET "
             "last_ms = excluded.last_ms, last_node = excluded.last_node; ";
         const std::string outboxInsertDel =
             "INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms) "
-            "SELECT " + SqliteStampOrigin(table, "OLD.id") + ", '" + table +
-            "', CAST(OLD.id AS TEXT), 'delete', json_object('id', OLD.id), " +
-            SqliteStampMs(table, "OLD.id") + "; ";
+            "SELECT " + SqliteStampOrigin(table, rowIdOld) + ", '" + table +
+            "', CAST(" + rowIdOld + " AS TEXT), 'delete', " +
+            (composite
+                 ? std::string("json_object('agent_id', OLD.agent_id, 'key', OLD.key)")
+                 : std::string("json_object('id', OLD.id)")) + ", " +
+            SqliteStampMs(table, rowIdOld) + "; ";
         const std::string versionUpsertDel =
             "INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node) "
-            "SELECT '" + table + "', CAST(OLD.id AS TEXT), "
+            "SELECT '" + table + "', CAST(" + rowIdOld + " AS TEXT), "
             "(SELECT unix_ms FROM sync_outbox WHERE id = last_insert_rowid()), " +
-            SqliteStampOrigin(table, "OLD.id") + " WHERE OLD.id IS NOT NULL "
+            SqliteStampOrigin(table, rowIdOld) + " WHERE " + rowIdOld + " IS NOT NULL "
             "ON CONFLICT (table_name, row_id) DO UPDATE SET "
             "last_ms = excluded.last_ms, last_node = excluded.last_node; ";
 
@@ -466,13 +482,16 @@ bool SyncStore::InstallTriggersFor(const std::string& table, std::string* error)
         return true;
     }
 
-    // PostgreSQL
+    // PostgreSQL — the shape argument selects the row-id expression (#93 P3)
+    const std::string shapeArg = composite ? "'pair'" : "'id'";
     if (!m_store->Exec("DROP TRIGGER IF EXISTS sync_" + table + "_ai ON " + table) ||
         !m_store->Exec("CREATE TRIGGER sync_" + table + "_ai AFTER INSERT OR UPDATE ON " +
-                       table + " FOR EACH ROW EXECUTE FUNCTION animus_sync_upsert()") ||
+                       table + " FOR EACH ROW EXECUTE FUNCTION animus_sync_upsert(" +
+                       shapeArg + ")") ||
         !m_store->Exec("DROP TRIGGER IF EXISTS sync_" + table + "_ad ON " + table) ||
         !m_store->Exec("CREATE TRIGGER sync_" + table + "_ad AFTER DELETE ON " +
-                       table + " FOR EACH ROW EXECUTE FUNCTION animus_sync_delete()")) {
+                       table + " FOR EACH ROW EXECUTE FUNCTION animus_sync_delete(" +
+                       shapeArg + ")")) {
         if (error) *error = m_store->ErrMsg();
         return false;
     }
@@ -514,8 +533,13 @@ std::vector<SyncStore::TableDigest> SyncStore::TableDigests() {
         // Table may not exist yet on a partially-initialized database
         // (stores create their tables lazily per subsystem); skip those —
         // a peer comparing digests only heals on tables present on both.
+        // #93 P3: composite-key tables have no single id; max is over the
+        // escaped pair string (a stable total order for divergence probes).
+        const std::string maxExpr = IsCompositeKeyTable(table)
+            ? "COALESCE(MAX(agent_id || char(31) || key), '')"
+            : "COALESCE(MAX(id), 0)";
         auto q1 = m_store->Prepare(
-            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM " + table);
+            "SELECT COUNT(*), " + maxExpr + " FROM " + table);
         if (!q1 || !q1->Step()) continue;  // table absent on this database
         TableDigest d;
         d.table = table;
@@ -597,10 +621,30 @@ bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
     const std::pair<int64_t, int64_t> incoming(rec.unix_ms, rec.origin_node);
     const std::pair<int64_t, int64_t> local(localMs, localNode);
     if (incoming <= local) {
-        ALOG_DEBUG("sync", "skip " << rec.table_name << "/" << rec.row_key
-                   << " — stale/echo (in " << rec.unix_ms << "/" << rec.origin_node
-                   << " vs local " << localMs << "/" << localNode << ")");
-        return false;   // stale, echo, or exact tie — all safe to skip
+        // #93 P3: same-origin tie where the incoming op is a DELETE —
+        // within one origin, a delete of a row always FOLLOWS the last
+        // upsert of that row (writes on the origin are sequential), so a
+        // tie at identical (ms, origin) with op=delete means the delete
+        // landed in the same ms as the upsert. The upsert's echo carries
+        // the same pair and dies here on the origin node (op=upsert ->
+        // plain skip, echo death intact); the delete must win or the row
+        // survives on every peer (witnessed: P2a update+delete in one
+        // batch, same ms — B kept a deleted schedule).
+        // The local-vs-self guard: an echo's pair carries the LOCAL node's
+        // identity (remote applies stamp the origin), so on the true origin
+        // an echo tie has origin == self and skips — echo death intact. On
+        // a PEER, a same-origin tie means "same remote node wrote twice in
+        // one ms and the delete came second" — the delete wins.
+        const bool tieDeleteWins =
+            rec.op == kDelete && incoming == local &&
+            rec.origin_node == localNode && localMs >= 0 &&
+            rec.origin_node != static_cast<int64_t>(m_nodeId);
+        if (!tieDeleteWins) {
+            ALOG_DEBUG("sync", "skip " << rec.table_name << "/" << rec.row_key
+                       << " — stale/echo (in " << rec.unix_ms << "/" << rec.origin_node
+                       << " vs local " << localMs << "/" << localNode << ")");
+            return false;   // stale, echo, or exact tie — all safe to skip
+        }
     }
 
     // Publish apply context so triggers stamp the incoming (ms, origin)
@@ -632,11 +676,17 @@ bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
     }
     if (!ok) ALOG_WARNING("sync", "apply FAILED for " << rec.table_name
                           << "/" << rec.row_key << ": " << applyErr);
-    else if (ok && rec.table_name == "task_runs")
-        // P2b: a task_runs apply can complete a partition double-claim —
-        // run the epoch-fence reconciliation for that window so the loser
-        // row is marked and the violation surfaces (tripwire).
-        FenceTaskRun(rec.payload);
+    else {
+        if (rec.table_name == "task_runs")
+            // P2b: a task_runs apply can complete a partition double-claim —
+            // run the epoch-fence reconciliation for that window so the
+            // loser row is marked and the violation surfaces (tripwire).
+            FenceTaskRun(rec.payload);
+        // #93 P3: notify cache-owning stores — sync writes bypass every
+        // store API, so an in-memory cache (AgentConfigStore) would hide
+        // the replicated change until a reload otherwise.
+        if (m_applyNotifier) m_applyNotifier(rec.table_name, rec.row_key);
+    }
     return ok;
 }
 
@@ -652,6 +702,21 @@ void SyncStore::FenceTaskRun(const std::string& payloadJson) {
 }
 
 bool SyncStore::ApplyDelete(const OutboxRecord& rec) {
+    if (IsCompositeKeyTable(rec.table_name)) {
+        const std::string pairJson = CompositeKeyToJson(rec.row_key);
+        if (pairJson == rec.row_key) return false;  // not a pair string — malformed
+        Json::Value k;
+        Json::CharReaderBuilder rb;
+        std::string errs;
+        std::istringstream ss(pairJson);
+        if (!Json::parseFromStream(rb, ss, &k, &errs)) return false;
+        auto q = m_store->Prepare(
+            "DELETE FROM " + rec.table_name + " WHERE agent_id = ? AND key = ?");
+        if (!q) return false;
+        q->BindText(1, k["agent_id"].asString());
+        q->BindText(2, k["key"].asString());
+        return q->ExecDML();
+    }
     auto q = m_store->Prepare("DELETE FROM " + rec.table_name + " WHERE id = ?");
     if (!q) return false;
     q->BindText(1, rec.row_key);
@@ -668,7 +733,15 @@ bool SyncStore::ApplyUpsert(const OutboxRecord& rec) {
                      << "/" << rec.row_key << ": " << parseErr);
         return false;
     }
-    if (!root.isObject() || !root.isMember("id")) {
+    // #93 P3: composite-key tables carry row identity as the pair columns
+    // in the payload (agent_id + key) — presence check per table shape.
+    const bool composite = IsCompositeKeyTable(rec.table_name);
+    if (composite) {
+        if (!root.isObject() || !root.isMember("agent_id") || !root.isMember("key")) {
+            ALOG_WARNING("sync", "payload missing composite key for " << rec.table_name);
+            return false;
+        }
+    } else if (!root.isObject() || !root.isMember("id")) {
         ALOG_WARNING("sync", "payload missing id for " << rec.table_name);
         return false;
     }
@@ -687,10 +760,12 @@ bool SyncStore::ApplyUpsert(const OutboxRecord& rec) {
         ins << cols[i];
         ph << "?";
     }
-    ins << ") VALUES (" << ph.str() << ") ON CONFLICT (id) DO UPDATE SET ";
+    ins << ") VALUES (" << ph.str() << ") ON CONFLICT "
+        << (composite ? "(agent_id, key)" : "(id)") << " DO UPDATE SET ";
     bool first = true;
     for (const auto& c : cols) {
         if (c == "id") continue;   // conflict key is never updatable (SQLite rejects)
+        if (composite && (c == "agent_id" || c == "key")) continue;  // ditto
         if (!first) upd << ", ";
         first = false;
         upd << c << " = excluded." << c;

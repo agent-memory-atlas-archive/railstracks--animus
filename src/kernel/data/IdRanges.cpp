@@ -1,4 +1,7 @@
 #include "animus_kernel/IdRanges.h"
+
+#include <json/json.h>
+#include <sstream>
 #include "animus_kernel/Log.h"
 
 #include <algorithm>
@@ -28,8 +31,53 @@ const std::vector<std::string>& AgentGlobalTables() {
         // the merged effective lease is derived at read time: max epoch,
         // then max expires_ms, then max id). Integer ids, node-range seeded.
         "schedule_leases",
+        // #93 P3: config replication. agent_config (channel + agent config
+        // kv — COMPOSITE key (agent_id, key), the only non-single-row-id
+        // member; sync row identity is the surrogate pair string
+        // "agent_idkey") and the #23 vault (api_package_secrets —
+        // ciphertext replicates; the master key does NOT — verified-node
+        // key distribution is manual for now, decided on #93).
+        "agent_config",
+        "api_package_secrets",
     };
     return tables;
+}
+
+// ── #93 P3: per-table row identity ─────────────────────────────────────
+// Single-row-id tables use "id" (P1/P2 behavior, unchanged). agent_config
+// is the composite exception: row identity is the escaped pair string
+// agent_id  key (unit separator can't appear in either half).
+const std::vector<std::string>& CompositeKeyTables() {
+    static const std::vector<std::string> tables = {"agent_config"};
+    return tables;
+}
+
+bool IsCompositeKeyTable(const std::string& t) {
+    for (const auto& x : CompositeKeyTables()) if (x == t) return true;
+    return false;
+}
+
+std::string CompositeKeyToJson(const std::string& compositeKey) {
+    const auto pos = compositeKey.find('\x1F');
+    if (pos == std::string::npos) return compositeKey;
+    Json::Value j(Json::objectValue);
+    j["agent_id"] = compositeKey.substr(0, pos);
+    j["key"] = compositeKey.substr(pos + 1);
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    return Json::writeString(wb, j);
+}
+
+std::string JsonToCompositeKey(const std::string& payloadKeyJson) {
+    if (payloadKeyJson.empty() || payloadKeyJson.front() != '{') return payloadKeyJson;
+    Json::CharReaderBuilder rb;
+    std::string errs;
+    Json::Value v;
+    std::istringstream ss(payloadKeyJson);
+    if (!Json::parseFromStream(rb, ss, &v, &errs)) return payloadKeyJson;
+    if (!v.isObject() || !v.isMember("agent_id") || !v.isMember("key"))
+        return payloadKeyJson;
+    return v["agent_id"].asString() + std::string(1, '\x1F') + v["key"].asString();
 }
 
 namespace {

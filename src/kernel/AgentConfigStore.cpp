@@ -94,6 +94,20 @@ std::string AgentConfigStore::Get(const std::string& agentId,
     return raw;
 }
 
+void AgentConfigStore::OnSyncApplied(const std::string& table, const std::string& rowKey) {
+    if (table != "agent_config") return;
+    // rowKey is the escaped composite pair agent_id \x1F key — invalidate
+    // that agent's whole cache slice (simplest correct granularity; the
+    // next Get re-reads from the DB).
+    const auto pos = rowKey.find('\x1F');
+    if (pos == std::string::npos) return;
+    const std::string agentId = rowKey.substr(0, pos);
+    auto it = m_cache.find(agentId);
+    if (it != m_cache.end()) m_cache.erase(it);
+    // NOTE: m_cacheWarmed stays — a warmed-but-empty slice re-reads on Get
+    // (the miss path queries the DB), which is the behavior we want.
+}
+
 bool AgentConfigStore::IsCredentialKey(const std::string& key) {
     static const std::vector<std::string> suffixes = {
         "api_key", "access_token", "bot_token", "app_token", "app_password",

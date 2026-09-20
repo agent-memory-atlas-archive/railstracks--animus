@@ -33,6 +33,11 @@ public:
     // plaintext. Raw row access (GetRaw) bypasses resolution.
     void SetVault(SecretsVault* vault) { m_vault = vault; }
 
+    // #93 P3: replication coherence — the sync layer writes agent_config
+    // rows directly (bypassing this store), so a warmed in-memory cache
+    // would hide replicated changes. Wired to SyncStore's apply notifier.
+    void OnSyncApplied(const std::string& table, const std::string& rowKey);
+
     AgentConfigStore(const AgentConfigStore&) = delete;
     AgentConfigStore& operator=(const AgentConfigStore&) = delete;
 
