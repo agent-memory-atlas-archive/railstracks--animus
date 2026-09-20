@@ -104,8 +104,12 @@ void AgentConfigStore::OnSyncApplied(const std::string& table, const std::string
     const std::string agentId = rowKey.substr(0, pos);
     auto it = m_cache.find(agentId);
     if (it != m_cache.end()) m_cache.erase(it);
-    // NOTE: m_cacheWarmed stays — a warmed-but-empty slice re-reads on Get
-    // (the miss path queries the DB), which is the behavior we want.
+    // #109 audit F2: the warmed flag must go too. GetAll() checks
+    // m_cacheWarmed FIRST and returns the (now erased) empty slice
+    // without ever re-reading the DB — a warmed-but-missing slice served
+    // {} permanently. Drop the flag so the next GetAll reloads from the
+    // DB; GetRaw's miss path is cache-absent -> DB either way.
+    m_cacheWarmed.erase(agentId);
 }
 
 bool AgentConfigStore::IsCredentialKey(const std::string& key) {

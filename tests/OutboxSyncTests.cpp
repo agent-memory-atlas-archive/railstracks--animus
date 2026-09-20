@@ -786,6 +786,11 @@ int TestConfigReplication() {
     a.configStore.Set("default", "channel.telegram-main.type", "telegram");
     a.configStore.Set("default", "channel.telegram-main.config",
                       "{\"bot_token\":\"***\"}");
+    // Distinct-ms guarantee: LWW ties are skipped BY DESIGN (the echo-death
+    // property), and under CPU contention the second Set + this UPDATE can
+    // land in the same millisecond — the update would then skip as a tie
+    // and this test would count 2 records instead of 3. Space the writes.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
     // ...and via direct SQL (paths the store doesn't cover)
     auto upd = a.dataStore.Prepare(
@@ -893,6 +898,40 @@ int TestP3DigestAndHandshake() {
     return 0;
 }
 
+// ── #109 audit F2: cache invalidation must drop the warmed flag ────────
+// A warmed GetAll() caches the slice and sets m_cacheWarmed. A remote
+// apply then invalidates the slice. The pre-fix code erased the slice but
+// KEPT the warmed flag — GetAll took the warmed path and returned {} for
+// the agent forever, hiding every replicated row.
+int TestCacheInvalidationReloads() {
+    std::cerr << "  [P3] remote apply invalidates warmed GetAll cache\n";
+    Node a(1), b(2);
+
+    // Warm b's cache for 'default' (empty at this point).
+    const auto before = b.configStore.GetAll("default");
+    Assert(before.empty(), "b cache warm on empty slice");
+
+    // Replicate two rows from a.
+    a.configStore.Set("default", "channel.t.type", "telegram");
+    a.configStore.Set("default", "channel.t.config", "{\"n\":1}");
+    const int applied = b.PullFrom(a);
+    Assert(applied == 2, "2 config rows applied to b, got " +
+                             std::to_string(applied));
+
+    // The fix under test: warmed-but-invalidated slice must RELOAD, not
+    // return the erased empty map.
+    const auto after = b.configStore.GetAll("default");
+    Assert(after.size() == 2, "GetAll after remote apply sees replicated rows"
+                              " (got " + std::to_string(after.size()) + ")");
+    Assert(after.count("channel.t.type") && after.at("channel.t.type") == "telegram",
+           "reloaded slice carries the replicated value");
+
+    // Single-key reads reload too (GetRaw via cache-absent path).
+    Assert(b.configStore.GetRaw("default", "channel.t.type") == "telegram",
+           "GetRaw sees replicated row after invalidation");
+    return 0;
+}
+
 int main() {
     std::cerr << "\n=== Outbox Sync Tests (#78 P1b) ===\n\n";
     TestTriggerCoverage();
@@ -907,6 +946,7 @@ int main() {
     TestConfigReplication();
     TestSecretsNeverInPayloads();
     TestP3DigestAndHandshake();
+    TestCacheInvalidationReloads();
     if (g_failures == 0) std::cerr << "\nAll outbox sync tests passed.\n";
     else std::cerr << "\n" << g_failures << " test assertion(s) FAILED.\n";
     return g_failures == 0 ? 0 : 1;

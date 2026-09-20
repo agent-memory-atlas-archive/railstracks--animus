@@ -118,16 +118,33 @@ bool SyncStore::EnsureSchema(std::string* error) {
     const bool isPg = m_store->Dialect() == DataStoreDialect::PostgreSQL;
 
     if (isPg) {
-        // Shared stamping functions (one per OLD/NEW shape).
+        // Shared stamping functions. #93 P3: one function per op, with the
+        // row-identity SHAPE passed as a TRIGGER argument and read via
+        // TG_ARGV[0] ('id' = single BIGINT id column; 'pair' = composite
+        // (agent_id, key), escaped to agent_id || chr(31) || key).
+        // NOTE: PG forbids declared arguments on trigger functions
+        // ("trigger functions cannot have declared arguments") — the shape
+        // arrives via TG_ARGV, NOT a function parameter. PR #109 audit F1:
+        // the original zero-arg functions ignored the trigger argument and
+        // unconditionally read NEW.id/OLD.id, so NO triggers installed on PG
+        // ("function animus_sync_upsert(unknown) does not exist").
         m_store->Exec(R"(
 CREATE OR REPLACE FUNCTION animus_sync_upsert() RETURNS trigger AS $$
 DECLARE
     ctl RECORD;
     ms BIGINT;
     origin BIGINT;
+    v_row_id TEXT;
+    shape TEXT;
 BEGIN
+    shape := TG_ARGV[0];
+    IF shape = 'pair' THEN
+        v_row_id := NEW.agent_id || chr(31) || NEW.key;
+    ELSE
+        v_row_id := NEW.id::text;
+    END IF;
     SELECT * INTO ctl FROM sync_control;
-    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = NEW.id::text
+    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = v_row_id
        AND ctl.apply_origin IS NOT NULL THEN
         ms := ctl.apply_ms;
         origin := ctl.apply_origin;
@@ -136,11 +153,11 @@ BEGIN
         origin := ctl.node_id;
     END IF;
     INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node)
-        VALUES (TG_TABLE_NAME, NEW.id::text, ms, origin)
+        VALUES (TG_TABLE_NAME, v_row_id, ms, origin)
         ON CONFLICT (table_name, row_id) DO UPDATE SET
             last_ms = EXCLUDED.last_ms, last_node = EXCLUDED.last_node;
     INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms)
-        VALUES (origin, TG_TABLE_NAME, NEW.id::text, 'upsert', to_jsonb(NEW)::text, ms);
+        VALUES (origin, TG_TABLE_NAME, v_row_id, 'upsert', to_jsonb(NEW)::text, ms);
     RETURN NEW;
 END $$ LANGUAGE plpgsql;)");
         m_store->Exec(R"(
@@ -149,9 +166,17 @@ DECLARE
     ctl RECORD;
     ms BIGINT;
     origin BIGINT;
+    v_row_id TEXT;
+    shape TEXT;
 BEGIN
+    shape := TG_ARGV[0];
+    IF shape = 'pair' THEN
+        v_row_id := OLD.agent_id || chr(31) || OLD.key;
+    ELSE
+        v_row_id := OLD.id::text;
+    END IF;
     SELECT * INTO ctl FROM sync_control;
-    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = OLD.id::text
+    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = v_row_id
        AND ctl.apply_origin IS NOT NULL THEN
         ms := ctl.apply_ms;
         origin := ctl.apply_origin;
@@ -160,12 +185,17 @@ BEGIN
         origin := ctl.node_id;
     END IF;
     INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node)
-        VALUES (TG_TABLE_NAME, OLD.id::text, ms, origin)
+        VALUES (TG_TABLE_NAME, v_row_id, ms, origin)
         ON CONFLICT (table_name, row_id) DO UPDATE SET
             last_ms = EXCLUDED.last_ms, last_node = EXCLUDED.last_node;
+    -- Payload: shape-dependent field access must NOT reference columns of
+    -- the OTHER shape (plpgsql resolves every branch's OLD.<col> against the
+    -- actual table row; an 'id'-shaped table has no agent_id/key column and
+    -- the DELETE aborts). to_jsonb(OLD) is shape-safe: the apply side reads
+    -- agent_id/key for pair rows and id for id rows from the same object.
     INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms)
-        VALUES (origin, TG_TABLE_NAME, OLD.id::text, 'delete',
-                json_build_object('id', OLD.id)::text, ms);
+        VALUES (origin, TG_TABLE_NAME, v_row_id, 'delete',
+                to_jsonb(OLD)::text, ms);
     RETURN OLD;
 END $$ LANGUAGE plpgsql;)");
     }
@@ -404,11 +434,14 @@ bool SyncStore::InstallTriggersFor(const std::string& table, std::string* error)
     // TEXT value, so the whole (version, outbox, LWW, echo) machinery is
     // untouched.
     const bool composite = IsCompositeKeyTable(table);
+    // char(31) is a SQLite function; PG needs chr(31) (char(n) is a TYPE).
+    const std::string sep = m_store->Dialect() == DataStoreDialect::PostgreSQL
+        ? "chr(31)" : "char(31)";
     const std::string rowId = composite
-        ? "(NEW.agent_id || char(31) || NEW.key)"
+        ? "(NEW.agent_id || " + sep + " || NEW.key)"
         : "NEW.id";
     const std::string rowIdOld = composite
-        ? "(OLD.agent_id || char(31) || OLD.key)"
+        ? "(OLD.agent_id || " + sep + " || OLD.key)"
         : "OLD.id";
 
     if (m_store->Dialect() == DataStoreDialect::SQLite) {
@@ -535,8 +568,13 @@ std::vector<SyncStore::TableDigest> SyncStore::TableDigests() {
         // a peer comparing digests only heals on tables present on both.
         // #93 P3: composite-key tables have no single id; max is over the
         // escaped pair string (a stable total order for divergence probes).
+        // char(31) is a SQLite function — PG needs chr(31) (char(n) is a TYPE
+        // there; a silent prepare failure would drop composite tables from
+        // digests entirely on PG).
+        const std::string sep =
+            m_store->Dialect() == DataStoreDialect::PostgreSQL ? "chr(31)" : "char(31)";
         const std::string maxExpr = IsCompositeKeyTable(table)
-            ? "COALESCE(MAX(agent_id || char(31) || key), '')"
+            ? "COALESCE(MAX(agent_id || " + sep + " || key), '')"
             : "COALESCE(MAX(id), 0)";
         auto q1 = m_store->Prepare(
             "SELECT COUNT(*), " + maxExpr + " FROM " + table);
