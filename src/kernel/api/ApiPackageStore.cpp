@@ -14,7 +14,9 @@
 #include <iomanip>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
+#include <atomic>
 #include <stdexcept>
 
 namespace animus::kernel {
@@ -171,6 +173,7 @@ void ApiPackageStore::EnsureSchema() {
             approval_status TEXT,
             content_hash TEXT NOT NULL DEFAULT '',
             approved_hash TEXT NOT NULL DEFAULT '',
+            hash_algo TEXT,
             created_at_unix_ms INTEGER NOT NULL,
             updated_at_unix_ms INTEGER NOT NULL
         );
@@ -194,6 +197,11 @@ void ApiPackageStore::EnsureSchema() {
     if (!schema::ColumnExists(m_store, "api_packages", "approved_hash"))
         schema::CreateTable(m_store,
             "ALTER TABLE api_packages ADD COLUMN approved_hash TEXT NOT NULL DEFAULT ''");
+    // #106 audit: NULL hash_algo = row hashed under v1 (string-embedded
+    // projection). MigrateHashV2 verifies those rows against the v1
+    // algorithm before re-binding under v2; new writes always stamp 'v2'.
+    if (!schema::ColumnExists(m_store, "api_packages", "hash_algo"))
+        schema::CreateTable(m_store, "ALTER TABLE api_packages ADD COLUMN hash_algo TEXT");
 
     schema::CreateTable(m_store, R"(
         CREATE TABLE IF NOT EXISTS api_package_agents (
@@ -242,6 +250,7 @@ void ApiPackageStore::EnsureSchema() {
     // so every table they depend on must exist before they run.
     MigrateEgressScopes();
     MigrateApprovalGate();
+    MigrateHashV2();
 }
 
 void ApiPackageStore::MigrateEgressScopes() {
@@ -301,7 +310,7 @@ void ApiPackageStore::MigrateApprovalGate() {
             ComputeContentHash(pkg, ListCommands(pkg.id), ListConnections(pkg.id));
         auto stmt = m_store->Prepare(
             "UPDATE api_packages SET approval_status = 'approved', content_hash = ?, "
-            "approved_hash = ? WHERE id = ?");
+            "approved_hash = ?, hash_algo = 'v2' WHERE id = ?");
         if (!stmt) continue;
         stmt->BindText(1, hash);
         stmt->BindText(2, hash);
@@ -312,6 +321,144 @@ void ApiPackageStore::MigrateApprovalGate() {
     }
 }
 
+namespace {
+// v2 canonicalization: nested JSON fields are parsed and attached as VALUES
+// (writer has sortKeys=true, so nested objects canonicalize recursively) and
+// set-like arrays are sorted + deduplicated. Equivalent content that differs
+// only in key order / member order / whitespace hashes identically. Fields
+// that fail to parse fall back to the raw string — still deterministic.
+Json::Value CanonicalNested(const std::string& raw, const Json::Value& fallback) {
+    Json::CharReaderBuilder rb;
+    std::string errs;
+    Json::Value parsed;
+    std::istringstream ss(raw.empty() ? (fallback.isString() ? fallback.asString() : "") : raw);
+    if (!raw.empty() && Json::parseFromStream(rb, ss, &parsed, &errs) && parsed.isObject())
+        return parsed;
+    if (!raw.empty() && Json::parseFromStream(rb, ss, &parsed, &errs) && parsed.isArray())
+        return parsed;
+    return fallback;
+}
+Json::Value CanonicalHostSet(const std::string& raw) {
+    Json::Value out(Json::arrayValue);
+    if (raw.empty()) return out;
+    Json::CharReaderBuilder rb;
+    std::string errs;
+    Json::Value parsed;
+    std::istringstream ss(raw);
+    if (!Json::parseFromStream(rb, ss, &parsed, &errs) || !parsed.isArray()) return out;
+    std::set<std::string> hosts;
+    for (const auto& h : parsed) hosts.insert(h.asString());
+    for (const auto& h : hosts) out.append(h);
+    return out;
+}
+}  // namespace
+
+void ApiPackageStore::MigrateHashV2() {
+    // #106 audit: rows hashed under the v1 projection (hash_algo NULL) must
+    // be re-bound under v2 — but ONLY after authenticating them with the v1
+    // algorithm, so a v1-approved package whose content drifted is caught
+    // here instead of silently keeping its approval. Never hard-breaks
+    // unchanged installs (same contract as the egress and approval sweeps).
+    for (const auto& pkg : ListPackages()) {
+        if (pkg.hash_algo == "v2") continue;  // already migrated / new-era row
+        const std::string legacy =
+            ComputeContentHashLegacy(pkg, ListCommands(pkg.id), ListConnections(pkg.id));
+        const std::string v2 =
+            ComputeContentHash(pkg, ListCommands(pkg.id), ListConnections(pkg.id));
+        if (pkg.approval_status == "approved" && pkg.approved_hash == legacy) {
+            auto stmt = m_store->Prepare(
+                "UPDATE api_packages SET approval_status = 'approved', content_hash = ?, "
+                "approved_hash = ?, hash_algo = 'v2' WHERE id = ?");
+            if (!stmt) continue;
+            stmt->BindText(1, v2);
+            stmt->BindText(2, v2);
+            stmt->BindText(3, pkg.id);
+            stmt->ExecDML();
+            ALOG_INFO("api", "[approval] v1->v2 hash re-bind for '" << pkg.name
+                       << "' (content verified under v1)");
+        } else if (pkg.approval_status == "approved") {
+            // v1 hash does not match stored content — drifted before the
+            // audit fix; approval does not carry over.
+            auto stmt = m_store->Prepare(
+                "UPDATE api_packages SET approval_status = 'pending', content_hash = ?, "
+                "approved_hash = '', hash_algo = 'v2' WHERE id = ?");
+            if (!stmt) continue;
+            stmt->BindText(1, v2);
+            stmt->BindText(2, pkg.id);
+            stmt->ExecDML();
+            ALOG_WARNING("api", "[approval] v1 hash mismatch for '" << pkg.name
+                         << "' — reset to pending (content changed under v1 approval)");
+        } else {
+            auto stmt = m_store->Prepare(
+                "UPDATE api_packages SET content_hash = ?, hash_algo = 'v2' WHERE id = ?");
+            if (!stmt) continue;
+            stmt->BindText(1, v2);
+            stmt->BindText(2, pkg.id);
+            stmt->ExecDML();
+        }
+    }
+}
+
+void ApiPackageStore::RefreshApproval(const std::string& packageId, bool ownerActed) {
+    auto pkg = GetPackage(packageId);
+    if (!pkg) return;
+    const std::string h2 =
+        ComputeContentHash(*pkg, ListCommands(packageId), ListConnections(packageId));
+    auto setAll = [&](const char* status, bool keepApproved) {
+        auto stmt = m_store->Prepare(
+            "UPDATE api_packages SET approval_status = ?, content_hash = ?, "
+            "approved_hash = ?, hash_algo = 'v2', updated_at_unix_ms = ? WHERE id = ?");
+        if (!stmt) return;
+        stmt->BindText(1, status);
+        stmt->BindText(2, h2);
+        stmt->BindText(3, keepApproved ? pkg->approved_hash : h2);
+        stmt->BindInt64(4, NowUnixMs());
+        stmt->BindText(5, packageId);
+        stmt->ExecDML();
+    };
+    if (ownerActed) {
+        if (pkg->approval_status != "approved" || pkg->approved_hash != h2 ||
+            pkg->content_hash != h2) {
+            setAll("approved", /*keepApproved=*/false);  // binds h2 to both
+            ALOG_INFO("api", "[approval] owner act approved package '" << pkg->name
+                       << "' (content " << h2.substr(0, 12) << ")");
+        }
+        return;
+    }
+    if (pkg->approval_status == "approved") {
+        if (pkg->approved_hash == h2) {
+            if (pkg->content_hash != h2 || pkg->hash_algo != "v2") setAll("approved", true);
+            return;
+        }
+        // #106 audit: stored content drifted from what was approved — every
+        // security-relevant mutation must land here. approved_hash is KEPT:
+        // restoring the approved bytes re-approves automatically.
+        setAll("pending", /*keepApproved=*/true);
+        ALOG_WARNING("api", "[approval] content of '" << pkg->name
+                     << "' changed since approval — reset to pending (approved hash kept"
+                     << " for auto-restore)");
+        return;
+    }
+    if (pkg->approval_status == "pending" && !pkg->approved_hash.empty() &&
+        pkg->approved_hash == h2) {
+        setAll("approved", true);
+        ALOG_INFO("api", "[approval] '" << pkg->name
+                   << "' content restored to the approved bytes — approval re-established");
+        return;
+    }
+    if (pkg->content_hash != h2 || pkg->hash_algo != "v2") setAll(pkg->approval_status.c_str(), true);
+}
+
+bool ApiPackageStore::VerifyApprovalBinding(const std::string& packageId) {
+    auto pkg = GetPackage(packageId);
+    if (!pkg || pkg->approval_status != "approved") return false;
+    const std::string h2 =
+        ComputeContentHash(*pkg, ListCommands(packageId), ListConnections(packageId));
+    if (pkg->approved_hash == h2) return true;
+    RefreshApproval(packageId);  // downgrade + loud log
+    return false;
+}
+
 std::string ApiPackageStore::ComputeContentHash(const ApiPackage& pkg,
                                                 const std::vector<ApiPackageCommand>& cmds,
                                                 const std::vector<ApiPackageConnection>& conns) {
@@ -320,7 +467,63 @@ std::string ApiPackageStore::ComputeContentHash(const ApiPackage& pkg,
     // scripts/requests, connection templates). Cosmetic fields
     // (display_name, description, keywords) do not participate — changing a
     // description must not force re-approval. Serialized with sorted keys so
-    // manifest key order / whitespace never changes the hash.
+    // manifest key order / whitespace never changes the hash (#106 audit:
+    // v2 canonicalizes set-like and nested-JSON fields too).
+    Json::Value j(Json::objectValue);
+    j["name"] = pkg.name;
+    j["version"] = pkg.version;
+    j["state_schema"] = CanonicalNested(pkg.state_schema.empty() ? "{}" : pkg.state_schema,
+                                        Json::Value(Json::objectValue));
+    j["egress_hosts"] = CanonicalHostSet(pkg.egress_hosts);
+    Json::Value jc(Json::arrayValue);
+    std::vector<ApiPackageCommand> sortedCmds = cmds;
+    std::sort(sortedCmds.begin(), sortedCmds.end(),
+              [](const ApiPackageCommand& a, const ApiPackageCommand& b) {
+                  return a.name < b.name;
+              });
+    for (const auto& c : sortedCmds) {
+        Json::Value o(Json::objectValue);
+        o["name"] = c.name;
+        o["kind"] = c.kind;
+        o["event"] = c.event;
+        o["parameters"] = CanonicalNested(c.parameters.empty() ? "{}" : c.parameters,
+                                          Json::Value(Json::objectValue));
+        o["request"] = c.request;
+        o["script"] = c.script;
+        jc.append(o);
+    }
+    j["commands"] = jc;
+    Json::Value jn(Json::arrayValue);
+    std::vector<ApiPackageConnection> sortedConns = conns;
+    std::sort(sortedConns.begin(), sortedConns.end(),
+              [](const ApiPackageConnection& a, const ApiPackageConnection& b) {
+                  return a.name < b.name;
+              });
+    for (const auto& c : sortedConns) {
+        Json::Value o(Json::objectValue);
+        o["name"] = c.name;
+        o["type"] = c.type;
+        o["url_template"] = c.url_template;
+        o["headers_template"] = CanonicalNested(c.headers_template.empty() ? "{}" : c.headers_template,
+                                                Json::Value(Json::objectValue));
+        o["poll"] = CanonicalNested(c.poll, Json::Value(Json::objectValue));
+        o["hooks"] = CanonicalNested(c.hooks.empty() ? "{}" : c.hooks,
+                                     Json::Value(Json::objectValue));
+        jn.append(o);
+    }
+    j["connections"] = jn;
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    wb["sortKeys"] = true;
+    return crypto::Sha256Hex(Json::writeString(wb, j));
+}
+
+std::string ApiPackageStore::ComputeContentHashLegacy(const ApiPackage& pkg,
+                                                      const std::vector<ApiPackageCommand>& cmds,
+                                                      const std::vector<ApiPackageConnection>& conns) {
+    // v1 projection (as shipped in #106): nested JSON embedded verbatim as
+    // strings, egress_hosts order-sensitive. Do NOT extend — every change
+    // here desynchronizes it from rows approved under v1. Migration only.
     Json::Value j(Json::objectValue);
     j["name"] = pkg.name;
     j["version"] = pkg.version;
@@ -400,6 +603,7 @@ ApiPackage RowToPackage(const std::unique_ptr<IStatement>& stmt) {
     p.approval_status = stmt->ColumnText(17);   // "" = NULL = pre-gate row
     p.content_hash = stmt->ColumnText(18);
     p.approved_hash = stmt->ColumnText(19);
+    p.hash_algo = stmt->ColumnText(20);
     p.created_at_unix_ms = stmt->ColumnInt64(14);
     p.updated_at_unix_ms = stmt->ColumnInt64(15);
     return p;
@@ -409,7 +613,7 @@ const char* kPackageColumns =
     "id, name, display_name, description, keywords, version, registry_source, "
     "registry_version, locally_modified, enabled, dispatch_cooldown_ms, "
     "files_quota_mb, state_schema, state, created_at_unix_ms, updated_at_unix_ms, "
-    "egress_hosts, approval_status, content_hash, approved_hash";
+    "egress_hosts, approval_status, content_hash, approved_hash, hash_algo";
 
 ApiPackageCommand RowToCommand(const std::unique_ptr<IStatement>& stmt) {
     ApiPackageCommand c;
@@ -525,7 +729,7 @@ std::vector<ApiPackage> ApiPackageStore::ListPackages() const {
     return out;
 }
 
-bool ApiPackageStore::UpdatePackageMeta(const ApiPackage& pkg) {
+bool ApiPackageStore::UpdatePackageMeta(const ApiPackage& pkg, bool partOfLargerWrite) {
     if (!GetPackage(pkg.id)) return false;
     auto stmt = m_store->Prepare(
         "UPDATE api_packages SET display_name = ?, description = ?, keywords = ?, "
@@ -552,6 +756,10 @@ bool ApiPackageStore::UpdatePackageMeta(const ApiPackage& pkg) {
     stmt->BindText(16, pkg.id);
     stmt->ExecDML();
     stmt->Finalize();
+    // Meta carries hash-relevant fields (version, state_schema, egress_hosts):
+    // re-arbitrate unless the caller runs a larger write that arbitrates once
+    // at its own end (InstallFromManifest).
+    if (!partOfLargerWrite) RefreshApproval(pkg.id);
     return true;
 }
 
@@ -564,7 +772,7 @@ bool ApiPackageStore::ApprovePackage(const std::string& id) {
         hash = ComputeContentHash(*pkg, ListCommands(id), ListConnections(id));
     auto stmt = m_store->Prepare(
         "UPDATE api_packages SET approval_status = 'approved', content_hash = ?, "
-        "approved_hash = ?, updated_at_unix_ms = ? WHERE id = ?");
+        "approved_hash = ?, hash_algo = 'v2', updated_at_unix_ms = ? WHERE id = ?");
     if (!stmt) return false;
     stmt->BindText(1, hash);
     stmt->BindText(2, hash);
@@ -704,12 +912,22 @@ std::vector<ApiPackageCommand> ApiPackageStore::ListCommands(const std::string& 
 }
 
 bool ApiPackageStore::DeleteCommand(const std::string& id) {
+    std::string pkgId;
+    {
+        auto q = m_store->Prepare("SELECT package_id FROM api_package_commands WHERE id = ?");
+        if (q) {
+            q->BindText(1, id);
+            if (q->Step()) pkgId = q->ColumnText(0);
+        }
+    }
     auto stmt = m_store->Prepare("DELETE FROM api_package_commands WHERE id = ?");
     if (!stmt) return false;
     stmt->BindText(1, id);
     stmt->ExecDML();
     stmt->Finalize();
-    return m_store->Changes() > 0;
+    const bool removed = m_store->Changes() > 0;
+    if (removed && !pkgId.empty()) RefreshApproval(pkgId);  // #106: content changed
+    return removed;
 }
 
 int ApiPackageStore::ReplaceCommands(const std::string& packageId,
@@ -732,6 +950,7 @@ int ApiPackageStore::ReplaceCommands(const std::string& packageId,
             m_store->Rollback();
             throw std::runtime_error("commit failed: " + m_store->ErrMsg());
         }
+        RefreshApproval(packageId);  // #106: batch content change — re-arbitrate
         return inserted;
     } catch (...) {
         m_store->Rollback();
@@ -794,12 +1013,22 @@ std::vector<ApiPackageConnection> ApiPackageStore::ListConnections(
 }
 
 bool ApiPackageStore::DeleteConnection(const std::string& id) {
+    std::string pkgId;
+    {
+        auto q = m_store->Prepare("SELECT package_id FROM api_package_connections WHERE id = ?");
+        if (q) {
+            q->BindText(1, id);
+            if (q->Step()) pkgId = q->ColumnText(0);
+        }
+    }
     auto stmt = m_store->Prepare("DELETE FROM api_package_connections WHERE id = ?");
     if (!stmt) return false;
     stmt->BindText(1, id);
     stmt->ExecDML();
     stmt->Finalize();
-    return m_store->Changes() > 0;
+    const bool removed = m_store->Changes() > 0;
+    if (removed && !pkgId.empty()) RefreshApproval(pkgId);  // #106: content changed
+    return removed;
 }
 
 int ApiPackageStore::ReplaceConnections(const std::string& packageId,
@@ -822,6 +1051,7 @@ int ApiPackageStore::ReplaceConnections(const std::string& packageId,
             m_store->Rollback();
             throw std::runtime_error("commit failed: " + m_store->ErrMsg());
         }
+        RefreshApproval(packageId);  // #106: batch content change — re-arbitrate
         return inserted;
     } catch (...) {
         m_store->Rollback();
@@ -1299,28 +1529,26 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
         pkg.state = "{}";
     }
 
-    // #25 approval gate: approval binds to CONTENT, not the name. An
-    // identical reinstall of already-approved content keeps its approval;
-    // any content change returns the package to pending — unless the owner
-    // performed the install themselves (admin surface), which IS approval.
-    pkg.content_hash = ComputeContentHash(pkg, cmds, conns);
-    const bool sameApprovedContent =
-        existing && existing->approval_status == "approved" &&
-        !existing->approved_hash.empty() &&
-        existing->approved_hash == pkg.content_hash;
-    if (sameApprovedContent || ownerInstalled) {
-        pkg.approval_status = "approved";
-        pkg.approved_hash = pkg.content_hash;
+    // #25/#106 approval gate: approval binds to CONTENT, not the name. The
+    // decision is made ONCE, post-commit, by RefreshApproval from stored
+    // rows (single arbitration point — no pre-txn/DB-truth divergence).
+    // Here we only carry the PRIOR binding forward so the intermediate
+    // writes don't destroy it: identical reinstalls keep approval, changed
+    // content goes back to pending, owner installs are approved by act.
+    if (existing && !existing->approved_hash.empty()) {
+        pkg.approval_status = existing->approval_status;
+        pkg.approved_hash = existing->approved_hash;
     } else {
         pkg.approval_status = "pending";
         pkg.approved_hash = "";
     }
+    pkg.content_hash = "";
 
     m_store->BeginTransaction();
     ApiPackage stored;
     try {
         if (existing) {
-            if (!UpdatePackageMeta(pkg))
+            if (!UpdatePackageMeta(pkg, /*partOfLargerWrite=*/true))
                 throw std::runtime_error("upgrade meta update failed: " + m_store->ErrMsg());
             stored = pkg;
         } else {
@@ -1353,7 +1581,10 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
         m_store->Rollback();
         throw std::runtime_error("commit failed: " + m_store->ErrMsg());
     }
-    return stored;
+    // Single arbitration point (see comment above): decide from stored rows.
+    RefreshApproval(stored.id, ownerInstalled);
+    auto fresh = GetPackage(stored.id);
+    return fresh ? *fresh : stored;
 }
 
 }  // namespace animus::kernel

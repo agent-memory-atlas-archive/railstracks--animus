@@ -41,6 +41,10 @@ struct ApiPackage {
                                      // approval binds to content, not name
     std::string approved_hash;       // content_hash at approval time; content change
                                      // resets the package to pending
+    std::string hash_algo;           // "v2" = canonicalized projection (sorted
+                                     // egress, parsed nested JSON); ""/NULL = v1
+                                     // (string-embedded) — upgrade-verified by
+                                     // MigrateHashV2 before re-binding
     int64_t dispatch_cooldown_ms{10000};
     int64_t files_quota_mb{256};     // ctx.fs quota (D12)
     std::string state_schema;        // JSON object: key -> {type, default?, secret?}
@@ -89,7 +93,9 @@ public:
 
     // Full authored-field update (everything except id/name/enabled/state/
     // timestamps). Returns false if the package does not exist.
-    bool UpdatePackageMeta(const ApiPackage& pkg);
+    // partOfLargerWrite: caller (InstallFromManifest) arbitrates approval
+    // itself at the end of its transaction — skip the per-call refresh.
+    bool UpdatePackageMeta(const ApiPackage& pkg, bool partOfLargerWrite = false);
 
     bool SetPackageEnabled(const std::string& id, bool enabled);
 
@@ -141,6 +147,31 @@ public:
     // from stored url templates + state_schema defaults). Idempotent.
     void MigrateEgressScopes();
     void MigrateApprovalGate();
+    void MigrateHashV2();
+
+    // Single arbitration point for the approval gate: recompute the content
+    // hash from STORED rows and reconcile approval_status with it.
+    //   approved + hash match        -> stays approved
+    //   approved + hash drift        -> pending (approved_hash KEPT so content
+    //                                    restored to the approved bytes
+    //                                    re-approves automatically)
+    //   pending + hash == approved   -> re-approved (content restored)
+    //   otherwise                    -> status kept, content_hash refreshed
+    // ownerActed: the owner performed the write themselves — approval by act.
+    void RefreshApproval(const std::string& packageId, bool ownerActed = false);
+
+    // Runtime/poll backstop (#106 audit): verify an approved package's stored
+    // content still matches approved_hash. On drift, downgrades to pending
+    // (via RefreshApproval) and returns false. Defense in depth against any
+    // mutation path that skips RefreshApproval (including direct DB writes).
+    bool VerifyApprovalBinding(const std::string& packageId);
+
+    // v1 (pre-#106-audit) projection: nested JSON embedded verbatim, egress
+    // order-sensitive. Used ONLY by MigrateHashV2 to authenticate rows that
+    // were approved under v1 before re-binding them under v2.
+    std::string ComputeContentHashLegacy(const ApiPackage& pkg,
+                                         const std::vector<ApiPackageCommand>& cmds,
+                                         const std::vector<ApiPackageConnection>& conns);
     std::optional<bool> GetAgentEnablement(const std::string& packageId,
                                            const std::string& agentId) const;  // nullopt = no row
     bool ClearAgentEnablement(const std::string& packageId, const std::string& agentId);
