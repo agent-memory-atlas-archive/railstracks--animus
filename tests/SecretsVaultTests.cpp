@@ -601,6 +601,111 @@ void TestAgentMigration() {
            "plaintext gone from the raw row");
 }
 
+// ── #108 audit: vault hardening regressions ──────────────────────────────
+
+void TestAuditF1JsonObjectCredentials() {
+    std::cerr << "  [audit-f1] JSON-object credentials are vaulted, not bypassed...\n";
+    std::string dbPath = MakeDbPath();
+    SqliteDataStore db{dbPath};
+    SecretsVault vault{&db, dbPath + ".vault.key"};
+    vault.EnsureSchema();
+    AgentConfigStore config{&db};
+    config.SetVault(&vault);
+
+    // The old '{'-prefix exemption let this through raw
+    config.Set("default", "channels.matrix:home.bot_token",
+               "{\"access_token\":\"syt_plain\",\"device_id\":\"DEV1\"}");
+    std::string raw = config.GetRaw("default", "channels.matrix:home.bot_token");
+    Assert(raw.find("secret_ref") != std::string::npos,
+           "JSON credential stored as ref object");
+    Assert(raw.find("syt_plain") == std::string::npos,
+           "JSON credential plaintext never lands in the row");
+    Assert(config.Get("default", "channels.matrix:home.bot_token")
+               .find("syt_plain") != std::string::npos,
+           "Get returns the serialized JSON credential verbatim");
+
+    // A legit ref object still passes through untouched (no double vault)
+    config.Set("default", "channels.matrix:home.bot_token",
+               "{\"secret_ref\":\"custom_name\"}");
+    Assert(config.GetRaw("default", "channels.matrix:home.bot_token")
+               .find("custom_name") != std::string::npos,
+           "valid ref object passes through on write");
+    Assert(config.GetRaw("default", "channels.matrix:home.bot_token")
+               .find("secret_ref") != std::string::npos,
+           "ref object not re-vaulted");
+}
+
+void TestAuditF2NameCollision() {
+    std::cerr << "  [audit-f2] colliding keys derive distinct vault names...\n";
+    std::string dbPath = MakeDbPath();
+    SqliteDataStore db{dbPath};
+    SecretsVault vault{&db, dbPath + ".vault.key"};
+    vault.EnsureSchema();
+    AgentConfigStore config{&db};
+    config.SetVault(&vault);
+
+    // ':' and '.' both sanitize to '_' — pre-fix these two shared ONE vault
+    // entry; the second Set clobbered the first and BOTH rows resolved to
+    // the wrong credential.
+    config.Set("default", "channels.foo:bar.bot_token", "AAA-first");
+    config.Set("default", "channels.foo.bar.bot_token", "BBB-second");
+    Assert(config.Get("default", "channels.foo:bar.bot_token") == "AAA-first",
+           "colon key resolves to ITS credential");
+    Assert(config.Get("default", "channels.foo.bar.bot_token") == "BBB-second",
+           "dot key resolves to ITS credential");
+    const std::string r1 = config.GetRaw("default", "channels.foo:bar.bot_token");
+    const std::string r2 = config.GetRaw("default", "channels.foo.bar.bot_token");
+    Assert(r1 != r2, "the two rows carry distinct refs");
+}
+
+void TestAuditF3GetAllResolves() {
+    std::cerr << "  [audit-f3] GetAll resolves refs like Get...\n";
+    std::string dbPath = MakeDbPath();
+    SqliteDataStore db{dbPath};
+    SecretsVault vault{&db, dbPath + ".vault.key"};
+    vault.EnsureSchema();
+    AgentConfigStore config{&db};
+    config.SetVault(&vault);
+
+    config.Set("default", "channels.telegram:main.bot_token", "tok-xyz");
+    config.Set("default", "channels.telegram:main.group_id", "42");
+    auto all = config.GetAll("default");
+    Assert(all.count("channels.telegram:main.bot_token") &&
+               all["channels.telegram:main.bot_token"] == "tok-xyz",
+           "GetAll returns the RESOLVED credential");
+    Assert(all.count("channels.telegram:main.group_id") &&
+               all["channels.telegram:main.group_id"] == "42",
+           "non-credential value unchanged through GetAll");
+}
+
+void TestAuditMigrationJsonObject() {
+    std::cerr << "  [audit-mig] migration vaults JSON credentials too...\n";
+    std::string dbPath = MakeDbPath();
+    SqliteDataStore db{dbPath};
+    SecretsVault vault{&db, dbPath + ".vault.key"};
+    vault.EnsureSchema();
+    AgentConfigStore config{&db};
+    config.SetVault(&vault);
+
+    {   // pre-P3a shape: JSON credential sitting raw in the row
+        auto ins = db.Prepare(
+            "INSERT INTO agent_config (agent_id, key, value) VALUES (?, ?, ?)");
+        ins->BindText(1, "default");
+        ins->BindText(2, "channels.slack:work.api_key");
+        ins->BindText(3, "{\"key\":\"sk_live_raw\"}");
+        ins->ExecDML();
+    }
+    std::string err;
+    const int migrated = vault.MigrateAgentConfigSecrets(err);
+    Assert(migrated == 1, "JSON credential migrated, got " + std::to_string(migrated));
+    const std::string raw = config.GetRaw("default", "channels.slack:work.api_key");
+    Assert(raw.find("sk_live_raw") == std::string::npos,
+           "JSON credential plaintext gone from the row");
+    Assert(config.Get("default", "channels.slack:work.api_key")
+               .find("sk_live_raw") != std::string::npos,
+           "migrated JSON credential resolves verbatim");
+}
+
 void TestDisabledVaultPassthrough() {
     std::cerr << "  [disabled-vault] config store without a vault = legacy behavior...\n";
     std::string dbPath = MakeDbPath();
@@ -623,6 +728,10 @@ int main() {
     TestAgentScope();
     TestConfigStoreIntegration();
     TestAgentMigration();
+    TestAuditF1JsonObjectCredentials();
+    TestAuditF2NameCollision();
+    TestAuditF3GetAllResolves();
+    TestAuditMigrationJsonObject();
     TestDisabledVaultPassthrough();
     if (g_failures == 0) {
         std::cerr << "SecretsVault tests: ALL PASSED\n";

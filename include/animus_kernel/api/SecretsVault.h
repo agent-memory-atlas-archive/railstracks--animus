@@ -122,6 +122,15 @@ public:
     // strings; this parses and validates them.
     static bool IsRefValue(const std::string& raw, std::string& name);
 
+    // #108 audit F2: injective key->name derivation for agent-scope vault
+    // entries. Sanitization alone is NOT injective ('channels.a:b' and
+    // 'channels.a.b' both -> 'channels_a_b'), so two distinct config keys
+    // would share one vault entry and silently resolve to the wrong
+    // credential. Derivation: sanitized prefix (<=45 chars, [a-zA-Z0-9_-])
+    // + '_' + 16-hex FNV-1a-64 of the ORIGINAL key. Deterministic across
+    // boots and nodes; collision odds at this scale are negligible.
+    static std::string DeriveAgentSecretName(const std::string& key);
+
     // Convenience for callers holding config JSON: writes the secret into
     // the vault under the agent scope and replaces the value with a ref.
     // Returns false + error on vault misuse (disabled, bad name).

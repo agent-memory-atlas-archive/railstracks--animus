@@ -133,16 +133,17 @@ void AgentConfigStore::Set(const std::string& agentId,
     // (single-box legacy behavior, loud at boot by the migration sweep).
     if (m_vault && !value.empty() && IsCredentialKey(key)) {
         std::string probeName;
-        if (!SecretsVault::IsRefValue(value, probeName) && value.front() != '{') {
-            std::string name;
-            for (char c : key) {
-                if (SecretsVault::IsValidSecretName(std::string(1, c))) name += c;
-                else if (!name.empty() && name.back() != '_') name += '_';
-            }
-            while (!name.empty() && name.back() == '_') name.pop_back();
+        // #108 audit F1: vault EVERYTHING credential-shaped that is not
+        // already a valid ref object. The old '{'-prefix exemption let
+        // {"token":"plaintext"} under bot_token persist raw — and JSON
+        // credentials are legitimate, so they must be vaulted, not rejected.
+        if (!SecretsVault::IsRefValue(value, probeName)) {
+            // #108 audit F2: injective derivation — sanitize alone let
+            // 'channels.foo:bar.bot_token' and 'channels.foo.bar.bot_token'
+            // collide on one vault entry (second write clobbered the first).
+            const std::string name = SecretsVault::DeriveAgentSecretName(key);
             std::string err;
-            if (!name.empty() && name.size() <= 63 &&
-                m_vault->VaultAgentValue(agentId, name, value, err)) {
+            if (m_vault->VaultAgentValue(agentId, name, value, err)) {
                 Json::Value ref(Json::objectValue);
                 ref["secret_ref"] = name;
                 Json::StreamWriterBuilder wb;
@@ -211,12 +212,18 @@ void AgentConfigStore::Delete(const std::string& agentId,
 
 std::unordered_map<std::string, std::string>
 AgentConfigStore::GetAll(const std::string& agentId) const {
+    auto resolveAll = [this, &agentId](std::unordered_map<std::string, std::string> m) {
+        if (m_vault) {
+            for (auto& kv : m) kv.second = m_vault->ResolveAgentValue(agentId, kv.second);
+        }
+        return m;
+    };
     // Return from cache if warmed
     auto warmedIt = m_cacheWarmed.find(agentId);
     if (warmedIt != m_cacheWarmed.end() && warmedIt->second) {
         auto agentIt = m_cache.find(agentId);
         if (agentIt != m_cache.end()) {
-            return agentIt->second;
+            return resolveAll(agentIt->second);
         }
         return {};
     }
@@ -237,10 +244,15 @@ AgentConfigStore::GetAll(const std::string& agentId) const {
 
     std::cerr << "[config-store] GetAll(agentId='" << agentId << "'): " << result.size() << " entries" << std::endl;
 
-    // Cache it
+    // #108 audit F3: bulk reads resolve refs like Get() does — a caller of
+    // the bulk API must never receive a serialized {"secret_ref":...}
+    // object where a credential belongs. The cache stays raw; resolution
+    // happens at the API boundary, exactly like Get()'s GetRaw+resolve.
+
+    // Cache it (raw — resolution happens per-read at the API boundary)
     m_cache[agentId] = result;
     m_cacheWarmed[agentId] = true;
-    return result;
+    return resolveAll(std::move(result));
 }
 
 std::vector<std::string>

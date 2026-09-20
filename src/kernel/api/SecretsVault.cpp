@@ -250,22 +250,16 @@ int SecretsVault::MigrateAgentConfigSecrets(std::string& error) {
         if (!credentialShaped) continue;
         std::string probeName;
         if (IsRefValue(r.value, probeName)) continue;  // already vaulted
-        if (r.value.front() == '{') continue;          // JSON object — not a credential literal
+        // #108 audit F1: the old '{'-prefix exemption let arbitrary JSON
+        // objects ({"token":"plaintext"} under bot_token etc.) stay in the
+        // row unvaulted — and JSON credentials are a LEGITIMATE shape
+        // (service-account keys, provider auth blobs). Rule now: anything
+        // credential-shaped that is not already a valid ref gets vaulted.
         if (!enabled()) {
             error = "vault disabled — refusing to leave credential plaintext in place";
             return -1;
         }
-        std::string name;
-        for (char c : r.key) {
-            if (IsValidSecretName(std::string(1, c))) name += c;
-            else if (!name.empty() && name.back() != '_') name += '_';
-        }
-        while (!name.empty() && name.back() == '_') name.pop_back();
-        if (name.empty() || name.size() > 63) {
-            ALOG_WARNING("api", "[vault] skipping credential key '" << r.key
-                         << "' — cannot derive a valid vault name");
-            continue;
-        }
+        const std::string name = DeriveAgentSecretName(r.key);
         std::string vaultErr;
         if (!VaultAgentValue(r.agentId, name, r.value, vaultErr)) {
             error = "migration of '" + r.key + "' failed: " + vaultErr;
@@ -436,8 +430,34 @@ bool SecretsVault::IsSecretRef(const Json::Value& v, std::string& name) {
     if (!v.isObject() || v.size() != 1 || !v.isMember("secret_ref")) return false;
     const Json::Value& ref = v["secret_ref"];
     if (!ref.isString() || ref.asString().empty()) return false;
+    // #108 audit (minor): a ref with a name the vault could never have
+    // stored is not a ref — reject consistently at the parse boundary so
+    // write interception never "passes through" a malformed object.
+    if (!IsValidSecretName(ref.asString())) return false;
     name = ref.asString();
     return true;
+}
+
+// #108 audit F2 — see header. FNV-1a 64-bit: dependency-free, stable.
+std::string SecretsVault::DeriveAgentSecretName(const std::string& key) {
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : key) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    static const char* hex = "0123456789abcdef";
+    std::string digest;
+    for (int shift = 60; shift >= 0; shift -= 4) digest += hex[(h >> shift) & 0xF];
+    std::string name;
+    for (char c : key) {
+        if (IsValidSecretName(std::string(1, c))) name += c;
+        else if (!name.empty() && name.back() != '_') name += '_';
+        // collapse runs; also a plain '.' or ':' in key position 0
+    }
+    while (!name.empty() && name.back() == '_') name.pop_back();
+    if (name.size() > 45) name.resize(45);
+    if (name.empty()) name = "cred";
+    return name + "_" + digest;
 }
 
 void SecretsVault::ResolveState(const std::string& packageId,
