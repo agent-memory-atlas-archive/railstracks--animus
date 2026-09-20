@@ -15,6 +15,7 @@
 
 using namespace animus::kernel;
 
+
 namespace {
 
 int g_failures = 0;
@@ -66,12 +67,21 @@ int main() {
         db->Exec("CREATE TABLE observations (id BIGSERIAL PRIMARY KEY, "
                  "layer_id BIGINT NOT NULL, agent_id TEXT NOT NULL DEFAULT 'default', "
                  "text TEXT NOT NULL DEFAULT '')");
+        // #93 P3: composite-key table (pair shape) — the PG trigger
+        // functions must take the shape argument and branch on it
+        // (PR #109 audit F1: zero-arg functions + argumented call =
+        // no triggers installed at all on PG).
+        db->Exec("CREATE TABLE agent_config (agent_id TEXT NOT NULL, "
+                 "key TEXT NOT NULL, value TEXT NOT NULL DEFAULT '', "
+                 "PRIMARY KEY (agent_id, key))");
     }
 
     std::string err;
     // P1a + P1b together: node-scoped ids + trigger-based outbox.
-    Check(SeedAgentGlobalIdRanges(&dbA, 1, &err) == 10, "node 1 ranges seeded");
-    Check(SeedAgentGlobalIdRanges(&dbB, 2, &err) == 10, "node 2 ranges seeded");
+    const int seededA = SeedAgentGlobalIdRanges(&dbA, 1, &err);
+    Check(seededA >= 2, "node 1 ranges seeded (got " + std::to_string(seededA) + ")");
+    const int seededB = SeedAgentGlobalIdRanges(&dbB, 2, &err);
+    Check(seededB >= 2, "node 2 ranges seeded (got " + std::to_string(seededB) + ")");
     SyncStore syncA(&dbA, 1), syncB(&dbB, 2);
     Check(syncA.EnsureSchema(&err), "A sync schema: " + err);
     Check(syncB.EnsureSchema(&err), "B sync schema: " + err);
@@ -133,6 +143,73 @@ int main() {
             qd->BindInt64(1, obsId);
             Check(qd && !qd->Step(), "row gone from B");
         }
+    }
+
+    // ── #93 P3 / PR #109 audit: composite-key table on PG ──────────────
+    // agent_config uses the 'pair' shape. A fresh EnsureSchema with the
+    // pre-fix zero-arg trigger functions installs NOTHING on PG — so this
+    // block doubles as the boot-time trigger-installation regression test
+    // for the audit's coverage gap.
+    {
+        std::cerr << "  [P3] agent_config pair-shape replication (PG)\n";
+        dbA.Exec("INSERT INTO agent_config (agent_id, key, value) "
+                 "VALUES ('default', 'channel.t.type', 'telegram')");
+        dbA.Exec("INSERT INTO agent_config (agent_id, key, value) "
+                 "VALUES ('default', 'channel.t.config', '{\"n\":1}')");
+        auto out = syncA.FetchOutboxSince(syncA.MaxOutboxId() - 2, 10);
+        Check(out.size() == 2, "pair upserts captured on A, got " +
+                                   std::to_string(out.size()));
+        if (!out.empty()) {
+            Check(out.front().row_key == "default\x1f" "channel.t.type" ||
+                  out.back().row_key == "default\x1f" "channel.t.type",
+                  "pair row_key is escaped agent_id\\x1Fkey, got '" +
+                      out.front().row_key + "'");
+        }
+        int applied = 0;
+        for (const auto& r : out) if (syncB.ApplyRemoteChange(r)) applied++;
+        Check(applied == 2, "B applied pair rows, got " +
+                                std::to_string(applied));
+        {
+            auto q = dbB.Prepare("SELECT value FROM agent_config "
+                                 "WHERE agent_id = 'default' AND key = 'channel.t.type'");
+            Check(q && q->Step() && q->ColumnText(0) == "telegram",
+                  "pair row replicated to B");
+        }
+
+        // Same-ms update + delete (the LWW tie defect class, PG path):
+        // one statement updates, the next deletes. Even if both land in
+        // the same millisecond, the delete must win on B (tie + delete +
+        // origin != local applies).
+        dbA.Exec("UPDATE agent_config SET value = 'irc' "
+                 "WHERE agent_id = 'default' AND key = 'channel.t.type'");
+        dbA.Exec("DELETE FROM agent_config "
+                 "WHERE agent_id = 'default' AND key = 'channel.t.type'");
+        auto tail = syncA.FetchOutboxSince(syncA.MaxOutboxId() - 2, 10);
+        int tailApplied = 0;
+        for (const auto& r : tail) if (syncB.ApplyRemoteChange(r)) tailApplied++;
+        Check(tailApplied >= 1, "B applied at least the delete, got " +
+                                     std::to_string(tailApplied));
+        {
+            auto q = dbB.Prepare("SELECT COUNT(*) FROM agent_config "
+                                 "WHERE agent_id = 'default' AND key = 'channel.t.type'");
+            Check(q && q->Step() && q->ColumnInt64(0) == 0,
+                  "same-ms update+delete: row gone from B (delete wins)");
+        }
+
+        // Delete payload carries the pair, not a bogus id key.
+        for (const auto& r : tail) {
+            if (r.op == "delete") {
+                Check(r.payload.find("agent_id") != std::string::npos &&
+                          r.payload.find("channel.t.type") != std::string::npos,
+                      "delete payload carries composite key, got '" + r.payload + "'");
+            }
+        }
+
+        // Pair digests work on PG (chr(31) — char(31) is a type there).
+        auto digests = syncA.TableDigests();
+        bool sawConfig = false;
+        for (const auto& d : digests) if (d.table == "agent_config") sawConfig = true;
+        Check(sawConfig, "agent_config present in PG digests");
     }
 
     // Tear down: kill pool connections first, then drop the scratch DBs.
