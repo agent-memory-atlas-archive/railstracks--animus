@@ -8,6 +8,7 @@
 namespace animus::kernel {
 
 class IDataStore;
+class SecretsVault;
 
 // ============================================================================
 // AgentConfigStore — persistent key-value config for Lua agents
@@ -25,6 +26,12 @@ class AgentConfigStore {
 public:
     explicit AgentConfigStore(IDataStore* dataStore);
     ~AgentConfigStore() = default;
+
+    // #93 P3a: vault hook — when set, Get() transparently resolves
+    // {"secret_ref":...} values against the agent scope. Set() intercepts
+    // credential-shaped values and vaults them instead of storing
+    // plaintext. Raw row access (GetRaw) bypasses resolution.
+    void SetVault(SecretsVault* vault) { m_vault = vault; }
 
     AgentConfigStore(const AgentConfigStore&) = delete;
     AgentConfigStore& operator=(const AgentConfigStore&) = delete;
@@ -47,6 +54,14 @@ public:
     /// e.g. DeleteByPrefix("default", "social.") removes all social config.
     void DeleteByPrefix(const std::string& agentId, const std::string& prefix);
 
+    // #93 P3a: raw read WITHOUT secret_ref resolution (replication payloads,
+    // exports, admin surfaces that must see the ref object, not the secret).
+    std::string GetRaw(const std::string& agentId, const std::string& key) const;
+
+    // #93 P3a: does this key name look like a credential (the migration
+    // heuristic, shared so write-side vaulting and boot sweep agree)?
+    static bool IsCredentialKey(const std::string& key);
+
     /// Load all values for an agent from SQLite into the in-memory cache.
     /// Called at startup or when a new agent's state is initialized.
     void WarmCache(const std::string& agentId);
@@ -58,6 +73,7 @@ private:
     void EnsureSchema();
 
     IDataStore* m_store;
+    SecretsVault* m_vault{nullptr};   // #93 P3a: optional secret_ref resolution
 
     // Cache: agent_id → (key → value)
     // Mutable because Get operations are logically const but may need cache access.

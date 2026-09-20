@@ -574,6 +574,20 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         m_adminServer->SetApiPackageStore(m_apiPackageStore);
         m_adminServer->SetLuaScriptDir(m_config.lua_script_dir);
         m_configStore = new AgentConfigStore(m_dataStore);
+        // #93 P3a: the config store resolves/vaults credential-shaped values
+        // through the same vault the api packages use (agent:<id> scope).
+        m_configStore->SetVault(m_secretsVault);
+        {
+            std::string agentMigErr;
+            const int agentMigrated =
+                m_secretsVault->MigrateAgentConfigSecrets(agentMigErr);
+            if (agentMigrated < 0)
+                ALOG_ERROR("api", "[vault] agent credential migration failed: "
+                           << agentMigErr);
+            else if (agentMigrated > 0)
+                ALOG_INFO("api", "[vault] migrated " << agentMigrated
+                           << " agent credential(s) into the vault");
+        }
 
         // Load persisted search config if available
         m_configStore->WarmCache("__kernel__");
