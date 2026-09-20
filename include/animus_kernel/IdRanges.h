@@ -33,6 +33,17 @@ namespace animus::kernel {
 // is excluded; virtual/FTS tables have no sequence.
 const std::vector<std::string>& AgentGlobalTables();
 
+// #93 P3: tables in the synced set whose row identity is NOT a single
+// "id" column (agent_config: composite (agent_id, key)). Sync triggers,
+// apply, and digests branch on this. Escaped row-key = <a> \x1F <b>.
+const std::vector<std::string>& CompositeKeyTables();
+bool IsCompositeKeyTable(const std::string& table);
+
+// Escaped composite row key ("a\x1Fb") -> JSON object {"k1":"a","k2":"b"}
+// (for outbox payloads) and back. Plain values pass through untouched.
+std::string CompositeKeyToJson(const std::string& compositeKey);
+std::string JsonToCompositeKey(const std::string& payloadKeyJson);
+
 // Returns the number of sequences raised, or -1 with *error set on failure
 // (nodeId out of range). Missing tables/sequences are skipped with a debug
 // log, not treated as errors — the store set varies by install state.

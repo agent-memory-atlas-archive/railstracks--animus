@@ -1,6 +1,9 @@
 #include "animus_kernel/SyncStore.h"
 #include "animus_kernel/IdRanges.h"
 #include "animus_kernel/SqliteDataStore.h"
+#include "animus_kernel/AgentConfigStore.h"
+#include "animus_kernel/ApiPackageStore.h"
+#include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/MemoryStore.h"
 #include "animus_kernel/MemoryFileStore.h"
 #include "animus_kernel/OntologyStore.h"
@@ -48,15 +51,26 @@ struct Node {
     ScheduleStore scheduleStore;
     TaskRunStore taskRunStore;
     ScheduleLeaseStore leaseStore;
+    AgentConfigStore configStore;         // #93 P3: agent_config syncs
+    ApiPackageStore pkgStore;             // #93 P3: vault rows sync
+    SecretsVault vault;                   // empty key path = disabled (schema only)
     SyncStore sync;
 
     Node(uint64_t nodeId)
         : dbPath(MakeTempDbPath()), dataStore(dbPath), memory(&dataStore),
           files(&dataStore), ontology(&dataStore), diary(&dataStore),
           scheduleStore(&dataStore), taskRunStore(&dataStore),
-          leaseStore(&dataStore), sync(&dataStore, nodeId) {
+          leaseStore(&dataStore), configStore(&dataStore), pkgStore(&dataStore),
+          vault(&dataStore, ""), sync(&dataStore, nodeId) {
         taskRunStore.EnsureSchema();   // ctor doesn't ensure; schedules does
         leaseStore.EnsureSchema();     // must pre-exist trigger install
+        pkgStore.EnsureSchema();       // vault FK'd tables pre-exist sync too
+        vault.EnsureSchema();         // api_package_secrets table
+        // Kernel parity: remote agent_config applies invalidate the cache.
+        sync.SetApplyNotifier(
+            [this](const std::string& t, const std::string& k) {
+                configStore.OnSyncApplied(t, k);
+            });
         // Kernel parity: node-scoped id ranges so cross-node rows never
         // collide (P2b double-claim test writes on BOTH nodes before pull).
         std::string rangeErr;
@@ -69,12 +83,18 @@ struct Node {
     ~Node() { std::filesystem::remove(dbPath); }
 
     // Pull everything new from `from` and apply it here. Returns applied count.
-    int PullFrom(Node& from) {
+    int PullFrom(Node& from, const char* tag = nullptr) {
         const int64_t cursor = sync.GetPeerCursor(from.sync.LocalNodeId());
         auto records = from.sync.FetchOutboxSince(cursor, 1000);
         int applied = 0;
         for (const auto& r : records) {
-            if (sync.ApplyRemoteChange(r)) applied++;
+            const bool ok = sync.ApplyRemoteChange(r);
+            if (tag)
+                std::cerr << "    [" << tag << "] " << r.table_name
+                          << "/" << r.row_key << " op=" << r.op
+                          << " in=" << r.unix_ms << "/" << r.origin_node
+                          << (ok ? " APPLIED" : " SKIPPED") << "\n";
+            if (ok) applied++;
         }
         sync.SetPeerCursor(from.sync.LocalNodeId(), from.sync.MaxOutboxId());
         return applied;
@@ -166,6 +186,15 @@ int TestTriggerCoverage() {
     a.dataStore.Exec("INSERT INTO task_runs (run_uuid, schedule_id, agent_id, scheduled_for, started_at_unix_ms) "
                      "VALUES ('cov-run', 'cov-sched', 'ag', 'w', 1)");
     a.leaseStore.Acquire("cov-sched", "1", 1, 1, 60000);
+
+    // #93 P3: config + vault tables join the covered set.
+    a.configStore.Set("ag", "coverage.key", "v");
+    {
+        SecretsVault covVault(&a.dataStore, a.dbPath + ".cov.key");
+        covVault.EnsureSchema();
+        std::string cerr_;
+        covVault.Set("cov-pkg", "tok", "secret-value", cerr_);
+    }
 
     auto records = a.sync.FetchOutboxSince(0, 1000);
     Assert(records.size() >= 13, "13+ outbox records, got " +
@@ -476,7 +505,7 @@ int TestSchedulerTableReplication() {
     Assert(sawRun, "outbox captured task_run claim");
 
     // B pulls: both tables converge.
-    const int applied = b.PullFrom(a);
+    const int applied = b.PullFrom(a, "P2a-pull1");
     Assert(applied >= 2, "B applied both rows, got " + std::to_string(applied));
     Assert(b.scheduleStore.Get(schedId).has_value(),
            "B sees the schedule after pull");
@@ -499,7 +528,7 @@ int TestSchedulerTableReplication() {
     Assert(a.scheduleStore.Update(*got, &err), "update: " + err);
     std::string delErr;
     Assert(a.scheduleStore.Delete(schedId, &delErr), "delete: " + delErr);
-    const int applied2 = b.PullFrom(a);
+    const int applied2 = b.PullFrom(a, "P2a-pull2");
     Assert(applied2 >= 2, "update+delete replicated, got " + std::to_string(applied2));
     Assert(!b.scheduleStore.Get(schedId).has_value(),
            "schedule delete converged on B");
@@ -747,6 +776,123 @@ int TestLeaseGateFireLoop() {
     return 0;
 }
 
+// ── #93 P3: config replication — agent_config + vault rows ─────────────
+
+int TestConfigReplication() {
+    std::cerr << "  [P3] agent_config replicates (pair row-key, both ops)\n";
+    Node a(1), b(2);
+
+    // Upsert via the store API — trigger must capture the composite row
+    a.configStore.Set("default", "channel.telegram-main.type", "telegram");
+    a.configStore.Set("default", "channel.telegram-main.config",
+                      "{\"bot_token\":\"***\"}");
+
+    // ...and via direct SQL (paths the store doesn't cover)
+    auto upd = a.dataStore.Prepare(
+        "UPDATE agent_config SET value = 'irc' WHERE agent_id = ? AND key = ?");
+    Assert(upd != nullptr, "direct update prepare");
+    upd->BindText(1, "default");
+    upd->BindText(2, "channel.telegram-main.type");
+    Assert(upd->ExecDML(), "direct update runs");
+
+    const int applied = b.PullFrom(a);
+    // 3 outbox records (2 inserts + 1 update), all apply; 2 rows exist.
+    Assert(applied == 3, "3 config records applied to node b, got " +
+                            std::to_string(applied));
+    Assert(b.configStore.GetRaw("default", "channel.telegram-main.type") == "irc",
+           "composite upsert applied (value updated, not duplicated)");
+    Assert(b.configStore.GetRaw("default", "channel.telegram-main.config")
+               .find("bot_token") != std::string::npos,
+           "pair-sibling row applied");
+    Assert(b.CountRows("agent_config") == 2,
+           "exactly two rows (one per pair), no duplicates");
+
+    // LWW: b writes a newer value; a pulls it back
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    b.configStore.Set("default", "channel.telegram-main.type", "irc-newer");
+    const int back = a.PullFrom(b);
+    Assert(back >= 1, "b->a sync applied");
+    Assert(a.configStore.GetRaw("default", "channel.telegram-main.type") == "irc-newer",
+           "LWW carried b's newer write to a");
+
+    // Delete via prefix delete — every deleted row fences
+    b.configStore.DeleteByPrefix("default", "channel.telegram-main.");
+    a.PullFrom(b);
+    Assert(a.configStore.GetRaw("default", "channel.telegram-main.type").empty(),
+           "delete replicated to a");
+    return 0;
+}
+
+int TestSecretsNeverInPayloads() {
+    std::cerr << "  [P3] vault ciphertext replicates; opened secrets never do\n";
+    Node a(1), b(2);
+
+    // Enabled vault on node a (with key file)
+    std::string keyPath = a.dbPath + ".vault.key";
+    {
+        SecretsVault realVault(&a.dataStore, keyPath);
+        realVault.EnsureSchema();
+        std::string err;
+        Assert(realVault.Set("pkg-1", "bot_token", "SUPER-SECRET-TOKEN-XYZ", err),
+               "vault set on a");
+    }
+    const int applied = b.PullFrom(a);
+    Assert(applied >= 1, "vault row applied to b, got " + std::to_string(applied));
+
+    // The ciphertext row arrived; plaintext never existed on the wire.
+    std::string wire;
+    {
+        auto records = a.sync.FetchOutboxSince(0, 1000);
+        for (const auto& r : records) {
+            wire += r.payload;
+        }
+    }
+    Assert(wire.find("SUPER-SECRET-TOKEN-XYZ") == std::string::npos,
+           "plaintext secret NEVER in any outbox payload");
+    auto has = b.dataStore.Prepare(
+        "SELECT COUNT(*) FROM api_package_secrets WHERE package_id = 'pkg-1'");
+    Assert(has && has->Step() && has->ColumnInt64(0) == 1,
+           "ciphertext row replicated to b");
+
+    // Ref objects (agent_config) carry the ref NAME, never the value
+    std::string raw;
+    {
+        auto upd = a.dataStore.Prepare(
+            "INSERT INTO agent_config (agent_id, key, value) VALUES ('default', "
+            "'channels.t:main.bot_token', '{\"secret_ref\":\"telegram_bot_token\"}')");
+        Assert(upd && upd->ExecDML(), "ref row inserted");
+    }
+    std::string wire2;
+    b.PullFrom(a);
+    {
+        auto records = a.sync.FetchOutboxSince(0, 2000);
+        for (const auto& r : records) wire2 += r.payload;
+    }
+    Assert(wire2.find("SUPER-SECRET-TOKEN-XYZ") == std::string::npos,
+           "opened secret still absent after ref row sync");
+    Assert(wire2.find("secret_ref") != std::string::npos,
+           "ref object carried as ref");
+    return 0;
+}
+
+int TestP3DigestAndHandshake() {
+    std::cerr << "  [P3] digests cover agent_config + vault tables\n";
+    Node a(1);
+    a.configStore.Set("default", "k1", "v1");
+    const auto digests = a.sync.TableDigests();
+    bool sawConfig = false, sawVault = false;
+    for (const auto& d : digests) {
+        if (d.table == "agent_config") sawConfig = true;
+        if (d.table == "api_package_secrets") sawVault = true;
+    }
+    Assert(sawConfig && sawVault, "digests include both P3 tables");
+    const auto tables = a.sync.SyncedTables();
+    bool inSynced = false;
+    for (const auto& t : tables) if (t == "agent_config") inSynced = true;
+    Assert(inSynced, "agent_config reports as synced");
+    return 0;
+}
+
 int main() {
     std::cerr << "\n=== Outbox Sync Tests (#78 P1b) ===\n\n";
     TestTriggerCoverage();
@@ -758,6 +904,9 @@ int main() {
     TestSchedulerTableReplication();
     TestLeaseReplicationAndFencing();
     TestLeaseGateFireLoop();
+    TestConfigReplication();
+    TestSecretsNeverInPayloads();
+    TestP3DigestAndHandshake();
     if (g_failures == 0) std::cerr << "\nAll outbox sync tests passed.\n";
     else std::cerr << "\n" << g_failures << " test assertion(s) FAILED.\n";
     return g_failures == 0 ? 0 : 1;

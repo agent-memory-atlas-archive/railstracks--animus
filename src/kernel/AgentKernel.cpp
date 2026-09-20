@@ -398,6 +398,13 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             taskRunPre.EnsureSchema();   // TaskRunStore ctor does NOT ensure
             ScheduleLeaseStore leasePre(m_dataStore);
             leasePre.EnsureSchema();     // table must pre-exist sync trigger install
+            // #93 P3: agent_config (config store creates it at line ~576,
+            // AFTER trigger install) and api_package_secrets (vault, ~472)
+            // joined the synced set — pre-create both so P3 tables get
+            // triggers on THIS boot, not the next one.
+            AgentConfigStore configPre(m_dataStore);
+            SecretsVault vaultPre(m_dataStore, "");
+            vaultPre.EnsureSchema();     // table only — empty key path = no key file
         }
 
         // --- #78 P1a: node-scoped id ranges (federation identity) ---
@@ -577,6 +584,13 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         // #93 P3a: the config store resolves/vaults credential-shaped values
         // through the same vault the api packages use (agent:<id> scope).
         m_configStore->SetVault(m_secretsVault);
+        // #93 P3: replication coherence — remote agent_config applies
+        // invalidate this store's cache (sync writes bypass the API).
+        if (m_syncStore)
+            m_syncStore->SetApplyNotifier(
+                [this](const std::string& t, const std::string& k) {
+                    m_configStore->OnSyncApplied(t, k);
+                });
         {
             std::string agentMigErr;
             const int agentMigrated =

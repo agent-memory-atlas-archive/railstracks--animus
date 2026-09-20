@@ -23,6 +23,7 @@
 #include "animus_kernel/IDataStore.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,16 @@ public:
     IDataStore* Store() const { return m_store; }
     uint64_t LocalNodeId() const { return m_nodeId; }
 
+    // #93 P3: applied-change notifier — fires after a remote row APPLIES
+    // (stale/echo skips never fire it). Lets cache-owning stores
+    // (AgentConfigStore) invalidate their in-memory view; sync-layer
+    // writes bypass every store API, so without this a warmed cache hides
+    // replicated config changes forever.
+    void SetApplyNotifier(
+        std::function<void(const std::string& table, const std::string& rowKey)> fn) {
+        m_applyNotifier = std::move(fn);
+    }
+
     // Tables triggers were actually installed on (subset of agent-global;
     // missing stores are skipped). Handshake reports this list.
     const std::vector<std::string>& SyncedTables() const { return m_syncedTables; }
@@ -105,6 +116,7 @@ private:
     IDataStore* m_store;
     uint64_t m_nodeId;
     std::vector<std::string> m_syncedTables;
+    std::function<void(const std::string&, const std::string&)> m_applyNotifier;
 };
 
 } // namespace animus::kernel
