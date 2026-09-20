@@ -99,6 +99,8 @@ bool IsValidHostPattern(const std::string& p) {
             return false;
     if (p.find('*') != std::string::npos && p.substr(0, 2) != "*.")
         return false;  // wildcard only as a whole leading label
+    if (p.front() == '.' || p.back() == '.' || p.find("..") != std::string::npos)
+        return false;  // no empty DNS labels (leading/trailing/double dots)
     return true;
 }
 
@@ -163,21 +165,18 @@ void ApiPackageStore::EnsureSchema() {
             files_quota_mb INTEGER NOT NULL DEFAULT 256,
             state_schema TEXT NOT NULL DEFAULT '{}',
             state TEXT NOT NULL DEFAULT '{}',
-            egress_hosts TEXT NOT NULL DEFAULT '[]',
+            egress_hosts TEXT,
             created_at_unix_ms INTEGER NOT NULL,
             updated_at_unix_ms INTEGER NOT NULL
         );
     )");
 
-    // #25 migration: existing installs gain the column (default: open scope is
-    // preserved only for one boot — the migration below re-derives from the
-    // stored manifests' url templates at first touch; here we backfill '[]'
-    // and rely on upgrade sweeps/pacakge updates to fill it. See
-    // MigrateEgressScopes below for the backfill pass.)
+    // #25 migration: legacy rows keep NULL (the sweep sentinel — an explicit
+    // manifest "egress_hosts": [] must never be confused with a pre-scope
+    // row). See MigrateEgressScopes below for the one-shot backfill pass.
     if (!schema::ColumnExists(m_store, "api_packages", "egress_hosts"))
         schema::CreateTable(m_store,
-            "ALTER TABLE api_packages ADD COLUMN egress_hosts TEXT NOT NULL DEFAULT '[]'");
-    MigrateEgressScopes();
+            "ALTER TABLE api_packages ADD COLUMN egress_hosts TEXT");
 
     schema::CreateTable(m_store, R"(
         CREATE TABLE IF NOT EXISTS api_package_agents (
@@ -221,17 +220,23 @@ void ApiPackageStore::EnsureSchema() {
             UNIQUE (package_id, name)
         );
     )");
+
+    // #25 sweep LAST: it reads api_package_commands/api_package_connections,
+    // so every table it depends on must exist before it runs.
+    MigrateEgressScopes();
 }
 
 void ApiPackageStore::MigrateEgressScopes() {
-    // #25 backfill: packages installed before egress scoping have '[]' scopes.
-    // Deny-by-default would hard-break them on upgrade, so derive each scope
-    // from the STORED rows (commands' request url templates, connection
+    // #25 backfill: rows predating egress scoping have NULL (empty string
+    // here). Deny-by-default would hard-break them on upgrade, so derive each
+    // scope from the STORED rows (commands' request url templates, connection
     // templates, state_schema defaults) — same derivation as fresh installs.
-    // Idempotent: packages whose derived scope is empty keep '[]' (correct:
-    // script-only packages deny-all) and are simply re-derived next boot.
+    // One-shot by construction: the sweep always writes a value (possibly
+    // '[]' = derived-deny-all), so a row is NULL at most once. A manifest
+    // that explicitly declares "egress_hosts": [] stores '[]' and is NEVER
+    // re-derived — declared deny-all survives restarts.
     for (const auto& pkg : ListPackages()) {
-        if (pkg.egress_hosts != "[]") continue;
+        if (!pkg.egress_hosts.empty()) continue;
         Json::Value stateSchema;
         std::string schemaErr;
         ParseJson(pkg.state_schema.empty() ? "{}" : pkg.state_schema, stateSchema, schemaErr);
@@ -254,7 +259,6 @@ void ApiPackageStore::MigrateEgressScopes() {
         }
         for (const auto& conn : ListConnections(pkg.id))
             if (!conn.url_template.empty()) pushUnique(conn.url_template);
-        if (derived.empty()) continue;  // nothing derivable: keep deny-all
         auto stmt = m_store->Prepare(
             "UPDATE api_packages SET egress_hosts = ? WHERE id = ?");
         if (!stmt) continue;

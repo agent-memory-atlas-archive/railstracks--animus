@@ -17,6 +17,7 @@
 #include <cassert>
 #include <filesystem>
 #include <cstring>
+#include <map>
 #include <iostream>
 #include <mutex>
 #include <random>
@@ -48,6 +49,7 @@ struct HttpServer {
     std::string lastAuth;
     std::mutex mutex;
     std::atomic<bool> running{false};
+    std::map<std::string, std::string> redirects;  // path -> Location (302)
 
     uint16_t Start() {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -102,6 +104,20 @@ struct HttpServer {
                 }
             }
             hits++;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                const std::string pathOnly =
+                    lastPath.substr(0, lastPath.find('?'));
+                auto rit = redirects.find(pathOnly);
+                if (rit != redirects.end()) {
+                    const std::string resp =
+                        "HTTP/1.1 302 Found\r\nLocation: " + rit->second +
+                        "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    send(c, resp.data(), resp.size(), 0);
+                    close(c);
+                    continue;
+                }
+            }
             std::string body = "{\"ok\":true,\"path\":\"" + lastPath + "\"}";
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                                "Content-Length: " + std::to_string(body.size()) +
@@ -571,14 +587,15 @@ static int TestEgressControl() {
         Assert(ApiRuntime::EgressAllowed(scope, "https://user:pw@api.example.com/x", h),
                "userinfo stripped before match");
     }
-    // 5) legacy sweep: a pre-#25 package ('[]' scope) is re-derived at store
-    //    construction — no hard break on upgrade
+    // 5) legacy sweep: a pre-#25 package (NULL scope) is re-derived at store
+    //    construction — no hard break on upgrade. NULL is the one-shot
+    //    legacy sentinel; the sweep always writes a value afterward.
     {
         Fixture fx;
         InstallFixturePkg(fx);
         {
-            auto stmt = fx.db.Prepare("UPDATE api_packages SET egress_hosts = '[]'");
-            Assert(stmt && stmt->ExecDML(), "scope reset to legacy state");
+            auto stmt = fx.db.Prepare("UPDATE api_packages SET egress_hosts = NULL");
+            Assert(stmt && stmt->ExecDML(), "scope reset to legacy NULL state");
         }
         ApiPackageStore store2{&fx.db};  // EnsureSchema -> MigrateEgressScopes
         auto pkg = store2.GetPackageByName("testpkg");
@@ -586,6 +603,60 @@ static int TestEgressControl() {
                "legacy scope re-derived by migration sweep");
         auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent", Json::Value());
         Assert(r["success"].asBool(), "post-sweep transport admitted");
+        // swept twice: still exactly one derived scope (idempotent, not '[]')
+        ApiPackageStore store3{&fx.db};
+        Assert(store3.GetPackageByName("testpkg")->egress_hosts ==
+                       pkg->egress_hosts,
+               "second sweep is a no-op");
+    }
+    // 6) DECLARED empty scope survives restarts — '[]' is a manifest
+    //    decision (deny-all), never re-derived into an allow scope
+    {
+        Fixture fx;
+        InstallFixturePkg(fx, "", "[]");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                           Json::Value());
+        Assert(!r["success"].asBool(), "declared deny-all denies transport");
+        ApiPackageStore store2{&fx.db};
+        Assert(store2.GetPackageByName("testpkg")->egress_hosts == "[]",
+               "declared '[]' untouched by sweep");
+        auto r2 = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                            Json::Value());
+        Assert(!r2["success"].asBool(), "deny-all still denies after restart");
+    }
+    // 7) redirects: per-hop scope checks (#25 audit round 1)
+    {
+        Fixture fx;
+        fx.server.redirects["/redirect-out"] = "http://evil.example/steal";
+        fx.server.redirects["/redirect-in"] = "/v2/positions";  // relative
+        std::string extra = R"({"name": "hop out", "kind": "action", "description": "d",
+            "request": {"method": "GET", "url": "{{state.base_url}}/redirect-out"},
+            "script": "function run(ctx) local r = ctx.request or {} return {output='status '..tostring(r.status)} end"},
+        {"name": "hop in", "kind": "action", "description": "d",
+            "request": {"method": "GET", "url": "{{state.base_url}}/redirect-in"},
+            "script": "function run(ctx) local r = ctx.request or {} return {output='status '..tostring(r.status)} end"})";
+        InstallFixturePkg(fx, extra);  // scope derives to 127.0.0.1 only
+        auto out = fx.runtime->ExecuteAction("testpkg", "hop out", "agent", Json::Value());
+        Assert(!out["success"].asBool(), "out-of-scope redirect denied");
+        Assert(out["error"].asString().find("evil.example") != std::string::npos &&
+                   out["error"].asString().find("redirect") != std::string::npos,
+               "redirect denial names the target");
+        auto in = fx.runtime->ExecuteAction("testpkg", "hop in", "agent", Json::Value());
+        Assert(in["success"].asBool() && in["output"].asString() == "status 200",
+               "in-scope relative redirect followed to 200");
+    }
+    // 8) Location resolution semantics (unit)
+    {
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y", "https://b.test/z") ==
+                   "https://b.test/z", "absolute location");
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y", "/z") ==
+                   "https://a.test/z", "root-relative location");
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y?q=1", "?p=2") ==
+                   "https://a.test/x/y?p=2", "query-relative location");
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y", "z") ==
+                   "https://a.test/x/z", "path-relative location");
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y", "") == "",
+               "empty location unresolvable");
     }
     return 0;
 }
