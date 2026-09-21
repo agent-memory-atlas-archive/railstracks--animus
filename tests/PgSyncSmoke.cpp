@@ -51,18 +51,24 @@ int main() {
     PgDataStore admin(ParseConn(conn, "postgres"));
     admin.Exec("DROP DATABASE IF EXISTS animus_p1b_a");
     admin.Exec("DROP DATABASE IF EXISTS animus_p1b_b");
+    admin.Exec("DROP DATABASE IF EXISTS animus_p1b_c");
+    admin.Exec("DROP DATABASE IF EXISTS animus_p1b_d");
     if (!admin.Exec("CREATE DATABASE animus_p1b_a") ||
-        !admin.Exec("CREATE DATABASE animus_p1b_b")) {
+        !admin.Exec("CREATE DATABASE animus_p1b_b") ||
+        !admin.Exec("CREATE DATABASE animus_p1b_c") ||
+        !admin.Exec("CREATE DATABASE animus_p1b_d")) {
         std::cerr << "scratch db create failed: " << admin.ErrMsg() << "\n";
         return 2;
     }
 
     PgDataStore dbA(ParseConn(conn, "animus_p1b_a"));
     PgDataStore dbB(ParseConn(conn, "animus_p1b_b"));
+    PgDataStore dbC(ParseConn(conn, "animus_p1b_c"));
+    PgDataStore dbD(ParseConn(conn, "animus_p1b_d"));
 
     // Minimal agent-global tables (BIGSERIAL = post-fix translator output).
     // Missing agent-global tables are skipped by EnsureSchema with a warning.
-    for (auto* db : {&dbA, &dbB}) {
+    for (auto* db : {&dbA, &dbB, &dbC, &dbD}) {
         db->Exec("CREATE TABLE memory_layers (id BIGSERIAL PRIMARY KEY, "
                  "agent_id TEXT NOT NULL DEFAULT 'default', name TEXT NOT NULL, "
                  "horizon TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0)");
@@ -92,9 +98,15 @@ int main() {
     Check(seededA >= 2, "node 1 ranges seeded (got " + std::to_string(seededA) + ")");
     const int seededB = SeedAgentGlobalIdRanges(&dbB, 2, &err);
     Check(seededB >= 2, "node 2 ranges seeded (got " + std::to_string(seededB) + ")");
-    SyncStore syncA(&dbA, 1), syncB(&dbB, 2);
+    const int seededC = SeedAgentGlobalIdRanges(&dbC, 3, &err);
+    Check(seededC >= 2, "node 3 ranges seeded (got " + std::to_string(seededC) + ")");
+    const int seededD = SeedAgentGlobalIdRanges(&dbD, 4, &err);
+    Check(seededD >= 2, "node 4 ranges seeded (got " + std::to_string(seededD) + ")");
+    SyncStore syncA(&dbA, 1), syncB(&dbB, 2), syncC(&dbC, 3), syncD(&dbD, 4);
     Check(syncA.EnsureSchema(&err), "A sync schema: " + err);
     Check(syncB.EnsureSchema(&err), "B sync schema: " + err);
+    Check(syncC.EnsureSchema(&err), "C sync schema: " + err);
+    Check(syncD.EnsureSchema(&err), "D sync schema: " + err);
 
     // Node A writes.
     {
@@ -261,11 +273,125 @@ int main() {
               "B's row still carries a ref, not plaintext");
     }
 
+    // ── #93 wrap-up: N>2 validation + mixed-version grace ───────────────
+    // Acceptance sketch in miniature on live PG, chain topology A→B→C→D:
+    // echo-propagated fan-out, node-kill catch-up, scratch-join, and the
+    // defer-don't-block policy for unknown shapes.
+    {
+        std::cerr << "  [P3-N3] three-node validation\n";
+
+        // Phase 1 — fan-out A→B→C via B's echo (C never pulls A).
+        const int64_t aBefore = syncA.MaxOutboxId();
+        dbA.Exec("INSERT INTO agent_config (agent_id, key, value) "
+                 "VALUES ('default', 'channel.n3.type', 'telegram')");
+        int viaEcho = 0;
+        for (const auto& r : syncA.FetchOutboxSince(aBefore, 10)) {
+            if (syncB.ApplyRemoteChange(r) && r.origin_node == 1) viaEcho++;
+        }
+        Check(viaEcho == 1, "B applied A's fan-out write, got " +
+                                std::to_string(viaEcho));
+        int cGot = 0;
+        for (const auto& r : syncB.FetchOutboxSince(0, 1000)) {
+            if (syncC.ApplyRemoteChange(r) && r.table_name == "agent_config" &&
+                r.row_key.find("channel.n3.type") != std::string::npos) cGot++;
+        }
+        Check(cGot >= 1, "C received A's row via B's echo (chain propagation)");
+        {
+            auto q = dbC.Prepare("SELECT value FROM agent_config "
+                                 "WHERE agent_id='default' AND key='channel.n3.type'");
+            Check(q && q->Step() && std::string(q->ColumnText(0)) == "telegram",
+                  "fan-out row landed on C");
+            if (q) q->Finalize();
+        }
+
+        // Phase 2 — node kill + catch-up from cursor.
+        const int64_t bCursor = syncB.MaxOutboxId();  // B's tail; C consumed up to here
+        // C goes dark; A and B keep working.
+        const int64_t aBefore2 = syncA.MaxOutboxId();
+        dbA.Exec("INSERT INTO agent_config (agent_id, key, value) "
+                 "VALUES ('default', 'channel.n3.after_kill', '1')");
+        for (const auto& r : syncA.FetchOutboxSince(aBefore2, 10))
+            syncB.ApplyRemoteChange(r);
+        {
+            auto q = dbC.Prepare("SELECT COUNT(*) FROM agent_config "
+                                 "WHERE key='channel.n3.after_kill'");
+            long n = -1;
+            if (q && q->Step()) n = q->ColumnInt64(0);
+            Check(n == 0, "dark C misses the write, as it should");
+            if (q) q->Finalize();
+        }
+        int caught = 0;
+        for (const auto& r : syncB.FetchOutboxSince(bCursor, 100))
+            if (syncC.ApplyRemoteChange(r)) caught++;
+        Check(caught >= 1, "returned C caught up from its cursor, got " +
+                               std::to_string(caught));
+        {
+            auto q = dbC.Prepare("SELECT value FROM agent_config "
+                                 "WHERE agent_id='default' AND key='channel.n3.after_kill'");
+            Check(q && q->Step() && std::string(q->ColumnText(0)) == "1",
+                  "missed write replayed on C");
+            if (q) q->Finalize();
+        }
+
+        // Phase 3 — scratch-join: empty node D pulls EVERYTHING from B
+        // (echo carries channels, providers, vault ciphertext).
+        int dApplied = 0, dFailed = 0, dSecrets = 0;
+        for (const auto& r : syncB.FetchOutboxSince(0, 2000)) {
+            if (syncD.ApplyRemoteChange(r)) { dApplied++; if (r.table_name == "api_package_secrets") dSecrets++; }
+            else dFailed++;
+        }
+        Check(dFailed == 0, "scratch D applied everything cleanly, failed=" +
+                                std::to_string(dFailed));
+        Check(dSecrets >= 1, "vault ciphertext reached scratch D");
+        {
+            AgentConfigStore cfgD(&dbD);
+            SecretsVault vaultD(&dbD, "/tmp/animus_pgsmoke_shared.key");
+            vaultD.EnsureSchema();  // same shared key as A/B
+            cfgD.SetVault(&vaultD);
+            Check(cfgD.Get("default", "channel.n3.type") == "telegram",
+                  "scratch D rebuilt channel config from peers");
+            Check(cfgD.Get("__providers", "cfg.zai.api_key") == "sk-pg-live-42",
+                  "scratch D rebuilt provider config + vault secret from peers");
+        }
+
+        // Phase 4 — mixed-version grace: unknown table + unknown column.
+        {
+            std::cerr << "  [P3-mixed] mixed-version grace\n";
+            OutboxRecord future;
+            future.table_name = "future_widgets";   // peer runs a newer schema
+            future.row_key = "42";
+            future.op = "upsert";
+            future.payload = "{\"id\":\"42\",\"name\":\"widget\"}";
+            future.unix_ms = 1;
+            future.origin_node = 9;
+            const bool rejected = !syncC.ApplyRemoteChange(future);
+            Check(rejected, "unknown table rejected by apply");
+            // Sync continues: a known record right after still applies.
+            OutboxRecord known;
+            known.table_name = "agent_config";
+            known.row_key = "default" "\x1f" "channel.mixed";  // native pair format
+            known.op = "upsert";
+            known.payload = "{\"agent_id\":\"default\",\"key\":\"channel.mixed\","
+                            "\"value\":\"ok\",\"future_field\":\"ignored\"}";
+            known.unix_ms = 2;
+            known.origin_node = 9;
+            Check(syncC.ApplyRemoteChange(known),
+                  "known record applies after unknown-table rejection (no poison)");
+            auto qm = dbC.Prepare("SELECT value FROM agent_config "
+                                  "WHERE agent_id='default' AND key='channel.mixed'");
+            Check(qm && qm->Step() && std::string(qm->ColumnText(0)) == "ok",
+                  "extra payload column dropped by column intersection");
+            if (qm) qm->Finalize();
+        }
+    }
+
     // Tear down: kill pool connections first, then drop the scratch DBs.
     admin.Exec("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-               "WHERE datname IN ('animus_p1b_a','animus_p1b_b')");
+               "WHERE datname IN ('animus_p1b_a','animus_p1b_b','animus_p1b_c','animus_p1b_d')");
     admin.Exec("DROP DATABASE IF EXISTS animus_p1b_a");
     admin.Exec("DROP DATABASE IF EXISTS animus_p1b_b");
+    admin.Exec("DROP DATABASE IF EXISTS animus_p1b_c");
+    admin.Exec("DROP DATABASE IF EXISTS animus_p1b_d");
     std::cout << (g_failures ? "PG SYNC SMOKE FAILED\n" : "PG SYNC SMOKE PASSED\n");
     return g_failures ? 1 : 0;
 }
