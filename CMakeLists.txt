@@ -824,6 +824,15 @@ if(ANIMUS_BUILD_TESTS)
     )
     add_test(NAME SecretsVaultTests COMMAND animus_secrets_vault_tests)
 
+    add_executable(animus_provider_store_tests
+      tests/ProviderStoreTests.cpp
+    )
+    target_link_libraries(animus_provider_store_tests PRIVATE animus_kernel)
+    set_target_properties(animus_provider_store_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME ProviderStoreTests COMMAND animus_provider_store_tests)
+
     add_executable(animus_manifest_v1_tests
       tests/ManifestV1Tests.cpp
     )

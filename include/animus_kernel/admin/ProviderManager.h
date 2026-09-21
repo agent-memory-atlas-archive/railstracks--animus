@@ -17,6 +17,8 @@ namespace llm {
 class LLMProviderRegistry;
 }
 
+class AgentConfigStore;
+
 class ProviderManager {
 public:
     void Configure(const KernelConfig::ProviderConfigStorage& storage);
@@ -55,6 +57,45 @@ public:
 
     bool LoadAuthFromDisk(const std::string& providerId, Json::Value* out, std::string* error) const;
     bool SaveAuthToDisk(const std::string& providerId, const Json::Value& auth, std::string* error) const;
+
+    // ── #93 P3 slice 3: store-backed persistence (replicated set) ────────
+    // Provider config persists as agent_config kv rows under the reserved
+    // agent id "__providers" and replicates with the rest of the config
+    // set. Layout: "__default" = default provider id; "cfg.<id>" = config
+    // JSON (no secrets); "cfg.<id>.api_key" = API key (auto-vaulted by the
+    // credential-suffix interception, replicated as a secret_ref with the
+    // ciphertext in api_package_secrets); "cfg.<id>.auth_secret" = the
+    // auth.json blob (vaulted the same way). Runtime state (status,
+    // lastError, lastTested, capabilities) is node-local memory only —
+    // today's file format never persisted it either; health is a per-node
+    // observation and must not become sync chatter.
+    //
+    // Boot: files win ONLY when the store has no provider rows (one-time
+    // import); after that the store is the source of truth and
+    // providers.json/auth.json are legacy inputs, ignored.
+
+    /// Attach the replicated config store; switches persistence to store
+    /// mode (file methods become legacy import inputs only).
+    void ConfigureStore(AgentConfigStore* store);
+    bool UsingStore() const { return m_configStore != nullptr; }
+
+    /// Boot load. Store mode: rebuild from kv rows; on an empty store with
+    /// legacy files present, import them once (config + api keys + auth
+    /// blobs) and persist. File mode: LoadFromDisk.
+    bool LoadProviders(std::string* error);
+
+    /// Persist provider config (routes by mode). Store mode reconciles:
+    /// upserts every provider's rows and deletes orphaned rows.
+    bool SaveProviders(std::string* error) const;
+
+    /// Store-mode auth blob access (routes by mode).
+    bool LoadAuthProvider(const std::string& providerId, Json::Value* out, std::string* error) const;
+    bool SaveAuthProvider(const std::string& providerId, const Json::Value& auth, std::string* error) const;
+
+    /// Sync-apply hook: a remote agent_config apply under "__providers"
+    /// changed provider rows — rebuild the in-memory model (runtime state
+    /// of surviving providers is carried over). No-op in file mode.
+    void ReloadFromStore();
 
     Json::Value BuildProviderJson(const ProviderState& provider, bool maskSecrets = true) const;
     bool ValidateProviderPayload(
@@ -103,6 +144,8 @@ private:
     std::unordered_map<std::string, ProviderState>::iterator
     FindProviderLocked(const std::string& id);
 
+    std::vector<std::string> ListProviderIdsForAuthImport() const;
+
     bool ResolveProviderAuthFilePathLocked(
         const std::string& providerId,
         std::string* authFile,
@@ -120,6 +163,7 @@ private:
     std::uint32_t LookupStaticContextWindow(const std::string& modelId) const;
 
     KernelConfig::ProviderConfigStorage m_providerStorage{};
+    AgentConfigStore* m_configStore{nullptr};   // #93 P3: store mode when set
     std::string m_defaultProvider;
     std::unordered_map<std::string, ProviderState> m_providersByName;
     mutable std::mutex m_providerMutex;

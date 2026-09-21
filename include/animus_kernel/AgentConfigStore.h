@@ -46,6 +46,11 @@ public:
     std::string Get(const std::string& agentId, const std::string& key) const;
     void Set(const std::string& agentId, const std::string& key, const std::string& value);
     void Delete(const std::string& agentId, const std::string& key);
+    /// If `rawValue` is a {"secret_ref":...} object, best-effort delete the
+    /// referenced vault entry — the secret dies with its ref row (PR #112
+    /// audit: deleting rows without cleaning api_package_secrets left
+    /// orphaned ciphertext replicating to every peer).
+    void DeleteVaultEntryIfRef(const std::string& agentId, const std::string& rawValue);
 
     // --- Bulk operations ---
 

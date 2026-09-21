@@ -190,9 +190,28 @@ void AgentConfigStore::Set(const std::string& agentId,
     m_cacheWarmed[agentId] = true;
 }
 
+void AgentConfigStore::DeleteVaultEntryIfRef(const std::string& agentId,
+                                              const std::string& rawValue) {
+    if (!m_vault) return;
+    std::string name;
+    if (SecretsVault::IsRefValue(rawValue, name)) {
+        m_vault->Delete(SecretsVault::AgentScope(agentId), name);  // best-effort
+    }
+}
+
 void AgentConfigStore::Delete(const std::string& agentId,
                                const std::string& key) {
+    // PR #112 audit: a deleted row may be a vault ref — the ciphertext
+    // entry must die with it, or orphaned secrets keep replicating.
     if (m_store) {
+        auto read = m_store->Prepare(
+            "SELECT value FROM agent_config WHERE agent_id = ? AND key = ?");
+        if (read) {
+            read->BindText(1, agentId);
+            read->BindText(2, key);
+            if (read->Step()) DeleteVaultEntryIfRef(agentId, read->ColumnText(0));
+            read->Finalize();
+        }
         auto stmt = m_store->Prepare(
             "DELETE FROM agent_config WHERE agent_id = ? AND key = ?");
         if (stmt) {
@@ -273,6 +292,17 @@ AgentConfigStore::ListKeys(const std::string& agentId) const {
 void AgentConfigStore::DeleteByPrefix(const std::string& agentId,
                                        const std::string& prefix) {
     if (m_store) {
+        // Sweep vault entries of the rows being deleted (best-effort,
+        // before the SQL delete — see Delete()).
+        auto read = m_store->Prepare(
+            "SELECT key, value FROM agent_config WHERE agent_id = ? AND key LIKE ?");
+        if (read) {
+            read->BindText(1, agentId);
+            read->BindText(2, prefix + "%");
+            while (read->Step())
+                DeleteVaultEntryIfRef(agentId, read->ColumnText(1));
+            read->Finalize();
+        }
         auto stmt = m_store->Prepare(
             "DELETE FROM agent_config WHERE agent_id = ? AND key LIKE ?");
         if (stmt) {
