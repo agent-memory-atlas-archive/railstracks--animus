@@ -412,25 +412,49 @@ void DiscordAdapter::SendReply(const ChannelReplyTarget& target, const std::stri
     auto* rt = m_runtime.get();
     std::string channelId = !target.peer_id.empty() ? target.peer_id : target.post_id;
     std::string botToken = GetString(rt->config, "bot_token");
-    if (botToken.empty() || channelId.empty()) return;
+    if (botToken.empty() || channelId.empty()) {
+        if (m_ctx.sendFailure) {
+            m_ctx.sendFailure(target, "no bot token or channel id configured");
+        }
+        return;
+    }
 
-    std::string content = text;
-    if (content.size() > 2000) content = content.substr(0, 1997) + "...";
+    // Per-channel limit override; Discord's hard content cap is 2000 (#30).
+    const int64_t limitCfg = GetInt(rt->config, "max_message_length", 2000);
+    const size_t limit = static_cast<size_t>(limitCfg > 64 ? limitCfg : 2000);
+    const auto chunks = SplitForLimit(text, limit);
 
-    Json::Value body;
-    body["content"] = content;
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        Json::Value body;
+        body["content"] = chunks[i];
 
-    HttpClient::Request req;
-    req.method = "POST";
-    req.url = "https://discord.com/api/v10/channels/" + channelId + "/messages";
-    req.headers["Authorization"] = "Bot " + botToken;
-    req.headers["Content-Type"] = "application/json";
-    req.body = JsonCompact(body);
-    req.follow_redirects = false;
+        HttpClient::Request req;
+        req.method = "POST";
+        req.url = "https://discord.com/api/v10/channels/" + channelId + "/messages";
+        req.headers["Authorization"] = "Bot " + botToken;
+        req.headers["Content-Type"] = "application/json";
+        req.body = JsonCompact(body);
+        req.follow_redirects = false;
 
-    auto resp = m_ctx.httpClient.Execute(req);
-    if (resp.status_code != 200 && resp.status_code != 201) {
-        ALOG_WARNING("discord", "SendReply failed (" << resp.status_code << ")");
+        auto resp = m_ctx.httpClient.Execute(req);
+        if (resp.status_code == 200 || resp.status_code == 201) {
+            ALOG_DEBUG("discord", "Message sent to " << channelId
+                      << (chunks.size() > 1
+                          ? " [" + std::to_string(i + 1) + "/" + std::to_string(chunks.size()) + "]"
+                          : ""));
+        } else {
+            // Loud failure with a witness into the session: the reply did not
+            // land, and the agent must be able to see that (#30).
+            std::string err = "HTTP " + std::to_string(resp.status_code)
+                + ", chunk " + std::to_string(i + 1) + "/" + std::to_string(chunks.size())
+                + " not delivered";
+            ALOG_WARNING("discord", "SendReply failed (" << err << ")");
+            if (m_ctx.sendFailure) {
+                m_ctx.sendFailure(target, err);
+            }
+            // Continue with remaining chunks: partial delivery beats none,
+            // and the failure note carries the chunk detail.
+        }
     }
 }
 

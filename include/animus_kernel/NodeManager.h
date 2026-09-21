@@ -41,6 +41,8 @@ struct NodeToken {
     std::string signing_key;   // plaintext signing key (only shown once at creation)
     std::string signing_key_hash; // stored hash for comparison
     std::string description;
+    std::string user_id;       // #73: owning AuthUser id (empty = unbound —
+                               // operator reassigns via revoke + recreate)
     int64_t created_at_unix_ms{0};
     bool revoked{false};
 };
@@ -61,6 +63,13 @@ public:
         std::string signingKey;
     };
     GeneratedCredentials GenerateCredentials(const std::string& description);
+    // #73: bind a token to the owning user at creation time.
+    GeneratedCredentials GenerateCredentials(const std::string& description,
+                                             const std::string& userId);
+    // #73: bind/unbind an existing token (user reassignment without rotate).
+    bool SetTokenUser(int64_t tokenId, const std::string& userId);
+    // #73: user_id for a raw token ("" when unbound). Lookup by hash.
+    std::string GetUserIdForToken(const std::string& token) const;
     // Validate a token against stored hashes. Returns token ID or -1.
     int64_t ValidateToken(const std::string& token) const;
     // List all tokens (hash only, not plaintext)

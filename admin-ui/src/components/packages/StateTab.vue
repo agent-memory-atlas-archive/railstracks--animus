@@ -9,7 +9,7 @@
           v-model="f.value"
           :label="f.key + (f.secret ? ' 🔒' : '')"
           :type="f.secret && !f.reveal ? 'password' : 'text'"
-          :hint="f.secret ? t('packages.secretHint') : (f.default ? 'default: ' + f.default : '')"
+          :hint="f.secret ? secretHint(f) : (f.default ? 'default: ' + f.default : '')"
           persistent-hint
           density="comfortable"
           :append-inner-icon="f.secret ? (f.reveal ? 'mdi-eye-off' : 'mdi-eye') : undefined"
@@ -40,10 +40,20 @@ interface StateField {
   secret: boolean;
   default: string | null;
   reveal: boolean;
+  vaultSet: boolean;
+  vaultRef: string | null;
 }
 
 const fields = ref<StateField[]>([]);
 const saving = ref(false);
+
+function secretHint(f: StateField): string {
+  const status = f.vaultSet
+    ? t('packages.secretVaultSet')
+    : t('packages.secretVaultUnset');
+  const ref = f.vaultRef ? ` · ${t('packages.secretVaultRef', { name: f.vaultRef })}` : '';
+  return `${status}${ref} — ${t('packages.secretHint')}`;
+}
 
 function build() {
   const out: StateField[] = [];
@@ -54,6 +64,7 @@ function build() {
     const def = schema[key] || {};
     const isSecret = !!def.secret;
     const current = state[key];
+    const sec = props.detail.secrets?.[key];
     out.push({
       key,
       // Secrets come back masked ("***") — start empty, not with the mask
@@ -61,6 +72,8 @@ function build() {
       secret: isSecret,
       default: def.default ?? null,
       reveal: false,
+      vaultSet: isSecret ? !!sec?.set : false,
+      vaultRef: sec?.ref ?? null,
     });
   }
   fields.value = out;

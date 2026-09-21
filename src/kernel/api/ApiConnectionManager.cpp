@@ -1,7 +1,9 @@
 #include "animus_kernel/api/ApiConnectionManager.h"
 
 #include "animus_kernel/ApiPackageStore.h"
+#include "animus_kernel/api/ApiRuntime.h"
 #include "animus_kernel/Log.h"
+#include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/tools/HttpClient.h"
 
 #include <json/json.h>
@@ -93,6 +95,11 @@ int ApiConnectionManager::PollOnce() {
     int n = 0;
     for (const auto& pkg : m_store->ListPackages()) {
         if (!pkg.enabled) continue;
+        // #25: unapproved packages never even poll — approval gates network
+        // activity itself, not just dispatch. #106: also verify the content
+        // binding at the network boundary (same backstop as execute).
+        if (pkg.approval_status != "approved" ||
+            !m_store->VerifyApprovalBinding(pkg.id)) continue;
         for (const auto& conn : m_store->ListConnections(pkg.id)) {
             if (!conn.enabled) continue;
             std::string key = pkg.id + ":" + conn.name;
@@ -146,6 +153,11 @@ void ApiConnectionManager::Tick() {
 
     for (const auto& pkg : m_store->ListPackages()) {
         if (!pkg.enabled) continue;
+        // #25: unapproved packages never even poll — approval gates network
+        // activity itself, not just dispatch. #106: also verify the content
+        // binding at the network boundary (same backstop as execute).
+        if (pkg.approval_status != "approved" ||
+            !m_store->VerifyApprovalBinding(pkg.id)) continue;
         for (const auto& conn : m_store->ListConnections(pkg.id)) {
             if (!conn.enabled) continue;
 
@@ -190,6 +202,10 @@ Json::Value ApiConnectionManager::BuildPollContext(const ApiPackage& pkg,
                 state[k] = schema[k]["default"];
         }
     }
+    // #23: vault-resolve secret-typed keys into this in-memory context —
+    // url/headers templates then interpolate exactly like the action path.
+    if (m_runtime && m_runtime->vault())
+        m_runtime->vault()->ResolveState(pkg.id, schema, state);
     // Request-side cursor: {{state._cursor.value}} — first tick empty.
     Json::Value cursor(Json::objectValue);
     cursor["value"] = lastCursor;
@@ -273,10 +289,26 @@ ApiConnectionManager::PollOutcome ApiConnectionManager::PollConnection(
             req.url += (req.url.find('?') == std::string::npos ? "?" : "&") + qs;
     }
 
+    // #25 egress gate: connection polls live under the same package scope.
+    {
+        std::string egressHost;
+        const auto scope = ApiRuntime::ParseEgressHosts(pkg.egress_hosts);
+        if (!ApiRuntime::EgressAllowed(scope, req.url, egressHost)) {
+            ALOG_WARNING("api-conn", "[egress] DENIED " << pkg.name << ":" << conn.name
+                         << " poll -> " << (egressHost.empty() ? "<malformed url>" : egressHost)
+                         << " (outside package scope — declare egress_hosts in the manifest)");
+            o.consecutiveErrors = prevErrors + 1;
+            return o;
+        }
+    }
+
     ALOG_INFO("api-conn", "[" << pkg.name << ":" << conn.name << "] poll GET "
                               << ApiRuntime::MaskSecrets(req.url, secretValues));
 
-    HttpClient::Response resp = m_http->Execute(req);
+    // #25: polls follow redirects under the same per-hop package scope
+    HttpClient::Response resp =
+        ApiRuntime::ExecuteScoped(m_http, ApiRuntime::ParseEgressHosts(pkg.egress_hosts),
+                                  req, pkg.name + ":" + conn.name + " (poll)");
     if (resp.status_code != 200) {
         o.consecutiveErrors = prevErrors + 1;
         ALOG_WARNING("api-conn", "[" << pkg.name << ":" << conn.name << "] poll status "

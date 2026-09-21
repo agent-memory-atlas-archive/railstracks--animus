@@ -1,0 +1,870 @@
+#include "animus_kernel/SyncStore.h"
+#include "animus_kernel/IdRanges.h"
+#include "animus_kernel/Log.h"
+#include "animus_kernel/SchemaHelpers.h"
+#include "animus_kernel/scheduler/TaskRunStore.h"
+
+#include <algorithm>
+#include <chrono>
+#include <json/json.h>
+#include <json/reader.h>
+#include <sstream>
+
+namespace animus::kernel {
+
+using schema::CreateTable;
+
+namespace {
+
+constexpr const char* kUpsert = "upsert";
+constexpr const char* kDelete = "delete";
+
+bool IsAgentGlobalTable(const std::string& t) {
+    for (const auto& x : AgentGlobalTables()) if (x == t) return true;
+    return false;
+}
+
+// SQLite ms expression (millisecond precision; strftime('%s') is seconds).
+std::string SqliteNowMs() {
+    return "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+}
+
+// The (ms, origin) stamp used by both version row and outbox row:
+// - ms: max(local clock, apply_ms when applying a newer-stamped remote)
+// - origin: the remote origin while applying, else the local node
+// While a remote change is being applied to THIS EXACT row, stamp the
+// incoming (ms, origin) EXACTLY — equal pairs are what kill echoes at their
+// origin. Any other row (concurrent local writes) stamps (now, local node).
+// The match is scoped to (table, row_id) so a sync batch never mis-stamps
+// unrelated rows.
+std::string SqliteMatchCond(const std::string& table, const std::string& rowExpr) {
+    return "(SELECT apply_table FROM sync_control) = '" + table + "' "
+           "AND (SELECT apply_row_id FROM sync_control) = CAST(" + rowExpr + " AS TEXT) "
+           "AND (SELECT apply_origin FROM sync_control) IS NOT NULL";
+}
+
+std::string SqliteStampMs(const std::string& table, const std::string& rowExpr) {
+    return "CASE WHEN " + SqliteMatchCond(table, rowExpr) + " "
+           "THEN (SELECT apply_ms FROM sync_control) "
+           "ELSE " + SqliteNowMs() + " END";
+}
+
+std::string SqliteStampOrigin(const std::string& table, const std::string& rowExpr) {
+    return "CASE WHEN " + SqliteMatchCond(table, rowExpr) + " "
+           "THEN (SELECT apply_origin FROM sync_control) "
+           "ELSE (SELECT node_id FROM sync_control) END";
+}
+
+} // namespace
+
+SyncStore::SyncStore(IDataStore* store, uint64_t localNodeId)
+    : m_store(store), m_nodeId(localNodeId) {}
+
+bool SyncStore::EnsureSchema(std::string* error) {
+    if (!m_store) { if (error) *error = "null store"; return false; }
+
+    CreateTable(m_store, R"(
+        CREATE TABLE IF NOT EXISTS sync_control (
+            node_id INTEGER PRIMARY KEY,
+            apply_table TEXT,
+            apply_row_id TEXT,
+            apply_origin INTEGER,
+            apply_ms INTEGER
+        );
+    )");
+    CreateTable(m_store, R"(
+        CREATE TABLE IF NOT EXISTS sync_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            origin_node INTEGER NOT NULL,
+            table_name TEXT NOT NULL,
+            row_id TEXT NOT NULL,
+            op TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            unix_ms INTEGER NOT NULL
+        );
+    )");
+    CreateTable(m_store, R"(
+        CREATE TABLE IF NOT EXISTS sync_row_versions (
+            table_name TEXT NOT NULL,
+            row_id TEXT NOT NULL,
+            last_ms INTEGER NOT NULL,
+            last_node INTEGER NOT NULL,
+            PRIMARY KEY (table_name, row_id)
+        );
+    )");
+    CreateTable(m_store, R"(
+        CREATE TABLE IF NOT EXISTS sync_peer_state (
+            peer_node INTEGER PRIMARY KEY,
+            last_outbox_id INTEGER NOT NULL,
+            updated_ms INTEGER NOT NULL
+        );
+    )");
+
+    // Control row: local identity. Insert-if-missing (ON CONFLICT DO
+    // NOTHING — native upsert on both dialects): never clobbers an in-flight
+    // apply state, and node identity is expected to be stable anyway.
+    {
+        auto q = m_store->Prepare(
+            "INSERT INTO sync_control (node_id, apply_table, apply_row_id, "
+            "apply_origin, apply_ms) "
+            "VALUES (?, NULL, NULL, NULL, NULL) ON CONFLICT (node_id) DO NOTHING");
+        if (q) { q->BindInt64(1, (int64_t)m_nodeId); q->ExecDML(); }
+    }
+
+    // Row-id migration must precede trigger install: once triggers are
+    // live, any write against unconverted bigint columns aborts.
+    MigrateRowIdsIfNeeded();
+
+    const bool isPg = m_store->Dialect() == DataStoreDialect::PostgreSQL;
+
+    if (isPg) {
+        // Shared stamping functions. #93 P3: one function per op, with the
+        // row-identity SHAPE passed as a TRIGGER argument and read via
+        // TG_ARGV[0] ('id' = single BIGINT id column; 'pair' = composite
+        // (agent_id, key), escaped to agent_id || chr(31) || key).
+        // NOTE: PG forbids declared arguments on trigger functions
+        // ("trigger functions cannot have declared arguments") — the shape
+        // arrives via TG_ARGV, NOT a function parameter. PR #109 audit F1:
+        // the original zero-arg functions ignored the trigger argument and
+        // unconditionally read NEW.id/OLD.id, so NO triggers installed on PG
+        // ("function animus_sync_upsert(unknown) does not exist").
+        m_store->Exec(R"(
+CREATE OR REPLACE FUNCTION animus_sync_upsert() RETURNS trigger AS $$
+DECLARE
+    ctl RECORD;
+    ms BIGINT;
+    origin BIGINT;
+    v_row_id TEXT;
+    shape TEXT;
+BEGIN
+    shape := TG_ARGV[0];
+    IF shape = 'pair' THEN
+        v_row_id := NEW.agent_id || chr(31) || NEW.key;
+    ELSE
+        v_row_id := NEW.id::text;
+    END IF;
+    SELECT * INTO ctl FROM sync_control;
+    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = v_row_id
+       AND ctl.apply_origin IS NOT NULL THEN
+        ms := ctl.apply_ms;
+        origin := ctl.apply_origin;
+    ELSE
+        ms := (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT;
+        origin := ctl.node_id;
+    END IF;
+    INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node)
+        VALUES (TG_TABLE_NAME, v_row_id, ms, origin)
+        ON CONFLICT (table_name, row_id) DO UPDATE SET
+            last_ms = EXCLUDED.last_ms, last_node = EXCLUDED.last_node;
+    INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms)
+        VALUES (origin, TG_TABLE_NAME, v_row_id, 'upsert', to_jsonb(NEW)::text, ms);
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;)");
+        m_store->Exec(R"(
+CREATE OR REPLACE FUNCTION animus_sync_delete() RETURNS trigger AS $$
+DECLARE
+    ctl RECORD;
+    ms BIGINT;
+    origin BIGINT;
+    v_row_id TEXT;
+    shape TEXT;
+BEGIN
+    shape := TG_ARGV[0];
+    IF shape = 'pair' THEN
+        v_row_id := OLD.agent_id || chr(31) || OLD.key;
+    ELSE
+        v_row_id := OLD.id::text;
+    END IF;
+    SELECT * INTO ctl FROM sync_control;
+    IF ctl.apply_table = TG_TABLE_NAME AND ctl.apply_row_id = v_row_id
+       AND ctl.apply_origin IS NOT NULL THEN
+        ms := ctl.apply_ms;
+        origin := ctl.apply_origin;
+    ELSE
+        ms := (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT;
+        origin := ctl.node_id;
+    END IF;
+    INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node)
+        VALUES (TG_TABLE_NAME, v_row_id, ms, origin)
+        ON CONFLICT (table_name, row_id) DO UPDATE SET
+            last_ms = EXCLUDED.last_ms, last_node = EXCLUDED.last_node;
+    -- Payload: shape-dependent field access must NOT reference columns of
+    -- the OTHER shape (plpgsql resolves every branch's OLD.<col> against the
+    -- actual table row; an 'id'-shaped table has no agent_id/key column and
+    -- the DELETE aborts). to_jsonb(OLD) is shape-safe: the apply side reads
+    -- agent_id/key for pair rows and id for id rows from the same object.
+    INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms)
+        VALUES (origin, TG_TABLE_NAME, v_row_id, 'delete',
+                to_jsonb(OLD)::text, ms);
+    RETURN OLD;
+END $$ LANGUAGE plpgsql;)");
+    }
+
+    int installed = 0;
+    for (const auto& table : AgentGlobalTables()) {
+        std::string err;
+        if (!InstallTriggersFor(table, &err)) {
+            ALOG_WARNING("sync", "trigger install skipped for " << table
+                         << ": " << err);
+        } else {
+            installed++;
+            m_syncedTables.push_back(table);
+        }
+    }
+    if (installed == 0) {
+        if (error) *error = "no agent-global tables found — install after stores";
+        return false;
+    }
+    return true;
+}
+
+// --- P2a migration: row-id columns INTEGER -> TEXT -----------------------
+// schedules (TEXT primary keys) and task_runs joined the synced set;
+// the sync layer's row identity is now TEXT uniformly (int ids are
+// stringified at capture). SQLite can't ALTER a column type, so the
+// tables are rebuilt via create-copy-swap. PG uses ALTER TYPE (+USING).
+// NOTE: this block was formerly embedded inside ReadTableColumns' SQLite
+// branch — it only ever ran on SQLite as a side effect of trigger install.
+// PG never migrated: legacy bigint row-id columns stayed while the P2a
+// trigger compares NEW.id::text -> "operator does not exist: bigint = text"
+// aborting every write on triggered tables (live: Buffett, 2026-09-14).
+void SyncStore::MigrateRowIdsIfNeeded() {
+        const bool isPgNow = m_store->Dialect() == DataStoreDialect::PostgreSQL;
+        if (isPgNow) {
+            // bigint -> TEXT needs an explicit USING cast; PG refuses
+            // "cannot be cast automatically" otherwise. Exec failure was
+            // silent, leaving legacy-P1 columns bigint while the P2a trigger
+            // compares NEW.id::text -> "operator does not exist: bigint = text"
+            // aborting every write on triggered tables (live: Buffett's
+            // instance — boot registration, layer saves, schedule inserts).
+            // Guarded so already-TEXT databases skip the table rewrite.
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_outbox' AND column_name='row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_outbox ALTER COLUMN row_id TYPE TEXT "
+                "USING row_id::text; END IF; END $$;");
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_row_versions' AND column_name='row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_row_versions ALTER COLUMN row_id TYPE TEXT "
+                "USING row_id::text; END IF; END $$;");
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_control' AND column_name='apply_row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_control ALTER COLUMN apply_row_id TYPE TEXT "
+                "USING apply_row_id::text; END IF; END $$;");
+        } else {
+            std::string migErr;
+            auto probe = m_store->Prepare(
+                "SELECT type FROM pragma_table_info('sync_outbox') "
+                "WHERE name = 'row_id'");
+            const bool needMigrate = [&]() {
+                if (!probe) return false;
+                if (!probe->Step()) return false;
+                return probe->ColumnText(0) != "TEXT";
+            }();
+            if (needMigrate) {
+                if (RebuildSqliteTableWide(m_store, R"SQL(
+                    CREATE TABLE sync_outbox (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        origin_node INTEGER NOT NULL,
+                        table_name TEXT NOT NULL,
+                        row_id TEXT NOT NULL,
+                        op TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        unix_ms INTEGER NOT NULL
+                    ))SQL", "sync_outbox", &migErr)) {
+                    ALOG_INFO("sync", "migrated sync_outbox.row_id INTEGER -> TEXT");
+                } else {
+                    ALOG_WARNING("sync", "sync_outbox row_id migration failed: "
+                                 << migErr);
+                }
+                if (RebuildSqliteTableWide(m_store, R"SQL(
+                    CREATE TABLE sync_row_versions (
+                        table_name TEXT NOT NULL,
+                        row_id TEXT NOT NULL,
+                        last_ms INTEGER NOT NULL,
+                        last_node INTEGER NOT NULL,
+                        PRIMARY KEY (table_name, row_id)
+                    ))SQL", "sync_row_versions", &migErr)) {
+                    ALOG_INFO("sync", "migrated sync_row_versions.row_id INTEGER -> TEXT");
+                } else {
+                    ALOG_WARNING("sync", "sync_row_versions row_id migration failed: "
+                                 << migErr);
+                }
+                // sync_control holds a single identity row, re-inserted below;
+                // drop+recreate is the safe rebuild.
+                m_store->Exec("DROP TABLE IF EXISTS sync_control");
+                m_store->Exec(R"SQL(
+                    CREATE TABLE sync_control (
+                        node_id INTEGER PRIMARY KEY,
+                        apply_table TEXT,
+                        apply_row_id TEXT,
+                        apply_origin INTEGER,
+                        apply_ms INTEGER
+                    ))SQL");
+                ALOG_INFO("sync", "migrated sync_control.apply_row_id INTEGER -> TEXT");
+            }
+        }
+}
+
+std::vector<std::string> SyncStore::ReadTableColumns(const std::string& table) {
+    std::vector<std::string> cols;
+    if (m_store->Dialect() == DataStoreDialect::SQLite) {
+        auto q = m_store->Prepare("PRAGMA table_info(" + table + ")");
+        if (!q) return cols;
+        while (q->Step()) cols.push_back(q->ColumnText(1));
+
+    // --- P2a migration: row-id columns INTEGER -> TEXT ---------------------
+    // schedules (TEXT primary keys) and task_runs joined the synced set;
+    // the sync layer's row identity is now TEXT uniformly (int ids are
+    // stringified at capture). SQLite can't ALTER a column type, so the
+    // tables are rebuilt via create-copy-swap. PG uses ALTER TYPE.
+    {
+        const bool isPgNow = m_store->Dialect() == DataStoreDialect::PostgreSQL;
+        if (isPgNow) {
+            // bigint -> TEXT needs an explicit USING cast; PG refuses
+            // "cannot be cast automatically" otherwise. Exec failure was
+            // silent, leaving legacy-P1 columns bigint while the P2a trigger
+            // compares NEW.id::text -> "operator does not exist: bigint = text"
+            // aborting every write on triggered tables (live: Buffett's
+            // instance — boot registration, layer saves, schedule inserts).
+            // Guarded so already-TEXT databases skip the table rewrite.
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_outbox' AND column_name='row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_outbox ALTER COLUMN row_id TYPE TEXT "
+                "USING row_id::text; END IF; END $$;");
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_row_versions' AND column_name='row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_row_versions ALTER COLUMN row_id TYPE TEXT "
+                "USING row_id::text; END IF; END $$;");
+            m_store->Exec("DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='sync_control' AND column_name='apply_row_id' "
+                "AND data_type <> 'text') THEN "
+                "ALTER TABLE sync_control ALTER COLUMN apply_row_id TYPE TEXT "
+                "USING apply_row_id::text; END IF; END $$;");
+        } else {
+            std::string migErr;
+            auto probe = m_store->Prepare(
+                "SELECT type FROM pragma_table_info('sync_outbox') "
+                "WHERE name = 'row_id'");
+            const bool needMigrate = [&]() {
+                if (!probe) return false;
+                if (!probe->Step()) return false;
+                return probe->ColumnText(0) != "TEXT";
+            }();
+            if (needMigrate) {
+                if (RebuildSqliteTableWide(m_store, R"SQL(
+                    CREATE TABLE sync_outbox (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        origin_node INTEGER NOT NULL,
+                        table_name TEXT NOT NULL,
+                        row_id TEXT NOT NULL,
+                        op TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        unix_ms INTEGER NOT NULL
+                    ))SQL", "sync_outbox", &migErr)) {
+                    ALOG_INFO("sync", "migrated sync_outbox.row_id INTEGER -> TEXT");
+                } else {
+                    ALOG_WARNING("sync", "sync_outbox row_id migration failed: "
+                                 << migErr);
+                }
+                if (RebuildSqliteTableWide(m_store, R"SQL(
+                    CREATE TABLE sync_row_versions (
+                        table_name TEXT NOT NULL,
+                        row_id TEXT NOT NULL,
+                        last_ms INTEGER NOT NULL,
+                        last_node INTEGER NOT NULL,
+                        PRIMARY KEY (table_name, row_id)
+                    ))SQL", "sync_row_versions", &migErr)) {
+                    ALOG_INFO("sync", "migrated sync_row_versions.row_id INTEGER -> TEXT");
+                } else {
+                    ALOG_WARNING("sync", "sync_row_versions row_id migration failed: "
+                                 << migErr);
+                }
+                // sync_control holds a single identity row, re-inserted below;
+                // drop+recreate is the safe rebuild.
+                m_store->Exec("DROP TABLE IF EXISTS sync_control");
+                m_store->Exec(R"SQL(
+                    CREATE TABLE sync_control (
+                        node_id INTEGER PRIMARY KEY,
+                        apply_table TEXT,
+                        apply_row_id TEXT,
+                        apply_origin INTEGER,
+                        apply_ms INTEGER
+                    ))SQL");
+                ALOG_INFO("sync", "migrated sync_control.apply_row_id INTEGER -> TEXT");
+            }
+        }
+    }
+
+    } else {
+        auto q = m_store->Prepare(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = ? ORDER BY ordinal_position");
+        if (!q) return cols;
+        q->BindText(1, table);
+        while (q->Step()) cols.push_back(q->ColumnText(0));
+    }
+    return cols;
+}
+
+bool SyncStore::InstallTriggersFor(const std::string& table, std::string* error) {
+    if (!IsAgentGlobalTable(table)) {
+        if (error) *error = "not an agent-global table";
+        return false;
+    }
+    const auto cols = ReadTableColumns(table);
+    if (cols.empty()) {
+        if (error) *error = "table does not exist yet";
+        return false;
+    }
+
+    // #93 P3: row identity expression. Single-row-id tables use NEW.id /
+    // OLD.id; composite-key tables (agent_config) use the escaped pair
+    // NEW.agent_id || x'1F' || NEW.key — the outbox row_id stays a single
+    // TEXT value, so the whole (version, outbox, LWW, echo) machinery is
+    // untouched.
+    const bool composite = IsCompositeKeyTable(table);
+    // char(31) is a SQLite function; PG needs chr(31) (char(n) is a TYPE).
+    const std::string sep = m_store->Dialect() == DataStoreDialect::PostgreSQL
+        ? "chr(31)" : "char(31)";
+    const std::string rowId = composite
+        ? "(NEW.agent_id || " + sep + " || NEW.key)"
+        : "NEW.id";
+    const std::string rowIdOld = composite
+        ? "(OLD.agent_id || " + sep + " || OLD.key)"
+        : "OLD.id";
+
+    if (m_store->Dialect() == DataStoreDialect::SQLite) {
+        // Full-row JSON payload from the live column list.
+        std::ostringstream jo;
+        jo << "json_object(";
+        for (size_t i = 0; i < cols.size(); ++i) {
+            if (i) jo << ", ";
+            jo << "'" << cols[i] << "', NEW." << cols[i];
+        }
+        jo << ")";
+        const std::string payload = jo.str();
+
+        // ONE timestamp per trigger firing: the outbox row is written first,
+        // and the version row SELECTS its exact unix_ms back via
+        // last_insert_rowid(). Two separate julianday('now') evaluations
+        // (one per statement) straddle ms boundaries and break the
+        // (ms, origin) tie that kills echoes at their origin.
+        //
+        // NOTE: INSERT ... SELECT ... ON CONFLICT requires a WHERE clause on
+        // the SELECT to disambiguate the upsert clause (SQLite parser rule).
+        const std::string outboxInsert =
+            "INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms) "
+            "SELECT " + SqliteStampOrigin(table, rowId) + ", '" + table +
+            "', CAST(" + rowId + " AS TEXT), 'upsert', " + payload + ", " +
+            SqliteStampMs(table, rowId) + "; ";
+        const std::string versionUpsert =
+            "INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node) "
+            "SELECT '" + table + "', CAST(" + rowId + " AS TEXT), "
+            "(SELECT unix_ms FROM sync_outbox WHERE id = last_insert_rowid()), " +
+            SqliteStampOrigin(table, rowId) + " WHERE " + rowId + " IS NOT NULL "
+            "ON CONFLICT (table_name, row_id) DO UPDATE SET "
+            "last_ms = excluded.last_ms, last_node = excluded.last_node; ";
+        const std::string outboxInsertDel =
+            "INSERT INTO sync_outbox (origin_node, table_name, row_id, op, payload, unix_ms) "
+            "SELECT " + SqliteStampOrigin(table, rowIdOld) + ", '" + table +
+            "', CAST(" + rowIdOld + " AS TEXT), 'delete', " +
+            (composite
+                 ? std::string("json_object('agent_id', OLD.agent_id, 'key', OLD.key)")
+                 : std::string("json_object('id', OLD.id)")) + ", " +
+            SqliteStampMs(table, rowIdOld) + "; ";
+        const std::string versionUpsertDel =
+            "INSERT INTO sync_row_versions (table_name, row_id, last_ms, last_node) "
+            "SELECT '" + table + "', CAST(" + rowIdOld + " AS TEXT), "
+            "(SELECT unix_ms FROM sync_outbox WHERE id = last_insert_rowid()), " +
+            SqliteStampOrigin(table, rowIdOld) + " WHERE " + rowIdOld + " IS NOT NULL "
+            "ON CONFLICT (table_name, row_id) DO UPDATE SET "
+            "last_ms = excluded.last_ms, last_node = excluded.last_node; ";
+
+        // DROP+CREATE (not IF NOT EXISTS): a column added by a later
+        // migration must refresh the payload column list on next boot.
+        // Mirrors the PG branch.
+        const std::string prefix =
+            "DROP TRIGGER IF EXISTS sync_" + table + "_"; 
+        const std::string ai =
+            "CREATE TRIGGER sync_" + table + "_ai AFTER INSERT ON " +
+            table + " BEGIN " + outboxInsert + versionUpsert + "END;";
+        const std::string au =
+            "CREATE TRIGGER sync_" + table + "_au AFTER UPDATE ON " +
+            table + " BEGIN " + outboxInsert + versionUpsert + "END;";
+        const std::string ad =
+            "CREATE TRIGGER sync_" + table + "_ad AFTER DELETE ON " +
+            table + " BEGIN " + outboxInsertDel + versionUpsertDel + "END;";
+
+        if (!m_store->Exec(prefix + "ai") || !m_store->Exec(ai) ||
+            !m_store->Exec(prefix + "au") || !m_store->Exec(au) ||
+            !m_store->Exec(prefix + "ad") || !m_store->Exec(ad)) {
+            if (error) *error = m_store->ErrMsg();
+            return false;
+        }
+        return true;
+    }
+
+    // PostgreSQL — the shape argument selects the row-id expression (#93 P3)
+    const std::string shapeArg = composite ? "'pair'" : "'id'";
+    if (!m_store->Exec("DROP TRIGGER IF EXISTS sync_" + table + "_ai ON " + table) ||
+        !m_store->Exec("CREATE TRIGGER sync_" + table + "_ai AFTER INSERT OR UPDATE ON " +
+                       table + " FOR EACH ROW EXECUTE FUNCTION animus_sync_upsert(" +
+                       shapeArg + ")") ||
+        !m_store->Exec("DROP TRIGGER IF EXISTS sync_" + table + "_ad ON " + table) ||
+        !m_store->Exec("CREATE TRIGGER sync_" + table + "_ad AFTER DELETE ON " +
+                       table + " FOR EACH ROW EXECUTE FUNCTION animus_sync_delete(" +
+                       shapeArg + ")")) {
+        if (error) *error = m_store->ErrMsg();
+        return false;
+    }
+    return true;
+}
+
+std::vector<OutboxRecord> SyncStore::FetchOutboxSince(int64_t sinceOutboxId, int64_t limit) {
+    std::vector<OutboxRecord> out;
+    auto q = m_store->Prepare(
+        "SELECT id, origin_node, table_name, row_id, op, payload, unix_ms "
+        "FROM sync_outbox WHERE id > ? ORDER BY id ASC LIMIT ?");
+    if (!q) return out;
+    q->BindInt64(1, sinceOutboxId);
+    q->BindInt64(2, limit);
+    while (q->Step()) {
+        OutboxRecord r;
+        r.outbox_id = q->ColumnInt64(0);
+        r.origin_node = q->ColumnInt64(1);
+        r.table_name = q->ColumnText(2);
+        r.row_key = q->ColumnText(3);
+        r.op = q->ColumnText(4);
+        r.payload = q->ColumnText(5);
+        r.unix_ms = q->ColumnInt64(6);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+int64_t SyncStore::MaxOutboxId() {
+    auto q = m_store->Prepare("SELECT COALESCE(MAX(id), 0) FROM sync_outbox");
+    if (!q || !q->Step()) return 0;
+    return q->ColumnInt64(0);
+}
+
+std::vector<SyncStore::TableDigest> SyncStore::TableDigests() {
+    std::vector<TableDigest> out;
+    if (!m_store) return out;
+    for (const auto& table : AgentGlobalTables()) {
+        // Table may not exist yet on a partially-initialized database
+        // (stores create their tables lazily per subsystem); skip those —
+        // a peer comparing digests only heals on tables present on both.
+        // #93 P3: composite-key tables have no single id; max is over the
+        // escaped pair string (a stable total order for divergence probes).
+        // char(31) is a SQLite function — PG needs chr(31) (char(n) is a TYPE
+        // there; a silent prepare failure would drop composite tables from
+        // digests entirely on PG).
+        const std::string sep =
+            m_store->Dialect() == DataStoreDialect::PostgreSQL ? "chr(31)" : "char(31)";
+        const std::string maxExpr = IsCompositeKeyTable(table)
+            ? "COALESCE(MAX(agent_id || " + sep + " || key), '')"
+            : "COALESCE(MAX(id), 0)";
+        auto q1 = m_store->Prepare(
+            "SELECT COUNT(*), " + maxExpr + " FROM " + table);
+        if (!q1 || !q1->Step()) continue;  // table absent on this database
+        TableDigest d;
+        d.table = table;
+        d.count = q1->ColumnInt64(0);
+        d.maxId = q1->ColumnInt64(1);
+        // Version-stamp sum is a coarse drift signal for operators; the
+        // actionable heal rule uses counts only.
+        auto q2 = m_store->Prepare(
+            "SELECT COALESCE(SUM(last_ms), 0) FROM sync_row_versions "
+            "WHERE table_name = ?");
+        if (q2) {
+            q2->BindText(1, table);
+            if (q2->Step()) d.sumLastMs = q2->ColumnInt64(0);
+        }
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+void SyncStore::ClearTableVersions(const std::string& table) {
+    if (!m_store) return;
+    auto q = m_store->Prepare(
+        "DELETE FROM sync_row_versions WHERE table_name = ?");
+    if (!q) return;
+    q->BindText(1, table);
+    q->Step();
+}
+
+int64_t SyncStore::GetPeerCursor(int64_t peerNode) {
+    auto q = m_store->Prepare(
+        "SELECT last_outbox_id FROM sync_peer_state WHERE peer_node = ?");
+    if (!q) return 0;
+    q->BindInt64(1, peerNode);
+    if (!q->Step()) return 0;
+    return q->ColumnInt64(0);
+}
+
+bool SyncStore::SetPeerCursor(int64_t peerNode, int64_t outboxId) {
+    const std::string sql =
+        "INSERT INTO sync_peer_state (peer_node, last_outbox_id, updated_ms) "
+        "VALUES (?,?,?) ON CONFLICT (peer_node) DO UPDATE SET "
+        "last_outbox_id = excluded.last_outbox_id, updated_ms = excluded.updated_ms";
+    auto q = m_store->Prepare(sql);
+    if (!q) return false;
+    q->BindInt64(1, peerNode);
+    q->BindInt64(2, outboxId);
+    using namespace std::chrono;
+    q->BindInt64(3, duration_cast<milliseconds>(
+        system_clock::now().time_since_epoch()).count());
+    return q->ExecDML();
+}
+
+bool SyncStore::ApplyRemoteChange(const OutboxRecord& rec) {
+    // Whitelist the table name (identifier injection guard).
+    if (!IsAgentGlobalTable(rec.table_name)) {
+        ALOG_WARNING("sync", "apply rejected — unknown table: " << rec.table_name);
+        return false;
+    }
+    if (rec.op != kUpsert && rec.op != kDelete) {
+        ALOG_WARNING("sync", "apply rejected — unknown op: " << rec.op);
+        return false;
+    }
+
+    // LWW: (ms, node) pair-compare against the row's current version.
+    int64_t localMs = -1, localNode = -1;
+    {
+        auto q = m_store->Prepare(
+            "SELECT last_ms, last_node FROM sync_row_versions "
+            "WHERE table_name = ? AND row_id = ?");
+        if (q) {
+            q->BindText(1, rec.table_name);
+            q->BindText(2, rec.row_key);
+            if (q->Step()) {
+                localMs = q->ColumnInt64(0);
+                localNode = q->ColumnInt64(1);
+            }
+        }
+    }
+    const std::pair<int64_t, int64_t> incoming(rec.unix_ms, rec.origin_node);
+    const std::pair<int64_t, int64_t> local(localMs, localNode);
+    if (incoming <= local) {
+        // #93 P3: same-origin tie where the incoming op is a DELETE —
+        // within one origin, a delete of a row always FOLLOWS the last
+        // upsert of that row (writes on the origin are sequential), so a
+        // tie at identical (ms, origin) with op=delete means the delete
+        // landed in the same ms as the upsert. The upsert's echo carries
+        // the same pair and dies here on the origin node (op=upsert ->
+        // plain skip, echo death intact); the delete must win or the row
+        // survives on every peer (witnessed: P2a update+delete in one
+        // batch, same ms — B kept a deleted schedule).
+        // The local-vs-self guard: an echo's pair carries the LOCAL node's
+        // identity (remote applies stamp the origin), so on the true origin
+        // an echo tie has origin == self and skips — echo death intact. On
+        // a PEER, a same-origin tie means "same remote node wrote twice in
+        // one ms and the delete came second" — the delete wins.
+        const bool tieDeleteWins =
+            rec.op == kDelete && incoming == local &&
+            rec.origin_node == localNode && localMs >= 0 &&
+            rec.origin_node != static_cast<int64_t>(m_nodeId);
+        if (!tieDeleteWins) {
+            ALOG_DEBUG("sync", "skip " << rec.table_name << "/" << rec.row_key
+                       << " — stale/echo (in " << rec.unix_ms << "/" << rec.origin_node
+                       << " vs local " << localMs << "/" << localNode << ")");
+            return false;   // stale, echo, or exact tie — all safe to skip
+        }
+    }
+
+    // Publish apply context so triggers stamp the incoming (ms, origin)
+    // EXACTLY on this row — echoes then tie everywhere and die.
+    {
+        auto q = m_store->Prepare(
+            "UPDATE sync_control SET apply_table = ?, apply_row_id = ?, "
+            "apply_origin = ?, apply_ms = ?");
+        if (q) {
+            q->BindText(1, rec.table_name);
+            q->BindText(2, rec.row_key);
+            q->BindInt64(3, rec.origin_node);
+            q->BindInt64(4, rec.unix_ms);
+            q->ExecDML();
+        }
+    }
+    bool ok = (rec.op == kDelete) ? ApplyDelete(rec) : ApplyUpsert(rec);
+    // Capture the error string NOW — sqlite3_errmsg is per-connection and
+    // the next SUCCESSFUL statement (the sync_control cleanup below)
+    // resets it to "not an error", hiding the real cause (witnessed as a
+    // 14x/side WARN flood during #78 P2b chaos; real cause was a natural-
+    // key UNIQUE violation, invisible in the log).
+    std::string applyErr = ok ? std::string() : m_store->ErrMsg();
+    {
+        auto q = m_store->Prepare(
+            "UPDATE sync_control SET apply_table = NULL, apply_row_id = NULL, "
+            "apply_origin = NULL, apply_ms = NULL");
+        if (q) q->ExecDML();
+    }
+    if (!ok) ALOG_WARNING("sync", "apply FAILED for " << rec.table_name
+                          << "/" << rec.row_key << ": " << applyErr);
+    else {
+        if (rec.table_name == "task_runs")
+            // P2b: a task_runs apply can complete a partition double-claim —
+            // run the epoch-fence reconciliation for that window so the
+            // loser row is marked and the violation surfaces (tripwire).
+            FenceTaskRun(rec.payload);
+        // #93 P3: notify cache-owning stores — sync writes bypass every
+        // store API, so an in-memory cache (AgentConfigStore) would hide
+        // the replicated change until a reload otherwise.
+        if (m_applyNotifier) m_applyNotifier(rec.table_name, rec.row_key);
+    }
+    return ok;
+}
+
+void SyncStore::FenceTaskRun(const std::string& payloadJson) {
+    Json::Value root;
+    Json::CharReaderBuilder rb;
+    std::string parseErr;
+    std::istringstream ss(payloadJson);
+    if (!Json::parseFromStream(rb, ss, &root, &parseErr) || !root.isObject()) return;
+    if (!root.isMember("run_uuid")) return;
+    TaskRunStore runs(m_store);
+    runs.FenceRunUuid(root["run_uuid"].asString());
+}
+
+bool SyncStore::ApplyDelete(const OutboxRecord& rec) {
+    if (IsCompositeKeyTable(rec.table_name)) {
+        const std::string pairJson = CompositeKeyToJson(rec.row_key);
+        if (pairJson == rec.row_key) return false;  // not a pair string — malformed
+        Json::Value k;
+        Json::CharReaderBuilder rb;
+        std::string errs;
+        std::istringstream ss(pairJson);
+        if (!Json::parseFromStream(rb, ss, &k, &errs)) return false;
+        auto q = m_store->Prepare(
+            "DELETE FROM " + rec.table_name + " WHERE agent_id = ? AND key = ?");
+        if (!q) return false;
+        q->BindText(1, k["agent_id"].asString());
+        q->BindText(2, k["key"].asString());
+        return q->ExecDML();
+    }
+    auto q = m_store->Prepare("DELETE FROM " + rec.table_name + " WHERE id = ?");
+    if (!q) return false;
+    q->BindText(1, rec.row_key);
+    return q->ExecDML();
+}
+
+bool SyncStore::ApplyUpsert(const OutboxRecord& rec) {
+    Json::Value root;
+    Json::CharReaderBuilder rb;
+    std::string parseErr;
+    std::istringstream ss(rec.payload);
+    if (!Json::parseFromStream(rb, ss, &root, &parseErr)) {
+        ALOG_WARNING("sync", "payload parse failed for " << rec.table_name
+                     << "/" << rec.row_key << ": " << parseErr);
+        return false;
+    }
+    // #93 P3: composite-key tables carry row identity as the pair columns
+    // in the payload (agent_id + key) — presence check per table shape.
+    const bool composite = IsCompositeKeyTable(rec.table_name);
+    if (composite) {
+        if (!root.isObject() || !root.isMember("agent_id") || !root.isMember("key")) {
+            ALOG_WARNING("sync", "payload missing composite key for " << rec.table_name);
+            return false;
+        }
+    } else if (!root.isObject() || !root.isMember("id")) {
+        ALOG_WARNING("sync", "payload missing id for " << rec.table_name);
+        return false;
+    }
+
+    // Bind only columns that exist in BOTH the payload and the live table —
+    // mixed-version networks with extra/missing columns degrade gracefully.
+    const auto tableCols = ReadTableColumns(rec.table_name);
+    std::vector<std::string> cols;
+    for (const auto& c : tableCols) if (root.isMember(c)) cols.push_back(c);
+    if (cols.empty()) return false;
+
+    std::ostringstream ins, ph, upd;
+    ins << "INSERT INTO " << rec.table_name << " (";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i) { ins << ", "; ph << ", "; }
+        ins << cols[i];
+        ph << "?";
+    }
+    ins << ") VALUES (" << ph.str() << ") ON CONFLICT "
+        << (composite ? "(agent_id, key)" : "(id)") << " DO UPDATE SET ";
+    bool first = true;
+    for (const auto& c : cols) {
+        if (c == "id") continue;   // conflict key is never updatable (SQLite rejects)
+        if (composite && (c == "agent_id" || c == "key")) continue;  // ditto
+        if (!first) upd << ", ";
+        first = false;
+        upd << c << " = excluded." << c;
+    }
+    ins << upd.str();
+
+    auto q = m_store->Prepare(ins.str());
+    if (!q) return false;
+    for (size_t i = 0; i < cols.size(); ++i) {
+        const Json::Value& v = root[cols[i]];
+        const int idx = (int)i + 1;
+        if (v.isNull()) q->BindNull(idx);
+        else if (v.isIntegral()) q->BindInt64(idx, v.asInt64());
+        else if (v.isNumeric()) q->BindDouble(idx, v.asDouble());
+        else if (v.isString()) q->BindText(idx, v.asString());
+        else if (v.isBool()) q->BindInt64(idx, v.asBool() ? 1 : 0);
+        else q->BindText(idx, v.asString());
+    }
+    return q->ExecDML();
+}
+
+
+// SQLite can't ALTER COLUMN types; rebuild via create-copy-swap. The DDL
+// string creates the NEW shape under a temp name; rows are copied (SQLite's
+// implicit int->text coercion handles the row-id widening); the old table
+// is dropped and the new one renamed into place. Preserves rows; loses
+// nothing else (indexes on these tables are recreated by callers/DDL).
+bool SyncStore::RebuildSqliteTableWide(IDataStore* store, const std::string& ddl,
+                                       const std::string& table, std::string* error) {
+    const std::string tmp = table + "__p2a_tmp";
+    // Rewrite the DDL's table name into the temp name.
+    std::string tmpDdl = ddl;
+    const size_t nameAt = tmpDdl.find(table);
+    if (nameAt == std::string::npos) {
+        if (error) *error = "ddl does not name the table";
+        return false;
+    }
+    tmpDdl.replace(nameAt, table.size(), tmp);
+
+    if (!store->Exec("DROP TABLE IF EXISTS " + tmp)) {
+        if (error) *error = "drop tmp failed: " + store->ErrMsg();
+        return false;
+    }
+    if (!store->Exec(tmpDdl)) {
+        if (error) *error = "create tmp failed: " + store->ErrMsg();
+        return false;
+    }
+    if (!store->Exec("INSERT INTO " + tmp + " SELECT * FROM " + table)) {
+        if (error) *error = "copy rows failed: " + store->ErrMsg();
+        store->Exec("DROP TABLE IF EXISTS " + tmp);
+        return false;
+    }
+    if (!store->Exec("DROP TABLE " + table)) {
+        if (error) *error = "drop old failed: " + store->ErrMsg();
+        return false;
+    }
+    if (!store->Exec("ALTER TABLE " + tmp + " RENAME TO " + table)) {
+        if (error) *error = "rename failed: " + store->ErrMsg();
+        return false;
+    }
+    return true;
+}
+
+} // namespace animus::kernel

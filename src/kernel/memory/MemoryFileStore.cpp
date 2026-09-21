@@ -165,10 +165,13 @@ void MemoryFileStore::EnsureSchema() {
         )");
 
         // Backfill existing rows into FTS table.
+        // #51: membership tested against the _docsize shadow table (index
+        // truth) — external-content rowid reads are content-proxied and
+        // made the previous form a permanent no-op.
         m_store->Exec(
             "INSERT INTO memory_files_fts(rowid, content) "
             "SELECT id, content FROM memory_files "
-            "WHERE id NOT IN (SELECT rowid FROM memory_files_fts)");
+            "WHERE id NOT IN (SELECT id FROM memory_files_fts_docsize)");
     } else {
         // PostgreSQL: add tsvector column + GIN index.
         if (!schema::ColumnExists(m_store, "memory_files", "search_vector")) {
@@ -205,7 +208,7 @@ MemoryFile MemoryFileStore::CreateFile(const MemoryFile& file) {
         auto stmt = m_store->Prepare(
             "INSERT INTO memory_files "
             "(source_path, file_type, content, content_mutable, agent_id, superseded, created_at_unix_ms, imported_at_unix_ms, status) "
-            "VALUES (?,?,?,?,?,?,?,?,?)");
+            "VALUES (?,?,?,?,?,?,?,?,?) RETURNING id");
         if (!stmt) return {};
         stmt->BindText(1, file.source_path);
         stmt->BindInt64(2, FileTypeToInt(file.file_type));
@@ -216,12 +219,13 @@ MemoryFile MemoryFileStore::CreateFile(const MemoryFile& file) {
         stmt->BindInt64(7, createdAt);
         stmt->BindInt64(8, importedAt);
         stmt->BindInt(9, static_cast<int64_t>(file.status));
-        stmt->ExecDML();
-        if (!DidWriteRows(stmt.get())) {
-            ALOG_WARNING("memory_files", "create failed: " << m_store->ErrMsg());
+        // #76: statement-scoped id via RETURNING (the Sep 10 file_write
+        // create-phantom shape — row committed, id lost to the shared scan).
+        if (!stmt->Step()) {
+            ALOG_WARNING("memory_files", "create failed (no RETURNING row): " << m_store->ErrMsg());
             return {};
         }
-        newId = m_store->LastInsertRowId();
+        newId = stmt->ColumnInt64(0);
         // stmt destroyed here — releases statement before GetFile reuses the connection
     }
 

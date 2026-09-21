@@ -33,6 +33,18 @@ struct ApiPackage {
     std::string registry_version;    // semver last downloaded; "" if none
     bool locally_modified{false};
     bool enabled{false};             // install != enable; enabling is explicit
+    std::string egress_hosts;        // JSON array of allowed host patterns (#25);
+                                     // derived from url templates when undeclared
+    std::string approval_status;     // #25 gate: "pending" | "approved" | "rejected";
+                                     // "" (NULL) = pre-gate row, grandfathered by sweep
+    std::string content_hash;        // SHA256 of the canonical content projection;
+                                     // approval binds to content, not name
+    std::string approved_hash;       // content_hash at approval time; content change
+                                     // resets the package to pending
+    std::string hash_algo;           // "v2" = canonicalized projection (sorted
+                                     // egress, parsed nested JSON); ""/NULL = v1
+                                     // (string-embedded) — upgrade-verified by
+                                     // MigrateHashV2 before re-binding
     int64_t dispatch_cooldown_ms{10000};
     int64_t files_quota_mb{256};     // ctx.fs quota (D12)
     std::string state_schema;        // JSON object: key -> {type, default?, secret?}
@@ -81,9 +93,23 @@ public:
 
     // Full authored-field update (everything except id/name/enabled/state/
     // timestamps). Returns false if the package does not exist.
-    bool UpdatePackageMeta(const ApiPackage& pkg);
+    // partOfLargerWrite: caller (InstallFromManifest) arbitrates approval
+    // itself at the end of its transaction — skip the per-call refresh.
+    bool UpdatePackageMeta(const ApiPackage& pkg, bool partOfLargerWrite = false);
 
     bool SetPackageEnabled(const std::string& id, bool enabled);
+
+    // #25 approval gate. Owner-only transitions (admin surface):
+    // Approve records the package's CURRENT content hash; any later content
+    // change (reinstall with different manifest) returns it to pending.
+    bool ApprovePackage(const std::string& id);
+    bool RejectPackage(const std::string& id);
+
+    // Canonical content fingerprint: same package content -> same hash across
+    // install paths (manifest text order/whitespace do not participate).
+    static std::string ComputeContentHash(const ApiPackage& pkg,
+                                          const std::vector<ApiPackageCommand>& cmds,
+                                          const std::vector<ApiPackageConnection>& conns);
     // Persists a full state object (validation is the sandbox layer's job;
     // the store only checks it parses as a JSON object). Returns false if
     // the package is missing or the payload is not a JSON object.
@@ -116,6 +142,36 @@ public:
     // Absent row -> inherit package default. Effective enablement for agent A
     // = package.enabled AND (no row OR row.enabled).
     void SetAgentEnablement(const std::string& packageId, const std::string& agentId, bool enabled);
+
+    // #25: backfill egress scopes for packages predating the column (derived
+    // from stored url templates + state_schema defaults). Idempotent.
+    void MigrateEgressScopes();
+    void MigrateApprovalGate();
+    void MigrateHashV2();
+
+    // Single arbitration point for the approval gate: recompute the content
+    // hash from STORED rows and reconcile approval_status with it.
+    //   approved + hash match        -> stays approved
+    //   approved + hash drift        -> pending (approved_hash KEPT so content
+    //                                    restored to the approved bytes
+    //                                    re-approves automatically)
+    //   pending + hash == approved   -> re-approved (content restored)
+    //   otherwise                    -> status kept, content_hash refreshed
+    // ownerActed: the owner performed the write themselves — approval by act.
+    void RefreshApproval(const std::string& packageId, bool ownerActed = false);
+
+    // Runtime/poll backstop (#106 audit): verify an approved package's stored
+    // content still matches approved_hash. On drift, downgrades to pending
+    // (via RefreshApproval) and returns false. Defense in depth against any
+    // mutation path that skips RefreshApproval (including direct DB writes).
+    bool VerifyApprovalBinding(const std::string& packageId);
+
+    // v1 (pre-#106-audit) projection: nested JSON embedded verbatim, egress
+    // order-sensitive. Used ONLY by MigrateHashV2 to authenticate rows that
+    // were approved under v1 before re-binding them under v2.
+    std::string ComputeContentHashLegacy(const ApiPackage& pkg,
+                                         const std::vector<ApiPackageCommand>& cmds,
+                                         const std::vector<ApiPackageConnection>& conns);
     std::optional<bool> GetAgentEnablement(const std::string& packageId,
                                            const std::string& agentId) const;  // nullopt = no row
     bool ClearAgentEnablement(const std::string& packageId, const std::string& agentId);
@@ -129,7 +185,8 @@ public:
     // Throws std::runtime_error with a descriptive message on any violation.
     ApiPackage InstallFromManifest(const std::string& manifestJson,
                                    const std::string& registrySource = "",
-                                   const std::string& registryVersion = "");
+                                   const std::string& registryVersion = "",
+                                   bool ownerInstalled = false);
 
     // Validates a package name (slug + reserved words). Throws with a
     // descriptive message. Used by CreatePackage and the api tool.

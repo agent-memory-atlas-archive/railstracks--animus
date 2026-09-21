@@ -314,6 +314,7 @@
                     item["last_fire"] = schedule.last_fire;
                     item["fire_count"] = schedule.fire_count;
                     item["max_fires"] = schedule.max_fires;
+                    item["semantics"] = schedule.semantics;
                     arr.append(item);
                 }
 
@@ -322,6 +323,69 @@
                 out["tag"] = tag;
                 out["total"] = static_cast<Json::UInt64>(arr.size());
                 out["schedules"] = arr;
+                callback(drogon::HttpResponse::newHttpJsonResponse(out));
+            },
+            {drogon::Get});
+
+        // GET /api/v1/scheduler/runs — task run history (#78 task_runs)
+        // Query: agent_id (optional), schedule_id (optional), limit (default 50, max 500)
+        drogon::app().registerHandler(
+            "/api/v1/scheduler/runs",
+            [](const drogon::HttpRequestPtr& req,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) {
+                    SendServerNotActive(callback);
+                    return;
+                }
+                if (!server->m_scheduler) {
+                    SendJsonError(callback, "scheduler is not configured", drogon::k503ServiceUnavailable);
+                    return;
+                }
+
+                const std::string scheduleId = std::string(req->getParameter("schedule_id"));
+                const std::string agentId = std::string(req->getParameter("agent_id"));
+                int limit = 50;
+                try {
+                    const std::string limitParam = std::string(req->getParameter("limit"));
+                    if (!limitParam.empty()) limit = std::stoi(limitParam);
+                } catch (...) {}
+
+                std::vector<TaskRun> runs;
+                if (!scheduleId.empty()) {
+                    runs = server->m_scheduler->RunStore().ListForSchedule(scheduleId, limit);
+                } else {
+                    runs = server->m_scheduler->RunStore().ListRecent(agentId, limit);
+                }
+
+                Json::Value arr(Json::arrayValue);
+                for (const auto& run : runs) {
+                    Json::Value item(Json::objectValue);
+                    item["id"] = static_cast<Json::Int64>(run.id);
+                    item["epoch"] = Json::Int64(run.epoch);
+                    item["fenced"] = run.fenced;
+                    item["run_uuid"] = run.run_uuid;
+                    item["schedule_id"] = run.schedule_id;
+                    item["agent_id"] = run.agent_id;
+                    item["node_id"] = run.node_id;
+                    item["triggered_by"] = run.triggered_by;
+                    item["scheduled_for"] = run.scheduled_for;
+                    item["started_at_unix_ms"] = static_cast<Json::Int64>(run.started_at_unix_ms);
+                    item["finished_at_unix_ms"] = run.finished_at_unix_ms > 0
+                        ? Json::Value(static_cast<Json::Int64>(run.finished_at_unix_ms))
+                        : Json::Value();
+                    item["duration_ms"] = run.finished_at_unix_ms > 0
+                        ? Json::Value(static_cast<Json::Int64>(
+                              run.finished_at_unix_ms - run.started_at_unix_ms))
+                        : Json::Value();
+                    item["outcome"] = run.outcome;
+                    item["error"] = run.error;
+                    arr.append(item);
+                }
+
+                Json::Value out(Json::objectValue);
+                out["total"] = static_cast<Json::UInt64>(arr.size());
+                out["runs"] = arr;
                 callback(drogon::HttpResponse::newHttpJsonResponse(out));
             },
             {drogon::Get});
@@ -363,6 +427,7 @@
                 out["last_fire"] = schedule->last_fire;
                 out["fire_count"] = schedule->fire_count;
                 out["max_fires"] = schedule->max_fires;
+                out["semantics"] = schedule->semantics;
                 callback(drogon::HttpResponse::newHttpJsonResponse(out));
             },
             {drogon::Get});
@@ -396,6 +461,106 @@
                 callback(drogon::HttpResponse::newHttpJsonResponse(out));
             },
             {drogon::Delete});
+
+        // ── #78 P2b: lease inspection / ops ─────────────────────────────
+
+        // GET /api/v1/scheduler/leases — all effective leases
+        drogon::app().registerHandler(
+            "/api/v1/scheduler/leases",
+            [](const drogon::HttpRequestPtr&,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                if (!server->m_scheduler) {
+                    SendJsonError(callback, "scheduler is not configured", drogon::k503ServiceUnavailable);
+                    return;
+                }
+                const Json::Value out = server->m_scheduler->LeaseStatusJson();
+                callback(drogon::HttpResponse::newHttpJsonResponse(out));
+            },
+            {drogon::Get});
+
+        // GET /api/v1/scheduler/leases/{id} — effective lease view (the
+        // peer-ack endpoint: CheckLeaseAck reads exactly this)
+        drogon::app().registerHandler(
+            "/api/v1/scheduler/leases/{1}",
+            [](const drogon::HttpRequestPtr&,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+               const std::string& id) {
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                if (!server->m_scheduler) {
+                    SendJsonError(callback, "scheduler is not configured", drogon::k503ServiceUnavailable);
+                    return;
+                }
+                auto eff = server->m_scheduler->LeaseStore().EffectiveLease(id);
+                Json::Value out(Json::objectValue);
+                if (!eff) {
+                    out["exists"] = false;
+                    out["schedule_id"] = id;
+                } else {
+                    out["exists"] = true;
+                    out["schedule_id"] = eff->schedule_id;
+                    out["holder_node_id"] = eff->holder_node_id;
+                    out["epoch"] = Json::Int64(eff->epoch);
+                    out["expires_ms"] = Json::Int64(eff->expires_ms);
+                    out["last_renew_ms"] = Json::Int64(eff->last_renew_ms);
+                }
+                callback(drogon::HttpResponse::newHttpJsonResponse(out));
+            },
+            {drogon::Get});
+
+        // GET /api/v1/scheduler/claims/{run_uuid} — SURVIVOR claim view
+        // (#78 P2b two-phase dispatch: CheckClaimAck reads exactly this)
+        drogon::app().registerHandler(
+            "/api/v1/scheduler/claims/{1}",
+            [](const drogon::HttpRequestPtr&,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+               const std::string& runUuid) {
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                if (!server->m_scheduler) {
+                    SendJsonError(callback, "scheduler is not configured", drogon::k503ServiceUnavailable);
+                    return;
+                }
+                auto run = server->m_scheduler->RunStore().GetByUuid(runUuid);
+                Json::Value out(Json::objectValue);
+                if (!run) {
+                    out["exists"] = false;
+                    out["run_uuid"] = runUuid;
+                } else {
+                    out["exists"] = true;
+                    out["run_uuid"] = run->run_uuid;
+                    out["node_id"] = run->node_id;
+                    out["epoch"] = Json::Int64(run->epoch);
+                    out["fenced"] = run->fenced;
+                    out["outcome"] = run->outcome;
+                }
+                callback(drogon::HttpResponse::newHttpJsonResponse(out));
+            },
+            {drogon::Get});
+
+        // POST /api/v1/scheduler/leases/{id}/release — ops force-release
+        drogon::app().registerHandler(
+            "/api/v1/scheduler/leases/{1}/release",
+            [](const drogon::HttpRequestPtr&,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+               const std::string& id) {
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                if (!server->m_scheduler) {
+                    SendJsonError(callback, "scheduler is not configured", drogon::k503ServiceUnavailable);
+                    return;
+                }
+                if (!server->m_scheduler->ReleaseLease(id)) {
+                    SendJsonError(callback, "release failed (no rows?)", drogon::k500InternalServerError);
+                    return;
+                }
+                Json::Value out(Json::objectValue);
+                out["released"] = id;
+                callback(drogon::HttpResponse::newHttpJsonResponse(out));
+            },
+            {drogon::Post});
 
         // PUT /api/v1/scheduler/schedules/{id} — update schedule
         drogon::app().registerHandler(
@@ -434,6 +599,16 @@
                 if (body.isMember("enabled")) updated.enabled = body["enabled"].asBool();
                 if (body.isMember("max_fires")) updated.max_fires = body["max_fires"].asInt();
                 if (body.isMember("metadata")) updated.metadata = body["metadata"].asString();
+                if (body.isMember("semantics")) {
+                    updated.semantics = body["semantics"].asString();
+                    if (updated.semantics != "at_least_once"
+                            && updated.semantics != "lease_required") {
+                        SendJsonError(callback,
+                            "semantics must be at_least_once or lease_required",
+                            drogon::k400BadRequest);
+                        return;
+                    }
+                }
                 // Allow type change (one_shot ↔ recurring)
                 if (body.isMember("schedule_type")) {
                     std::string typeStr = body["schedule_type"].asString();
@@ -464,6 +639,7 @@
                 out["last_fire"] = updated.last_fire;
                 out["fire_count"] = updated.fire_count;
                 out["max_fires"] = updated.max_fires;
+                out["semantics"] = updated.semantics;
                 callback(drogon::HttpResponse::newHttpJsonResponse(out));
             },
             {drogon::Put});
@@ -515,6 +691,14 @@
                 sched.message = body.get("message", "").asString();
                 sched.metadata = body.get("metadata", "").asString();
                 sched.enabled = body.get("enabled", true).asBool();
+                sched.semantics = body.get("semantics", "at_least_once").asString();
+                if (sched.semantics != "at_least_once"
+                        && sched.semantics != "lease_required") {
+                    SendJsonError(callback,
+                        "semantics must be at_least_once or lease_required",
+                        drogon::k400BadRequest);
+                    return;
+                }
 
                 const bool repeat = body.get("repeat", false).asBool();
                 sched.type = repeat ? ScheduleType::Recurring : ScheduleType::OneShot;
@@ -558,6 +742,7 @@
                 out["metadata"] = created->metadata;
                 out["enabled"] = created->enabled;
                 out["created_at"] = created->created_at;
+                out["semantics"] = created->semantics;
 
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(out);
                 resp->setStatusCode(drogon::k201Created);

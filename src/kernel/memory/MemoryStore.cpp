@@ -136,6 +136,61 @@ void MemoryStore::EnsureSchema() {
         );
     )");
 
+    // #76: memory_layers uniqueness enforcement + duplicate cleanup.
+    // Tables created before the (agent_id, name) constraint existed (e.g.
+    // animus-tradingbot's PostgreSQL instance) accumulated a parallel
+    // duplicate layer set from racing boot inits. Remove duplicates that
+    // carry no observations (never observation-bearing rows), then enforce
+    // uniqueness with an index. If observation-bearing duplicates remain,
+    // index creation fails loudly — a visible tripwire, not silent decay.
+    m_store->Exec(
+        "DELETE FROM memory_layers WHERE id IN ("
+        "SELECT l.id FROM memory_layers l "
+        "WHERE NOT EXISTS (SELECT 1 FROM observations o WHERE o.layer_id = l.id) "
+        "AND l.id > (SELECT MIN(l2.id) FROM memory_layers l2 "
+        "WHERE l2.agent_id = l.agent_id AND l2.name = l.name))");
+    if (!m_store->Exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_layers_agent_name "
+        "ON memory_layers(agent_id, name)")) {
+        ALOG_ERROR("memory", "memory_layers unique index creation failed (observation-bearing "
+                 "duplicates remain?): " << m_store->ErrMsg());
+    }
+
+    // #51: retire exact-duplicate ACTIVE observations (same layer, agent,
+    // text) keeping the oldest of each group. Formation of new duplicates
+    // stopped with statement-scoped ids (#76/#80); this heals the residue
+    // idempotently at boot. Superseded rows are revision history and are
+    // left untouched.
+    {
+        auto dupes = m_store->Prepare(
+            "SELECT id FROM observations o "
+            "WHERE o.memory_state <> 2 AND o.superseded_by = 0 "
+            "AND EXISTS (SELECT 1 FROM observations o2 "
+            "WHERE o2.memory_state <> 2 AND o2.superseded_by = 0 "
+            "AND o2.layer_id = o.layer_id AND o2.agent_id = o.agent_id "
+            "AND o2.text = o.text AND o2.id < o.id)");
+        std::vector<int64_t> dupeIds;
+        while (dupes && dupes->Step()) {
+            dupeIds.push_back(dupes->ColumnInt64(0));
+        }
+        for (int64_t dupeId : dupeIds) {
+            auto retire = m_store->Prepare(
+                "UPDATE observations SET memory_state = 2, updated_at_unix_ms = ? "
+                "WHERE id = ? AND memory_state <> 2");
+            if (retire && retire->BindInt64(1, NowUnixMs())
+                       && retire->BindInt64(2, dupeId)) {
+                retire->Step();
+            } else {
+                ALOG_WARNING("memory", "duplicate-observation retire failed for id "
+                          << dupeId << ": " << m_store->ErrMsg());
+            }
+        }
+        if (!dupeIds.empty()) {
+            ALOG_INFO("memory", "retired " << dupeIds.size()
+                   << " exact-duplicate observation(s) at schema init");
+        }
+    }
+
     schema::CreateTable(m_store, R"(
         CREATE TABLE IF NOT EXISTS layer_perspectives (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,50 +412,99 @@ std::optional<MemoryLayer> MemoryStore::GetIntakeLayer(const std::string& agent_
     return RowToLayer(stmt.get());
 }
 
-MemoryLayer MemoryStore::CreateLayer(const MemoryLayer& layer) {
+MemoryLayer MemoryStore::CreateLayer(const MemoryLayer& layer, int64_t preset_id) {
     auto now = NowUnixMs();
     std::string agentId = layer.agent_id;
-    auto stmt = m_store->Prepare(
-        "INSERT INTO memory_layers (agent_id, name, horizon, sort_order, evaluation_interval_seconds, "
+
+    // #78 P2c deterministic defaults: a preset row that already exists (by
+    // id — replicated copy or reseed; or by name — legacy autoincrement
+    // defaults from a pre-P2c node) is KEPT, never duplicated.
+    if (preset_id > 0) {
+        auto byId = m_store->Prepare(
+            "SELECT id FROM memory_layers WHERE id = ?");
+        if (byId && byId->BindInt64(1, preset_id) && byId->Step()) {
+            return GetLayer(preset_id).value_or(MemoryLayer{});
+        }
+        auto byName = m_store->Prepare(
+            "SELECT id FROM memory_layers WHERE agent_id = ? AND name = ?");
+        if (byName && byName->BindText(1, agentId)
+                && byName->BindText(2, layer.name) && byName->Step()) {
+            return GetLayer(byName->ColumnInt64(0)).value_or(MemoryLayer{});
+        }
+    }
+
+    const bool fixed = preset_id > 0;
+    auto stmt = m_store->Prepare(std::string(
+        "INSERT INTO memory_layers (")
+        + (fixed ? "id, " : "")
+        + "agent_id, name, horizon, sort_order, evaluation_interval_seconds, "
         "cron_expr, consolidation_prompt, consolidation_intake_prompt, intake_interval, "
         "token_budget, enabled, created_at_unix_ms, updated_at_unix_ms) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        "VALUES (" + (fixed ? "?, " : "") + "?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        // #76: idempotent layer ensure — parallel boot races collapse onto one row.
+        "ON CONFLICT(agent_id, name) DO NOTHING "
+        "RETURNING id");
     if (!stmt) return {};
 
-    stmt->BindText(1, agentId);
-    stmt->BindText(2, layer.name);
-    stmt->BindText(3, layer.horizon);
-    stmt->BindInt(4, layer.sort_order);
-    stmt->BindInt64(5, layer.evaluation_interval_seconds);
-    stmt->BindText(6, layer.cron_expr);
-    stmt->BindText(7, layer.consolidation_review_prompt);
-    stmt->BindText(8, layer.consolidation_intake_prompt);
+    int bind = 0;
+    if (fixed) stmt->BindInt64(++bind, preset_id);
+    stmt->BindText(++bind, agentId);
+    stmt->BindText(++bind, layer.name);
+    stmt->BindText(++bind, layer.horizon);
+    stmt->BindInt(++bind, layer.sort_order);
+    stmt->BindInt64(++bind, layer.evaluation_interval_seconds);
+    stmt->BindText(++bind, layer.cron_expr);
+    stmt->BindText(++bind, layer.consolidation_review_prompt);
+    stmt->BindText(++bind, layer.consolidation_intake_prompt);
     if (layer.intake_interval.has_value() && !layer.intake_interval->empty()) {
-        stmt->BindText(9, *layer.intake_interval);
+        stmt->BindText(++bind, *layer.intake_interval);
     } else {
-        stmt->BindNull(9);
+        stmt->BindNull(++bind);
     }
-    stmt->BindInt64(10, layer.token_budget);
-    stmt->BindInt(11, layer.enabled ? 1 : 0);
-    stmt->BindInt64(12, now);
-    stmt->BindInt64(13, now);
+    stmt->BindInt64(++bind, layer.token_budget);
+    stmt->BindInt(++bind, layer.enabled ? 1 : 0);
+    stmt->BindInt64(++bind, now);
+    stmt->BindInt64(++bind, now);
 
-    stmt->ExecDML();
-    if (!DidWriteRows(stmt.get())) {
-        ALOG_WARNING("memory", "insert layer failed: " << m_store->ErrMsg());
+    // #76: statement-scoped id via RETURNING; on conflict resolve the
+    // existing row instead of failing (parallel-boot safe).
+    int64_t newLayerId = 0;
+    if (stmt->Step()) {
+        newLayerId = stmt->ColumnInt64(0);
+    } else {
+        auto existing = m_store->Prepare(
+            "SELECT id FROM memory_layers WHERE agent_id = ? AND name = ?");
+        if (existing && existing->BindText(1, agentId) && existing->BindText(2, layer.name)
+            && existing->Step()) {
+            newLayerId = existing->ColumnInt64(0);
+        }
+    }
+    if (newLayerId <= 0) {
+        ALOG_WARNING("memory", "insert layer failed (no RETURNING row and no existing row): "
+                  << m_store->ErrMsg());
         return {};
     }
 
-    auto result = GetLayer(m_store->LastInsertRowId());
+    auto result = GetLayer(newLayerId);
 
-    // Auto-create perspective row
+    // Auto-create perspective row. #78 P2c: preset layers get a preset
+    // perspective id (same value) — cross-apply converges on identical rows.
     if (result) {
-        std::string sql = schema::InsertIgnoreSql(m_store,
-            "layer_perspectives", "layer_id, updated_at_unix_ms", "layer_id");
+        std::string sql = (preset_id > 0)
+            ? "INSERT OR IGNORE INTO layer_perspectives "
+              "(id, layer_id, updated_at_unix_ms) VALUES (?,?,?)"
+            : schema::InsertIgnoreSql(m_store,
+              "layer_perspectives", "layer_id, updated_at_unix_ms", "layer_id");
         auto ps = m_store->Prepare(sql);
         if (ps) {
-            ps->BindInt64(1, result->id);
-            ps->BindInt64(2, now);
+            if (preset_id > 0) {
+                ps->BindInt64(1, result->id);   // id = layer_id (1:1)
+                ps->BindInt64(2, result->id);
+                ps->BindInt64(3, now);
+            } else {
+                ps->BindInt64(1, result->id);
+                ps->BindInt64(2, now);
+            }
             ps->Step();
         }
     }
@@ -520,7 +624,13 @@ bool MemoryStore::CreateDefaultLayersForAgent(const std::string& agent_id) {
         layer.token_budget = def.token_budget;
         layer.enabled = true;
 
-        auto created = CreateLayer(layer);
+        // #78 P2c: deterministic ids 1..7 — below every node's id-space
+        // (node ranges start at N<<40 + 1), so independently-booted nodes
+        // seed IDENTICAL rows and cross-apply converges instead of
+        // colliding on unique(agent_id, name) (the 14×/side WARN flood).
+        static_assert(7 <= 1099511627776LL, "reserved default ids fit below node 1 range");
+        const int64_t presetId = static_cast<int64_t>(&def - defaults) + 1;
+        auto created = CreateLayer(layer, presetId);
         if (created.id == 0) {
             ALOG_WARNING("memory", "failed to seed layer: " << def.name);
         }
@@ -687,7 +797,7 @@ Observation MemoryStore::CreateObservation(const Observation& obs) {
         "INSERT INTO observations (layer_id, agent_id, text, weight, decay_rate, tags, source, "
         "created_at_unix_ms, updated_at_unix_ms, last_evaluated_at_ms, next_review_at_ms, "
         "memory_state, superseded_by) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id");
     if (!stmt) return {};
 
     stmt->BindInt64(1, obs.layer_id);
@@ -704,10 +814,11 @@ Observation MemoryStore::CreateObservation(const Observation& obs) {
     stmt->BindInt64(12, MemoryStateToInt(obs.memory_state));
     stmt->BindInt64(13, obs.superseded_by);
 
-    bool execOk = stmt->ExecDML();
-    if (!execOk || !DidWriteRows(stmt.get())) {
-        ALOG_WARNING("memory", "insert observation failed: execOk=" << execOk
-                  << " changes=" << m_store->Changes()
+    // #76: statement-scoped id — the RETURNING row is the write receipt.
+    // (Store-global LastInsertRowId()/Changes() raced with concurrent DML:
+    // committed rows reported failed, ids borrowed from other threads.)
+    if (!stmt->Step()) {
+        ALOG_WARNING("memory", "insert observation failed (no RETURNING row): "
                   << " err=" << m_store->ErrMsg()
                   << " layer_id=" << obs.layer_id
                   << " agent=" << obs.agent_id
@@ -718,8 +829,7 @@ Observation MemoryStore::CreateObservation(const Observation& obs) {
                   << " next_review=" << nextReviewAt);
         return {};
     }
-
-    int64_t newId = m_store->LastInsertRowId();
+    int64_t newId = stmt->ColumnInt64(0);
 
     // Log mutation
     MemoryMutation m;
@@ -890,7 +1000,7 @@ Observation MemoryStore::ReviseObservation(int64_t obs_id, const std::string& ne
         "INSERT INTO observations (layer_id, agent_id, text, weight, decay_rate, tags, source, "
         "created_at_unix_ms, updated_at_unix_ms, last_evaluated_at_ms, next_review_at_ms, "
         "memory_state, superseded_by) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id");
     if (!stmt) return {};
 
     stmt->BindInt64(1, newVersion.layer_id);
@@ -907,13 +1017,12 @@ Observation MemoryStore::ReviseObservation(int64_t obs_id, const std::string& ne
     stmt->BindInt64(12, MemoryStateToInt(newVersion.memory_state));
     stmt->BindInt64(13, 0);  // current version
 
-    stmt->ExecDML();
-    if (!DidWriteRows(stmt.get())) {
+    // #76: statement-scoped id via RETURNING.
+    if (!stmt->Step()) {
         ALOG_WARNING("memory", "ReviseObservation: insert new version failed: " << m_store->ErrMsg());
         return {};
     }
-
-    int64_t newId = m_store->LastInsertRowId();
+    int64_t newId = stmt->ColumnInt64(0);
 
     // Mark the original as superseded
     auto supersede = m_store->Prepare(
@@ -1029,7 +1138,7 @@ std::optional<LayerPerspective> MemoryStore::GetPerspective(int64_t layer_id) {
     return result;
 }
 
-LayerPerspective MemoryStore::SetPerspective(const LayerPerspective& p) {
+std::optional<LayerPerspective> MemoryStore::SetPerspective(const LayerPerspective& p) {
     auto now = NowUnixMs();
 
     auto stmt = m_store->Prepare(
@@ -1039,7 +1148,7 @@ LayerPerspective MemoryStore::SetPerspective(const LayerPerspective& p) {
         "VALUES (?,?,?,?,?,?,?,?) "
         "ON CONFLICT(layer_id) DO UPDATE SET retrospective=?, retrospective_valence=?, "
         "current_perspective=?, current_valence=?, future_perspective=?, future_valence=?, "
-        "updated_at_unix_ms=?");
+        "updated_at_unix_ms=? RETURNING id");
     if (!stmt) return {};
 
     stmt->BindInt64(1, p.layer_id);
@@ -1059,10 +1168,14 @@ LayerPerspective MemoryStore::SetPerspective(const LayerPerspective& p) {
     stmt->BindText(14, p.future_valence);
     stmt->BindInt64(15, now);
 
-    stmt->ExecDML();
-    if (!DidWriteRows(stmt.get())) {
-        ALOG_WARNING("memory", "upsert perspective failed: " << m_store->ErrMsg());
-        return {};
+    // #76 pattern: the RETURNING row is the write receipt. Store-global row
+    // counts (DidWriteRows/Changes) race with concurrent DML on pooled
+    // connections — committed upserts reported as failures and vice versa.
+    if (!stmt->Step()) {
+        ALOG_WARNING("memory", "upsert perspective failed (no RETURNING row): "
+                  << " err=" << m_store->ErrMsg()
+                  << " layer_id=" << p.layer_id);
+        return std::nullopt;
     }
 
     // Log mutation
@@ -1074,7 +1187,9 @@ LayerPerspective MemoryStore::SetPerspective(const LayerPerspective& p) {
     m.unix_ms = now;
     LogMutation(m);
 
-    return GetPerspective(p.layer_id).value_or(LayerPerspective{});
+    LayerPerspective written = p;
+    written.updated_at_unix_ms = now;
+    return written;
 }
 
 // ============================================================================

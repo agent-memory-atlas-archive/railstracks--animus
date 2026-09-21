@@ -86,7 +86,8 @@ void ScheduleStore::EnsureSchema() {
             created_at TEXT NOT NULL,
             last_fire  TEXT,
             fire_count INTEGER NOT NULL DEFAULT 0,
-            max_fires  INTEGER
+            max_fires  INTEGER,
+            semantics  TEXT NOT NULL DEFAULT 'at_least_once'
         );
     )");
 
@@ -106,9 +107,15 @@ void ScheduleStore::EnsureSchema() {
         if (!schema::ColumnExists(m_store, "schedules", "metadata")) {
             m_store->Exec("ALTER TABLE schedules ADD COLUMN metadata TEXT NOT NULL DEFAULT ''");
         }
+        if (!schema::ColumnExists(m_store, "schedules", "semantics")) {
+            m_store->Exec("ALTER TABLE schedules ADD COLUMN semantics TEXT NOT NULL DEFAULT 'at_least_once'");
+        }
     } else if (m_store->Dialect() == DataStoreDialect::PostgreSQL) {
         if (!schema::ColumnExists(m_store, "schedules", "metadata")) {
             m_store->Exec("ALTER TABLE schedules ADD COLUMN metadata TEXT NOT NULL DEFAULT ''");
+        }
+        if (!schema::ColumnExists(m_store, "schedules", "semantics")) {
+            m_store->Exec("ALTER TABLE schedules ADD COLUMN semantics TEXT NOT NULL DEFAULT 'at_least_once'");
         }
     }
 }
@@ -125,7 +132,7 @@ ScheduleDescriptor ScheduleStore::RowToDescriptor(
         const std::string& metadata,
         bool enabled, const std::string& createdAt,
         const std::string& lastFire, std::int32_t fireCount,
-        std::int32_t maxFires) const {
+        std::int32_t maxFires, const std::string& semantics) const {
     ScheduleDescriptor s;
     s.id = id;
     s.agent_id = agentId;
@@ -141,6 +148,7 @@ ScheduleDescriptor ScheduleStore::RowToDescriptor(
     s.last_fire = lastFire;
     s.fire_count = fireCount;
     s.max_fires = maxFires;
+    s.semantics = semantics.empty() ? "at_least_once" : semantics;
     return s;
 }
 
@@ -153,8 +161,8 @@ bool ScheduleStore::Create(const ScheduleDescriptor& sched, std::string* error) 
 
     auto stmt = m_store->Prepare(
         "INSERT INTO schedules (id, agent_id, tag, type, next_fire, cron_expr, timezone, "
-        "message, metadata, enabled, created_at, max_fires) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+        "message, metadata, enabled, created_at, max_fires, semantics) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
     if (!stmt) {
         if (error) *error = "failed to prepare schedule insert: " + m_store->ErrMsg();
         return false;
@@ -181,6 +189,7 @@ bool ScheduleStore::Create(const ScheduleDescriptor& sched, std::string* error) 
     } else {
         stmt->BindInt(12, sched.max_fires);
     }
+    stmt->BindText(13, sched.semantics.empty() ? "at_least_once" : sched.semantics);
 
     stmt->ExecDML();
     return true;
@@ -195,7 +204,7 @@ std::string ScheduleStore::CreateAndReturnId(ScheduleDescriptor& sched, std::str
 std::optional<ScheduleDescriptor> ScheduleStore::Get(const std::string& id) const {
     auto stmt = m_store->Prepare(
         "SELECT id, agent_id, tag, type, next_fire, cron_expr, timezone, "
-        "message, metadata, enabled, created_at, last_fire, fire_count, max_fires "
+        "message, metadata, enabled, created_at, last_fire, fire_count, max_fires, semantics "
         "FROM schedules WHERE id=?");
     if (!stmt) return std::nullopt;
     stmt->BindText(1, id);
@@ -210,7 +219,8 @@ std::optional<ScheduleDescriptor> ScheduleStore::Get(const std::string& id) cons
             stmt->ColumnInt64(9) != 0, stmt->ColumnText(10),
             stmt->IsColumnNull(11) ? "" : stmt->ColumnText(11),
             stmt->IsColumnNull(12) ? 0 : static_cast<std::int32_t>(stmt->ColumnInt64(12)),
-            stmt->IsColumnNull(13) ? 0 : static_cast<std::int32_t>(stmt->ColumnInt64(13)));
+            stmt->IsColumnNull(13) ? 0 : static_cast<std::int32_t>(stmt->ColumnInt64(13)),
+            stmt->IsColumnNull(14) ? "at_least_once" : stmt->ColumnText(14));
     }
     return std::nullopt;
 }
@@ -221,7 +231,7 @@ std::vector<ScheduleDescriptor> ScheduleStore::List(
 
     std::string sql =
         "SELECT id, agent_id, tag, type, next_fire, cron_expr, timezone, "
-        "message, metadata, enabled, created_at, last_fire, fire_count, max_fires "
+        "message, metadata, enabled, created_at, last_fire, fire_count, max_fires, semantics "
         "FROM schedules WHERE agent_id=?";
     if (!tag.empty()) sql += " AND tag=?";
     sql += " ORDER BY next_fire ASC";
@@ -242,7 +252,8 @@ std::vector<ScheduleDescriptor> ScheduleStore::List(
             stmt->ColumnInt64(9) != 0, stmt->ColumnText(10),
             stmt->IsColumnNull(11) ? "" : stmt->ColumnText(11),
             stmt->IsColumnNull(12) ? 0 : static_cast<std::int32_t>(stmt->ColumnInt64(12)),
-            stmt->IsColumnNull(13) ? 0 : static_cast<std::int32_t>(stmt->ColumnInt64(13))));
+            stmt->IsColumnNull(13) ? 0 : static_cast<std::int32_t>(stmt->ColumnInt64(13)),
+            stmt->IsColumnNull(14) ? "at_least_once" : stmt->ColumnText(14)));
     }
     return result;
 }
@@ -251,7 +262,7 @@ bool ScheduleStore::Update(const ScheduleDescriptor& sched, std::string* error) 
     auto stmt = m_store->Prepare(
         "UPDATE schedules SET agent_id=?, tag=?, type=?, next_fire=?, "
         "cron_expr=?, timezone=?, message=?, metadata=?, enabled=?, last_fire=?, "
-        "fire_count=?, max_fires=? WHERE id=?");
+        "fire_count=?, max_fires=?, semantics=? WHERE id=?");
     if (!stmt) {
         if (error) *error = "failed to prepare schedule update: " + m_store->ErrMsg();
         return false;
@@ -277,7 +288,8 @@ bool ScheduleStore::Update(const ScheduleDescriptor& sched, std::string* error) 
     } else {
         stmt->BindInt(12, sched.max_fires);
     }
-    stmt->BindText(13, sched.id);
+    stmt->BindText(13, sched.semantics.empty() ? "at_least_once" : sched.semantics);
+    stmt->BindText(14, sched.id);
 
     // Trust Step() result, not Changes(). m_lastChanges is a shared atomic
     // across all connections/threads — concurrent queries overwrite it
@@ -303,7 +315,7 @@ std::vector<ScheduleDescriptor> ScheduleStore::GetDueSchedules(
 
     auto stmt = m_store->Prepare(
         "SELECT id, agent_id, tag, type, next_fire, cron_expr, timezone, "
-        "message, metadata, enabled, created_at, last_fire, fire_count, max_fires "
+        "message, metadata, enabled, created_at, last_fire, fire_count, max_fires, semantics "
         "FROM schedules "
         "WHERE enabled = 1 AND next_fire <= ? "
         "ORDER BY next_fire ASC LIMIT ?");
@@ -322,7 +334,8 @@ std::vector<ScheduleDescriptor> ScheduleStore::GetDueSchedules(
             stmt->ColumnInt64(9) != 0, stmt->ColumnText(10),
             stmt->IsColumnNull(11) ? "" : stmt->ColumnText(11),
             stmt->IsColumnNull(12) ? 0 : static_cast<std::int32_t>(stmt->ColumnInt64(12)),
-            stmt->IsColumnNull(13) ? 0 : static_cast<std::int32_t>(stmt->ColumnInt64(13))));
+            stmt->IsColumnNull(13) ? 0 : static_cast<std::int32_t>(stmt->ColumnInt64(13)),
+            stmt->IsColumnNull(14) ? "at_least_once" : stmt->ColumnText(14)));
     }
     return result;
 }

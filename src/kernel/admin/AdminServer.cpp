@@ -37,6 +37,7 @@
 #include "kernel/admin/AdminUiResources.h"
 #include "kernel/admin/internal/AdminServerInternals.h"
 #include "animus_kernel/SessionManager.h"
+#include "animus_kernel/PeerSyncService.h"  // kProtocol for sync routes
 #include <optional>
 
 namespace animus::kernel {
@@ -1301,8 +1302,22 @@ bool AdminServer::SaveInterfacesToDisk(std::string* error) const {
     return m_interfaceManager.SaveToDisk(error);
 }
 
+void AdminServer::SetProviderConfigStore(AgentConfigStore* store) {
+    m_providerManager.ConfigureStore(store);
+}
+
+void AdminServer::OnProviderConfigSyncApplied(const std::string& table, const std::string& rowKey) {
+    // rowKey is the composite pair agent_id\x1Fkey; only "__providers"
+    // rows concern the provider model.
+    if (table != "agent_config") return;
+    if (rowKey.rfind("__providers\x1F", 0) != 0) return;
+    m_providerManager.ReloadFromStore();
+}
+
 bool AdminServer::LoadProvidersFromDisk(std::string* error) {
-    return m_providerManager.LoadFromDisk(error);
+    // #93 P3 slice 3: routes to the replicated store when attached
+    // (LoadProviders handles the one-time legacy file import itself).
+    return m_providerManager.LoadProviders(error);
 }
 
 void AdminServer::RefreshChatSessionServiceDependencies() {
@@ -1319,19 +1334,20 @@ void AdminServer::RefreshChatSessionServiceDependencies() {
     deps.agentConfig = &m_agentConfig;
     deps.attachmentStore = m_attachmentStore;
     deps.attachmentTokenManager = &m_attachmentTokens;
+    deps.channelContextStore = m_channelContextStore;
     m_chatSessionService.Configure(deps);
 }
 
 bool AdminServer::SaveProvidersToDisk(std::string* error) const {
-    return m_providerManager.SaveToDisk(error);
+    return m_providerManager.SaveProviders(error);   // routes by mode
 }
 
 bool AdminServer::LoadAuthFromDisk(const std::string& providerId, Json::Value* out, std::string* error) const {
-    return m_providerManager.LoadAuthFromDisk(providerId, out, error);
+    return m_providerManager.LoadAuthProvider(providerId, out, error);   // routes by mode
 }
 
 bool AdminServer::SaveAuthToDisk(const std::string& providerId, const Json::Value& auth, std::string* error) const {
-    return m_providerManager.SaveAuthToDisk(providerId, auth, error);
+    return m_providerManager.SaveAuthProvider(providerId, auth, error);   // routes by mode
 }
 
 bool AdminServer::TriggerModelClientReinitialization(std::string* error) {
@@ -1489,6 +1505,7 @@ void AdminServer::RegisterHandlersOnce() {
         RegisterRoutesAuth();
         RegisterRoutesDiffusion();
         RegisterRoutesSops();
+        RegisterRoutesSync();
     });
 }
 

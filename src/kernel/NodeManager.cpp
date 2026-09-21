@@ -58,6 +58,13 @@ void NodeManager::EnsureSchema() {
         m_store->Exec("ALTER TABLE node_tokens ADD COLUMN signing_key_hash TEXT NOT NULL DEFAULT ''");
     }
 
+    // #73: user binding — owning AuthUser id (empty = unbound). Existing
+    // rows backfill as unbound; operators reassign via the admin UI
+    // (revoke + recreate, or the new PATCH binding).
+    if (schema::ColumnExists(m_store, "node_tokens", "user_id") == false) {
+        m_store->Exec("ALTER TABLE node_tokens ADD COLUMN user_id TEXT NOT NULL DEFAULT ''");
+    }
+
     m_store->Exec(
         "CREATE INDEX IF NOT EXISTS idx_node_tokens_hash "
         "ON node_tokens(token_hash)");
@@ -66,7 +73,7 @@ void NodeManager::EnsureSchema() {
 void NodeManager::LoadTokens() {
     if (!m_store) return;
     auto stmt = m_store->Prepare(
-        "SELECT id, token_hash, signing_key_hash, description, created_at_unix_ms, revoked "
+        "SELECT id, token_hash, signing_key_hash, description, user_id, created_at_unix_ms, revoked "
         "FROM node_tokens WHERE revoked = 0");
     if (!stmt) return;
     while (stmt->Step()) {
@@ -75,14 +82,20 @@ void NodeManager::LoadTokens() {
         t.token_hash = stmt->ColumnText(1);
         t.signing_key_hash = stmt->ColumnText(2);
         t.description = stmt->ColumnText(3);
-        t.created_at_unix_ms = stmt->ColumnInt64(4);
-        t.revoked = stmt->ColumnInt64(5) != 0;
+        t.user_id = stmt->ColumnText(4);
+        t.created_at_unix_ms = stmt->ColumnInt64(5);
+        t.revoked = stmt->ColumnInt64(6) != 0;
         m_tokensByHash[t.token_hash] = t;
     }
     std::cerr << "[node-manager] Loaded " << m_tokensByHash.size() << " active tokens\n";
 }
 
 NodeManager::GeneratedCredentials NodeManager::GenerateCredentials(const std::string& description) {
+    return GenerateCredentials(description, "");
+}
+
+NodeManager::GeneratedCredentials NodeManager::GenerateCredentials(const std::string& description,
+                                                                   const std::string& userId) {
     GeneratedCredentials result;
     if (!m_store) return result;
 
@@ -92,23 +105,25 @@ NodeManager::GeneratedCredentials NodeManager::GenerateCredentials(const std::st
     std::string signingKeyHash = crypto::Sha256Hex(signingKey);
 
     auto stmt = m_store->Prepare(
-        "INSERT INTO node_tokens (token_hash, signing_key_hash, description, created_at_unix_ms, revoked) "
-        "VALUES (?,?,?,?,0)");
+        "INSERT INTO node_tokens (token_hash, signing_key_hash, description, user_id, created_at_unix_ms, revoked) "
+        "VALUES (?,?,?,?,?,0) RETURNING id");
     if (!stmt) return result;
     stmt->BindText(1, hash);
     stmt->BindText(2, signingKeyHash);
     stmt->BindText(3, description);
-    stmt->BindInt64(4, NowMs());
-    stmt->BindInt64(4, NowMs());
-    stmt->ExecDML();
+    stmt->BindText(4, userId);
+    stmt->BindInt64(5, NowMs());
+    // #76: statement-scoped id via RETURNING.
+    int64_t newTokenId = stmt->Step() ? stmt->ColumnInt64(0) : 0;
 
     NodeToken t;
-    t.id = m_store->LastInsertRowId();
+    t.id = newTokenId;
     t.token = token;
     t.token_hash = hash;
     t.signing_key = signingKey;
     t.signing_key_hash = signingKeyHash;
     t.description = description;
+    t.user_id = userId;
     t.created_at_unix_ms = NowMs();
     m_tokensByHash[hash] = t;
 
@@ -127,6 +142,33 @@ int64_t NodeManager::ValidateToken(const std::string& token) const {
     if (it == m_tokensByHash.end()) return -1;
     if (it->second.revoked) return -1;
     return it->second.id;
+}
+
+bool NodeManager::SetTokenUser(int64_t tokenId, const std::string& userId) {
+    if (!m_store) return false;
+    auto stmt = m_store->Prepare(
+        "UPDATE node_tokens SET user_id = ? WHERE id = ?");
+    if (!stmt) return false;
+    stmt->BindText(1, userId);
+    stmt->BindInt64(2, tokenId);
+    stmt->ExecDML();
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& [hash, t] : m_tokensByHash) {
+        if (t.id == tokenId) {
+            t.user_id = userId;
+            break;
+        }
+    }
+    return true;
+}
+
+std::string NodeManager::GetUserIdForToken(const std::string& token) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::string hash = HashToken(token);
+    auto it = m_tokensByHash.find(hash);
+    if (it == m_tokensByHash.end()) return "";
+    return it->second.user_id;
 }
 
 std::string NodeManager::GetSigningKeyForToken(const std::string& token) const {

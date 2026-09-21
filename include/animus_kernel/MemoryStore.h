@@ -98,7 +98,11 @@ public:
     std::vector<MemoryLayer> ListLayers();                              // all layers, sorted by sort_order ASC
     std::vector<MemoryLayer> ListLayersForAgent(const std::string& agent_id); // layers for a specific agent
     std::optional<MemoryLayer> GetLayer(int64_t id);
-    MemoryLayer CreateLayer(const MemoryLayer& layer);
+    // preset_id > 0: deterministic id for replicated default layers (#78
+    // P2c — fixed ids below every node's id-space so independently-seeded
+    // defaults converge to the SAME rows instead of colliding on
+    // unique(agent_id, name) at cross-apply).
+    MemoryLayer CreateLayer(const MemoryLayer& layer, int64_t preset_id = 0);
     bool UpdateLayer(const MemoryLayer& layer);
     bool DeleteLayer(int64_t id);
     // Delete all layers, observations, and perspectives for an agent.
@@ -146,7 +150,12 @@ public:
 
     // ---- Perspectives ----
     std::optional<LayerPerspective> GetPerspective(int64_t layer_id);
-    LayerPerspective SetPerspective(const LayerPerspective& p);
+    // Upsert all three perspective slots atomically. Returns the written
+    // state on confirmed write (RETURNING receipt), nullopt if the write was
+    // not confirmed — callers MUST propagate failure instead of assuming
+    // success (#70 finding 3: regenerated perspectives reported success while
+    // the row never changed).
+    std::optional<LayerPerspective> SetPerspective(const LayerPerspective& p);
 
     // ---- Mutations (append-only) ----
     void LogMutation(const MemoryMutation& m);

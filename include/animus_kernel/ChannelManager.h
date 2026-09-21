@@ -117,6 +117,13 @@ public:
     ChannelManager(const ChannelManager&) = delete;
     ChannelManager& operator=(const ChannelManager&) = delete;
 
+    // Send-failure sink (#30): adapters report yielded replies that did not
+    // land; the kernel writes a session-visible witness. Safe to call after
+    // construction (read at failure time, not captured at adapter start).
+    void SetSendFailureCallback(ChannelSendFailureCallback cb) {
+        m_sendFailureCb = std::move(cb);
+    }
+
     // --- Channel CRUD ---
     std::vector<ChannelState> ListChannels() const;
     std::optional<ChannelState> GetChannel(const std::string& name) const;
@@ -294,6 +301,7 @@ private:
     DispatchCallback m_dispatch;
     LogCallback m_logCallback;
     SessionQueryCallback m_sessionQuery;
+    ChannelSendFailureCallback m_sendFailureCb;
 
     // All channel states (loaded from config store)
     std::unordered_map<std::string, ChannelState> m_channels;

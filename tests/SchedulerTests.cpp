@@ -384,6 +384,7 @@ int TestSchedulerFireCallback() {
         if (event.metadata.count("message")) {
             firedMessage = event.metadata.at("message");
         }
+        return "dispatched:test";
     });
 
     // Create a schedule that fires immediately (past timestamp)
@@ -415,6 +416,171 @@ int TestSchedulerFireCallback() {
     Assert(retrieved.has_value(), "Schedule should still exist");
     Assert(!retrieved->enabled, "One-shot should be disabled after fire");
     Assert(retrieved->fire_count >= 1, "fire_count should be >= 1");
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
+// ============================================================================
+// TaskRun tests (#78 task_runs — run recording + idempotency claims)
+// ============================================================================
+
+int TestTaskRunStoreBasics() {
+    std::cerr << "  [TaskRun] Store claim/finish/list...\n";
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    TaskRunStore runs(&dataStore);
+    runs.EnsureSchema();
+
+    // First claim wins
+    Assert(runs.TryClaim("sched-1@2026-09-13T10:00:00Z", "sched-1", "agent1",
+                         "2026-09-13T10:00:00Z", 1000),
+           "first claim should win");
+    // Second claim of the same uuid loses (running or finished — no dispatch)
+    Assert(!runs.TryClaim("sched-1@2026-09-13T10:00:00Z", "sched-1", "agent1",
+                          "2026-09-13T10:00:00Z", 2000),
+           "second claim of same uuid must lose");
+    // Different window claims fine
+    Assert(runs.TryClaim("sched-1@2026-09-13T11:00:00Z", "sched-1", "agent1",
+                         "2026-09-13T11:00:00Z", 3000),
+           "different window should claim");
+
+    // Row starts as running
+    auto run = runs.GetByUuid("sched-1@2026-09-13T10:00:00Z");
+    Assert(run.has_value(), "claimed run should be retrievable");
+    Assert(run->outcome == "running", "unclaimed-finished run starts running");
+    Assert(run->agent_id == "agent1", "agent recorded");
+
+    // Finish records outcome + duration basis
+    Assert(runs.Finish("sched-1@2026-09-13T10:00:00Z", "skipped:no_pending_intake", "", 5000),
+           "finish should succeed");
+    run = runs.GetByUuid("sched-1@2026-09-13T10:00:00Z");
+    Assert(run->outcome == "skipped:no_pending_intake", "outcome recorded");
+    Assert(run->finished_at_unix_ms == 5000, "finish timestamp recorded");
+
+    // Claim after finish STILL loses (window processed, period)
+    Assert(!runs.TryClaim("sched-1@2026-09-13T10:00:00Z", "sched-1", "agent1",
+                          "2026-09-13T10:00:00Z", 6000),
+           "claim after finish must lose — a processed window never re-fires");
+
+    // Listing: newest first, schedule-scoped
+    Assert(runs.Finish("sched-1@2026-09-13T11:00:00Z", "dispatched:event", "", 7000), "finish 2");
+    auto list = runs.ListForSchedule("sched-1", 10);
+    Assert(list.size() == 2, "two runs for schedule, got " + std::to_string(list.size()));
+    Assert(list[0].scheduled_for == "2026-09-13T11:00:00Z", "newest first");
+    auto recent = runs.ListRecent("agent1", 10);
+    Assert(recent.size() == 2, "recent agent-scoped has both");
+    Assert(runs.ListRecent("other-agent", 10).empty(), "foreign agent sees none");
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
+int TestSchedulerTaskRunRecording() {
+    std::cerr << "  [TaskRun] Scheduler records fire outcomes...\n";
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    Scheduler scheduler(&dataStore);
+    scheduler.SetPollIntervalMs(300);
+
+    std::atomic<int> fireCount{0};
+    scheduler.SetFireCallback([&](const IncomingEvent& event) {
+        fireCount++;
+        return "dispatched:recording-test";
+    });
+
+    ScheduleDescriptor past;
+    past.agent_id = "agent1";
+    past.next_fire = "2020-01-01T00:00:00Z";
+    past.message = "record me";
+    past.type = ScheduleType::OneShot;
+
+    std::string err;
+    auto id = scheduler.Create(past, &err);
+    Assert(!id.empty(), "Create: " + err);
+
+    Assert(scheduler.Start(&err), "Start: " + err);
+    for (int i = 0; i < 25 && fireCount.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    scheduler.Stop();
+
+    Assert(fireCount.load() == 1, "exactly one fire, got " + std::to_string(fireCount.load()));
+
+    auto runs = scheduler.RunStore().ListForSchedule(id, 10);
+    Assert(runs.size() == 1, "one task_run recorded, got " + std::to_string(runs.size()));
+    if (!runs.empty()) {
+        Assert(runs[0].outcome == "dispatched:recording-test",
+               "outcome = callback status, got: " + runs[0].outcome);
+        Assert(runs[0].finished_at_unix_ms > 0, "run finished");
+        Assert(runs[0].schedule_id == id, "schedule_id recorded");
+        Assert(runs[0].agent_id == "agent1", "agent recorded");
+    }
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
+int TestSchedulerCrashReplayNoDoubleFire() {
+    std::cerr << "  [TaskRun] Crash-replay: claimed window never re-dispatches...\n";
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    Scheduler scheduler(&dataStore);
+    scheduler.SetPollIntervalMs(300);
+
+    std::atomic<int> fireCount{0};
+    scheduler.SetFireCallback([&](const IncomingEvent&) {
+        fireCount++;
+        return "dispatched:first-life";
+    });
+
+    ScheduleDescriptor past;
+    past.agent_id = "agent1";
+    past.next_fire = "2020-06-01T00:00:00Z";   // the window identity
+    past.message = "crash sim";
+    past.type = ScheduleType::OneShot;
+
+    std::string err;
+    auto id = scheduler.Create(past, &err);
+    Assert(!id.empty(), "Create: " + err);
+
+    Assert(scheduler.Start(&err), "Start: " + err);
+    for (int i = 0; i < 25 && fireCount.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    scheduler.Stop();
+    Assert(fireCount.load() == 1, "first life fires once");
+
+    // Simulate crash-before-schedule-update: re-enable with the SAME window.
+    // (Real crash: the state update never landed, so next_fire is unchanged.)
+    auto s = scheduler.Get(id);
+    Assert(s.has_value(), "schedule exists");
+    s->enabled = true;                 // one-shot disabled itself; force back due
+    s->next_fire = "2020-06-01T00:00:00Z";  // SAME window -> same run uuid
+    Assert(scheduler.Update(*s, &err), "Update: " + err);
+
+    // Second life: poll again. The claim must block the dispatch, but the
+    // schedule state must still advance (no wedge).
+    scheduler.SetFireCallback([&](const IncomingEvent&) {
+        fireCount++;
+        return "dispatched:second-life";   // must NOT be invoked
+    });
+    Assert(scheduler.Start(&err), "Restart: " + err);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    scheduler.Stop();
+
+    Assert(fireCount.load() == 1,
+           "claimed window must not re-dispatch (got " + std::to_string(fireCount.load()) + ")");
+
+    auto runs = scheduler.RunStore().ListForSchedule(id, 10);
+    Assert(runs.size() == 1, "still exactly one run, got " + std::to_string(runs.size()));
+    Assert(!runs.empty() && runs[0].outcome == "dispatched:first-life",
+           "original run outcome intact");
+
+    auto after = scheduler.Get(id);
+    Assert(after.has_value() && after->fire_count == 2,
+           "schedule state advanced despite skipped dispatch (fire_count 2), got " +
+           std::to_string(after.has_value() ? after->fire_count : -1));
 
     std::filesystem::remove(dbPath);
     return 0;
@@ -609,6 +775,12 @@ int main() {
     // Fire callback test (uses thread)
     std::cerr << "\n-- Scheduler (fire callback) --\n";
     TestSchedulerFireCallback();
+
+    // TaskRun tests (#78)
+    std::cerr << "\n-- TaskRun (#78) --\n";
+    TestTaskRunStoreBasics();
+    TestSchedulerTaskRunRecording();
+    TestSchedulerCrashReplayNoDoubleFire();
 
     // Tool tests
     std::cerr << "\n-- ScheduleTool --\n";

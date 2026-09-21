@@ -28,6 +28,9 @@ class ProviderThrottle;
 class SessionManager;
 class ChainRunner;
 class CompactionService;
+class SecretsVault;
+class SyncStore;
+class PeerSyncService;
 class Scheduler;
 class ConsolidationPipeline;
 class NodeManager;
@@ -100,6 +103,11 @@ private:
     void SendAutoReply(const ChannelManager::ReplyTarget& target,
                        const std::string& text);
 
+    /// Delivery-failure witness (#30): write a session note when a yielded
+    /// channel reply fails to land, so the agent (and admin UI) can see it.
+    void ReportChannelSendFailure(const ChannelReplyTarget& target,
+                                  const std::string& error);
+
     /// Execute a channel dispatch: run the LLM chain on the session and send the reply.
     /// Used by both the direct dispatch path and the MessageQueue flush callback.
     void ExecuteChannelDispatch(
@@ -151,12 +159,15 @@ private:
     ChannelContextStore* m_channelContextStore{nullptr}; // trusted channel arrivals (#14)
     ApiPackageStore* m_apiPackageStore{nullptr}; // api package persistence (#26 b)
     ApiRuntime* m_apiRuntime{nullptr};               // api package runtime (#26 c)
+    SecretsVault* m_secretsVault{nullptr};           // encrypted package secrets (#23)
     ApiConnectionManager* m_apiConnManager{nullptr};  // connection driver + dispatch bridge (#26 d)
     AgendaStore* m_agendaStore{nullptr}; // per-agent calendar/agenda
     SessionReportStore* m_sessionReportStore{nullptr}; // per-session temporal reports
     ContextProviderRegistry* m_contextRegistry{nullptr}; // prompt assembly providers
     SessionTagsStore* m_sessionTagsStore{nullptr}; // session tag keywords
     PromptLogStore* m_promptLogStore{nullptr}; // LLM call logging
+    SyncStore* m_syncStore{nullptr};
+    PeerSyncService* m_peerSyncService{nullptr};   // #78 P1c pull loop
     Scheduler* m_scheduler{nullptr};              // cron-like schedule subsystem
     ConsolidationPipeline* m_consolidation{nullptr}; // memory consolidation pipeline
     std::unordered_map<std::string, std::unique_ptr<LuaState>> m_luaStates; // per-agent Lua VMs

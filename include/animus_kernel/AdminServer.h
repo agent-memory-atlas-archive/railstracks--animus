@@ -72,6 +72,8 @@ class PromptLogStore;
 
 class ApiPackageStore;
 class ApiRuntime;
+class SyncStore;
+class PeerSyncService;
 
 class AdminServer {
 public:
@@ -121,6 +123,17 @@ public:
     bool LoadConstitutionFromDisk(std::string* error);
     bool LoadInterfacesFromDisk(std::string* error);
     bool TriggerModelClientReinitialization(std::string* error);
+    // #93 P3 slice 3: attach the replicated config store — provider
+    // persistence switches from providers.json/auth.json to agent_config
+    // kv rows (replicated; secrets via vault). No-op attachments keep the
+    // legacy file behavior.
+    void SetProviderConfigStore(AgentConfigStore* store);
+
+    // #93 P3 slice 3: SyncStore apply-notifier relay — a remote
+    // agent_config apply under "__providers" rebuilds the in-memory
+    // provider model (provider config changed on a peer).
+    void OnProviderConfigSyncApplied(const std::string& table, const std::string& rowKey);
+
     bool LoadProvidersFromDisk(std::string* error);
     bool SaveProvidersToDisk(std::string* error) const;
     bool LoadAuthFromDisk(const std::string& providerId, Json::Value* out, std::string* error) const;
@@ -165,6 +178,8 @@ public:
     ontology::OntologyStore* m_ontologyStore{nullptr};
     AgentStore* m_agentStore{nullptr};
     NodeManager* m_nodeManager{nullptr};
+    SyncStore* m_syncStore{nullptr};            // #78 P1b outbox/LWW
+    PeerSyncService* m_peerSyncService{nullptr};     // #78 P1c pull loop (may be null)
     ToolRegistry* m_toolRegistry{nullptr};
     Scheduler* m_scheduler{nullptr};
     ::animus::jobs::JobSystem* m_jobs{nullptr};
@@ -202,6 +217,8 @@ public:
     }
     void SetToolRegistry(ToolRegistry* reg) { m_toolRegistry = reg; }
     void SetNodeManager(NodeManager* nm) { m_nodeManager = nm; }
+    void SetSyncStore(SyncStore* store) { m_syncStore = store; }
+    void SetPeerSyncService(PeerSyncService* svc) { m_peerSyncService = svc; }
     void SetScheduler(Scheduler* scheduler) { m_scheduler = scheduler; }
     void SetDiaryStore(DiaryStore* store) { m_diaryManager.Configure(store); }
     void SetGallivantingStore(GallivantingStore* store) { m_gallivantingStore = store; }
@@ -298,6 +315,7 @@ private:
     void RegisterRoutesAuth();
     void RegisterRoutesDiffusion();
     void RegisterRoutesSops();
+    void RegisterRoutesSync();
     void SyncIrcInterfaces();
     void RefreshChatSessionServiceDependencies();
 

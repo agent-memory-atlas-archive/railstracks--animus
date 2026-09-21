@@ -49,6 +49,9 @@ private:
     ToolResult HandleCreate(const std::string& arguments, const std::string& agentId);
     ToolResult HandleFetchPending(const std::string& arguments, const std::string& agentId, bool isSessionReport = false);
     ToolResult HandleOntologyUpsert(const std::string& arguments, const std::string& agentId);
+    ToolResult HandleOntologyList(const std::string& arguments, const std::string& agentId);
+    ToolResult HandleOntologyGet(const std::string& arguments, const std::string& agentId);
+    ToolResult HandleOntologyDelete(const std::string& arguments, const std::string& agentId);
     ToolResult HandleMemoryFileFetch(const std::string& arguments, const std::string& agentId);
     ToolResult HandleMemoryFileMarkProcessed(const std::string& arguments, const std::string& agentId);
     ToolResult HandleSessionReport(const std::string& arguments, const std::string& agentId);

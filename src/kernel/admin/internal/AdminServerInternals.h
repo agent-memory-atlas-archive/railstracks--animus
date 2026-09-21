@@ -18,6 +18,7 @@
 #include "animus_kernel/Session.h"
 #include "animus_kernel/AttachmentStore.h"
 #include "animus_kernel/AttachmentTokenManager.h"
+#include "animus_kernel/Log.h"
 #include "animus_kernel/admin/ObservationStreamTypes.h"
 #include "animus_kernel/tools/ToolTypes.h"
 

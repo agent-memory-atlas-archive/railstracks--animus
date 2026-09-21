@@ -1,3 +1,6 @@
+#include "animus_kernel/IdRanges.h"
+#include "animus_kernel/SyncStore.h"
+#include "animus_kernel/PeerSyncService.h"
 #include "animus_kernel/AgentKernel.h"
 #include "animus_kernel/Log.h"
 
@@ -72,11 +75,13 @@
 #include "animus_kernel/tools/ChannelsTool.h"
 #include "animus_kernel/tools/EmailTool.h"
 #include "animus_kernel/scheduler/Scheduler.h"
+#include "animus_kernel/scheduler/ScheduleLeaseStore.h"
 #include "animus_kernel/admin/DiaryManager.h"
 #include "animus_kernel/SessionNotesStore.h"
 #include "animus_kernel/ChannelContextStore.h"
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/api/ApiRuntime.h"
+#include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/api/ApiConnectionManager.h"
 #include "animus_kernel/tools/ApiTool.h"
 #include "animus_kernel/AgendaStore.h"
@@ -160,12 +165,15 @@ AgentKernel::~AgentKernel() {
     delete m_projectStore; m_projectStore = nullptr;
     delete m_dataStore; m_dataStore = nullptr;
     delete m_providerThrottle; m_providerThrottle = nullptr;
+    delete m_peerSyncService; m_peerSyncService = nullptr;
+    delete m_syncStore; m_syncStore = nullptr;
     delete m_scheduler; m_scheduler = nullptr;
     delete m_sessionNotesStore; m_sessionNotesStore = nullptr;
     delete m_channelContextStore; m_channelContextStore = nullptr;
     if (m_apiConnManager) { m_apiConnManager->Stop(); delete m_apiConnManager; m_apiConnManager = nullptr; }
     delete m_apiRuntime; m_apiRuntime = nullptr;
     delete m_apiPackageStore; m_apiPackageStore = nullptr;
+    delete m_secretsVault; m_secretsVault = nullptr;
     delete m_agendaStore; m_agendaStore = nullptr;
     delete m_sessionReportStore; m_sessionReportStore = nullptr;
     delete m_contextRegistry; m_contextRegistry = nullptr;
@@ -376,6 +384,67 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         // --- Diary store (SQLite-backed, per-agent private diary) ---
         m_diaryStore = new DiaryStore(m_dataStore);
         m_adminServer->SetDiaryStore(m_diaryStore);
+
+        // --- #78 P2a: scheduler tables join the replication set ----------
+        // schedules/task_runs schemas must exist BEFORE SyncStore installs
+        // triggers (install is live-schema-read at boot; a missing table is
+        // skipped). The Scheduler object itself is constructed later (its
+        // FireCallback captures this kernel), so pre-create the schemas via
+        // lightweight store objects here — ScheduleStore/TaskRunStore ctors
+        // are pure schema-ensurers on the shared IDataStore.
+        {
+            ScheduleStore schedulePre(m_dataStore);
+            TaskRunStore taskRunPre(m_dataStore);
+            taskRunPre.EnsureSchema();   // TaskRunStore ctor does NOT ensure
+            ScheduleLeaseStore leasePre(m_dataStore);
+            leasePre.EnsureSchema();     // table must pre-exist sync trigger install
+            // #93 P3: agent_config (config store creates it at line ~576,
+            // AFTER trigger install) and api_package_secrets (vault, ~472)
+            // joined the synced set — pre-create both so P3 tables get
+            // triggers on THIS boot, not the next one.
+            AgentConfigStore configPre(m_dataStore);
+            SecretsVault vaultPre(m_dataStore, "");
+            vaultPre.EnsureSchema();     // table only — empty key path = no key file
+        }
+
+        // --- #78 P1a: node-scoped id ranges (federation identity) ---
+        // After ALL agent-global stores exist (tables + sequences created),
+        // seed this node's id range so every agent-global insert allocates
+        // from [nodeId<<40, (nodeId+1)<<40). Raise-only; 0 = no-op.
+        if (m_config.node.id > 0) {
+            std::string idRangeError;
+            const int seededTables = SeedAgentGlobalIdRanges(
+                m_dataStore, m_config.node.id, &idRangeError);
+            if (seededTables < 0) {
+                ALOG_ERROR("kernel", "id-range seeding failed: " << idRangeError);
+            }
+        }
+
+        // --- #78 P1b: replication outbox + LWW apply (agent-global tables) ---
+        // Trigger-based change capture for every agent-global table. Installed
+        // on every node (single-node nodes simply accumulate an unpulled
+        // outbox — schema stays uniform and federation-ready).
+        m_syncStore = new SyncStore(m_dataStore, m_config.node.id);
+        {
+            std::string syncErr;
+            if (!m_syncStore->EnsureSchema(&syncErr)) {
+                ALOG_WARNING("kernel", "sync store init failed (single-node "
+                             "operation continues): " << syncErr);
+            }
+        }
+
+        // --- #78 P1c: federation transport (pull loop + sync API) ---
+        // Admin routes expose the outbox/handshake/status on every node;
+        // the pull loop runs only when peers are configured.
+        m_adminServer->SetSyncStore(m_syncStore);
+        if (m_config.node.id > 0 && !m_config.node.peers.empty()) {
+            m_peerSyncService = new PeerSyncService(
+                m_syncStore, m_config.node.peers, m_config.node.syncToken);
+            m_adminServer->SetPeerSyncService(m_peerSyncService);
+        } else {
+            ALOG_INFO("kernel", "node federation: no peers configured — "
+                      "sync API serves, pull loop idle");
+        }
         m_tools.Register(std::make_unique<DiaryTool>(&m_adminServer->GetDiaryManager()));
 
         // --- Agent Self-Management Tool (view/update own settings) ---
@@ -402,6 +471,19 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         // --- API Package Store (#26 data layer, build order b) ---
         // Installs disabled by default; tool/sandbox layers (c/d) consume it.
         m_apiPackageStore = new ApiPackageStore(m_dataStore);
+
+        // --- Secrets Vault (#23) ---
+        // Master key lives OUTSIDE the database (auto-generated key file next
+        // to the data dir, 0600). Legacy literal secrets migrate into the
+        // vault at boot — idempotent, one loud log line per secret moved.
+        m_secretsVault = new SecretsVault(m_dataStore, (m_config.dataDir / "api-vault.key").string());
+        m_secretsVault->EnsureSchema();
+        {
+            std::string migErr;
+            const int migrated = m_secretsVault->MigrateLegacyStateSecrets(*m_apiPackageStore, migErr);
+            if (migrated < 0)
+                ALOG_ERROR("api", "[vault] legacy secret migration failed: " << migErr);
+        }
 
         // --- Agenda Store (per-agent calendar/agenda events) ---
         m_agendaStore = new AgendaStore(m_dataStore);
@@ -499,6 +581,33 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
         m_adminServer->SetApiPackageStore(m_apiPackageStore);
         m_adminServer->SetLuaScriptDir(m_config.lua_script_dir);
         m_configStore = new AgentConfigStore(m_dataStore);
+        // #93 P3a: the config store resolves/vaults credential-shaped values
+        // through the same vault the api packages use (agent:<id> scope).
+        m_configStore->SetVault(m_secretsVault);
+        // #93 P3 slice 3: provider persistence rides the replicated config
+        // store (kv rows under "__providers"; api keys + auth blobs vaulted).
+        m_adminServer->SetProviderConfigStore(m_configStore);
+        // #93 P3: replication coherence — remote agent_config applies
+        // invalidate this store's cache (sync writes bypass the API), and
+        // "__providers" rows additionally rebuild the in-memory provider
+        // model (a peer changed provider config).
+        if (m_syncStore)
+            m_syncStore->SetApplyNotifier(
+                [this](const std::string& t, const std::string& k) {
+                    m_configStore->OnSyncApplied(t, k);
+                    m_adminServer->OnProviderConfigSyncApplied(t, k);
+                });
+        {
+            std::string agentMigErr;
+            const int agentMigrated =
+                m_secretsVault->MigrateAgentConfigSecrets(agentMigErr);
+            if (agentMigrated < 0)
+                ALOG_ERROR("api", "[vault] agent credential migration failed: "
+                           << agentMigErr);
+            else if (agentMigrated > 0)
+                ALOG_INFO("api", "[vault] migrated " << agentMigrated
+                           << " agent credential(s) into the vault");
+        }
 
         // Load persisted search config if available
         m_configStore->WarmCache("__kernel__");
@@ -613,6 +722,37 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
 
         // --- Scheduler (cron-like, fires IncomingEvent → session pipeline) ---
         m_scheduler = new Scheduler(m_dataStore);
+        m_scheduler->SetNodeId(std::to_string(m_config.node.id));
+        m_scheduler->SetLeaseTtlMs(
+            static_cast<int64_t>(m_config.node.leaseTtlMs));
+        m_scheduler->SetLeaseGraceMs(
+            static_cast<int64_t>(m_config.node.leaseGraceMs));
+        // #78 P2b: wire the lease acker to the peer layer (no-op when
+        // single-node — PeerSyncService won't exist).
+        if (m_peerSyncService) {
+            m_scheduler->SetLeaseAckFn(
+                [this](const std::string& scheduleId,
+                       int64_t epoch) -> Scheduler::LeasePeerState {
+                    auto ps = m_peerSyncService->CheckLeaseAck(scheduleId, epoch);
+                    Scheduler::LeasePeerState out;
+                    out.peersConfigured = ps.peersConfigured;
+                    out.anyAcked = ps.anyAcked;
+                    out.allDown = ps.allDown;
+                    out.lastExchangeOkMs = ps.lastExchangeOkMs;
+                    return out;
+                });
+            m_scheduler->SetClaimAckFn(
+                [this](const std::string& runUuid)
+                        -> Scheduler::ClaimPeerState {
+                    auto cs = m_peerSyncService->CheckClaimAck(runUuid);
+                    Scheduler::ClaimPeerState out;
+                    out.peersConfigured = cs.peersConfigured;
+                    out.confirmedMine = cs.confirmedMine;
+                    out.showsOther = cs.showsOther;
+                    out.allDown = cs.allDown;
+                    return out;
+                });
+        }
         m_adminServer->SetScheduler(m_scheduler);
         m_scheduler->SetFireCallback([this](const IncomingEvent& event) {
             const std::string agentId = event.metadata.count("agent_id")
@@ -679,7 +819,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                             if (dueForReview.empty()) {
                                 ALOG_WARNING("scheduler", "skipping review: no observations due for layer "
                                           << layerName << " agent=" << reviewAgentId);
-                                return;
+                                return "skipped:review_nothing_due";
                             }
                         }
                     }
@@ -696,7 +836,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                     // Skip intake if there's no new data to process for any known agent
                     if (m_consolidation && !m_consolidation->HasAnyPendingIntakeData()) {
                         ALOG_WARNING("scheduler", "skipping intake: no pending data");
-                        return;
+                        return "skipped:no_pending_intake";
                     }
                     sessionSubtype = "intake";
                     std::string layerHint;
@@ -795,7 +935,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                     if (m_sessionReportStore &&
                         !m_sessionReportStore->HasSessionsNeedingReport(agentId)) {
                         ALOG_DEBUG("scheduler", "skipping session_report: no sessions need updating");
-                        return;
+                        return "skipped:no_sessions_needing_report";
                     }
                     sessionSubtype = "session_report";
 
@@ -814,7 +954,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                 } else {
                     // Unknown consolidation message — skip
                     ALOG_DEBUG("scheduler", "unknown consolidation message: " << message);
-                    return;
+                    return "skipped:unknown_message";
                 }
 
                 // Create a consolidation session for intake or review
@@ -907,7 +1047,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                             });
                     }
                 }
-                return;
+                return "dispatched:consolidation";
             }
 
             // Gallivanting sessions get a fresh session each trigger so
@@ -933,7 +1073,7 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
 
             SessionKey key{ connector, "" };
             auto session = m_sessionManager->GetOrCreate(key);
-            if (!session) return;
+            if (!session) return "error:session_create_failed";
 
             if (session->AgentId().empty()) {
                 session->SetAgentId(agentId);
@@ -1072,6 +1212,8 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                         }
                     }
                 });
+
+            return "dispatched:event";
         });
         m_tools.Register(std::make_unique<ScheduleTool>(m_scheduler));
 
@@ -1180,6 +1322,16 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             std::string schedErr;
             if (!m_scheduler->Start(&schedErr)) {
                 ALOG_WARNING("kernel", "scheduler start failed: " << schedErr);
+            }
+        }
+
+        // Start the federation pull loop after the admin API is accepting
+        // (peers may immediately pull our outbox) and after the scheduler,
+        // so a flood of first-sync applies can't delay schedule startup.
+        if (m_peerSyncService) {
+            std::string syncErr;
+            if (!m_peerSyncService->Start(&syncErr)) {
+                ALOG_WARNING("kernel", "peer sync start failed: " << syncErr);
             }
         }
 
@@ -1327,11 +1479,17 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                                const std::string& sessionKey,
                                const std::string& message,
                                const std::string& sessionType,
-                               const ChannelManager::ReplyTarget& replyTarget,
+                               const ChannelManager::ReplyTarget& rt,
                                const std::string& metadata) {
             ALOG_DEBUG("channels:dispatch", "agentId=" << agentId
                       << " sessionKey=" << sessionKey
                       << " type=" << sessionType);
+
+            // Stamp session identity onto the target so send failures can be
+            // written back to the originating session (#30).
+            ChannelManager::ReplyTarget replyTarget = rt;
+            replyTarget.session_key = sessionKey;
+            replyTarget.agent_id = agentId;
 
             // Check if this channel has a minimum response interval configured
             const int interval = GetChannelInterval(replyTarget.channel_name);
@@ -1450,6 +1608,14 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             m_adminServer->SetChannelManager(m_channelManager);
         }
 
+        // Send-failure witness (#30): a yielded reply that does not land
+        // becomes a session note the agent and admin UI can see — not just a
+        // kernel log line.
+        m_channelManager->SetSendFailureCallback(
+            [this](const ChannelReplyTarget& target, const std::string& error) {
+                ReportChannelSendFailure(target, error);
+            });
+
         // Wire ChannelManager into ChannelsTool for list action
         if (m_channelsTool) {
             m_channelsTool->SetChannelManager(m_channelManager);
@@ -1475,6 +1641,28 @@ void AgentKernel::SendAutoReply(const ChannelManager::ReplyTarget& target,
                                    const std::string& text) {
     if (!m_channelManager) return;
     m_channelManager->SendReply(target, text);
+}
+
+void AgentKernel::ReportChannelSendFailure(const ChannelReplyTarget& target,
+                                           const std::string& error) {
+    ALOG_WARNING("channels", "send failure [" << target.channel_type << "] "
+              << error);
+    // Session-visible witness; guarded so delivery notes never crowd out the
+    // agent's own notes at the per-session cap.
+    if (target.session_key.empty() || !m_sessionNotesStore) return;
+    const std::string fullSessionKey = "channel:" + target.session_key;
+    const auto count = m_sessionNotesStore->CountForSession(fullSessionKey, target.agent_id);
+    if (count >= SessionNotesStore::kMaxNotesPerSession) return;
+
+    std::string peer = target.peer_id.empty() ? target.post_id : target.peer_id;
+    std::string brief = error;
+    if (brief.size() > 200) brief = brief.substr(0, 197) + "...";
+    const std::string bullet = "[delivery-failed] " + target.channel_type
+        + " reply to " + target.channel_name + "/" + peer
+        + " was NOT delivered: " + brief
+        + ". The reader did not see it.";
+    m_sessionNotesStore->Create(fullSessionKey, target.agent_id, bullet,
+                                static_cast<int>(count));
 }
 
 int AgentKernel::GetChannelInterval(const std::string& channelName) const {
@@ -1759,7 +1947,7 @@ void AgentKernel::RegisterBuiltinTools(const KernelConfig& config) {
     if (m_apiPackageStore) {
         ApiRuntime::Config apiCfg;
         apiCfg.filesRoot = (m_config.dataDir / "api-files").string();
-        m_apiRuntime = new ApiRuntime(m_apiPackageStore, &m_httpClient, apiCfg);
+        m_apiRuntime = new ApiRuntime(m_apiPackageStore, &m_httpClient, apiCfg, m_secretsVault);
         if (m_adminServer) m_adminServer->SetApiRuntime(m_apiRuntime);
         m_tools.Register(std::make_unique<ApiTool>(m_apiRuntime));
 
@@ -1957,6 +2145,10 @@ void AgentKernel::Stop() {
 
     if (m_channelManager) {
         m_channelManager->Shutdown();
+    }
+
+    if (m_peerSyncService) {
+        m_peerSyncService->Stop();
     }
 
     if (m_scheduler) {

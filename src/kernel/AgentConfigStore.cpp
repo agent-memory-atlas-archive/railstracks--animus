@@ -1,8 +1,14 @@
 #include "animus_kernel/AgentConfigStore.h"
 #include "animus_kernel/IDataStore.h"
 #include "animus_kernel/SchemaHelpers.h"
+#include "animus_kernel/Log.h"
+#include "animus_kernel/api/SecretsVault.h"
+
+#include <algorithm>
+#include <cctype>
 
 #include <iostream>
+#include <json/json.h>
 #include <sstream>
 
 namespace animus::kernel {
@@ -50,7 +56,7 @@ void AgentConfigStore::EnsureSchema() {
 // Single key operations
 // ============================================================================
 
-std::string AgentConfigStore::Get(const std::string& agentId,
+std::string AgentConfigStore::GetRaw(const std::string& agentId,
                                    const std::string& key) const {
     // Check cache first
     auto agentIt = m_cache.find(agentId);
@@ -81,9 +87,78 @@ std::string AgentConfigStore::Get(const std::string& agentId,
     return value;
 }
 
+std::string AgentConfigStore::Get(const std::string& agentId,
+                                   const std::string& key) const {
+    std::string raw = GetRaw(agentId, key);
+    if (m_vault) return m_vault->ResolveAgentValue(agentId, raw);
+    return raw;
+}
+
+void AgentConfigStore::OnSyncApplied(const std::string& table, const std::string& rowKey) {
+    if (table != "agent_config") return;
+    // rowKey is the escaped composite pair agent_id \x1F key — invalidate
+    // that agent's whole cache slice (simplest correct granularity; the
+    // next Get re-reads from the DB).
+    const auto pos = rowKey.find('\x1F');
+    if (pos == std::string::npos) return;
+    const std::string agentId = rowKey.substr(0, pos);
+    auto it = m_cache.find(agentId);
+    if (it != m_cache.end()) m_cache.erase(it);
+    // #109 audit F2: the warmed flag must go too. GetAll() checks
+    // m_cacheWarmed FIRST and returns the (now erased) empty slice
+    // without ever re-reading the DB — a warmed-but-missing slice served
+    // {} permanently. Drop the flag so the next GetAll reloads from the
+    // DB; GetRaw's miss path is cache-absent -> DB either way.
+    m_cacheWarmed.erase(agentId);
+}
+
+bool AgentConfigStore::IsCredentialKey(const std::string& key) {
+    static const std::vector<std::string> suffixes = {
+        "api_key", "access_token", "bot_token", "app_token", "app_password",
+        "client_secret", "refresh_token", "server_password", "access_jwt",
+        "refresh_jwt", "api_secret", "secret", "password",
+    };
+    std::string lower;
+    std::transform(key.begin(), key.end(), std::back_inserter(lower),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const auto& s : suffixes) {
+        std::string::size_type pos = lower.rfind(s);
+        if (pos != std::string::npos && pos + s.size() == lower.size()) return true;
+    }
+    return false;
+}
+
 void AgentConfigStore::Set(const std::string& agentId,
                             const std::string& key,
                             const std::string& value) {
+    // #93 P3a: credential-shaped values are vaulted, never stored raw. The
+    // row carries a {"secret_ref":"<name>"} object string instead; Get()
+    // resolves it transparently. Vault disabled -> plaintext passthrough
+    // (single-box legacy behavior, loud at boot by the migration sweep).
+    if (m_vault && !value.empty() && IsCredentialKey(key)) {
+        std::string probeName;
+        // #108 audit F1: vault EVERYTHING credential-shaped that is not
+        // already a valid ref object. The old '{'-prefix exemption let
+        // {"token":"plaintext"} under bot_token persist raw — and JSON
+        // credentials are legitimate, so they must be vaulted, not rejected.
+        if (!SecretsVault::IsRefValue(value, probeName)) {
+            // #108 audit F2: injective derivation — sanitize alone let
+            // 'channels.foo:bar.bot_token' and 'channels.foo.bar.bot_token'
+            // collide on one vault entry (second write clobbered the first).
+            const std::string name = SecretsVault::DeriveAgentSecretName(key);
+            std::string err;
+            if (m_vault->VaultAgentValue(agentId, name, value, err)) {
+                Json::Value ref(Json::objectValue);
+                ref["secret_ref"] = name;
+                Json::StreamWriterBuilder wb;
+                wb["indentation"] = "";
+                Set(agentId, key, Json::writeString(wb, ref));  // re-set as ref
+                return;
+            }
+            ALOG_WARNING("config", "[vault] could not vault credential '" << key
+                         << "' (" << err << ") — storing plaintext (legacy behavior)");
+        }
+    }
     // Write to DB first
     if (m_store) {
         const char* nowFunc = (m_store->Dialect() == DataStoreDialect::PostgreSQL)
@@ -115,9 +190,28 @@ void AgentConfigStore::Set(const std::string& agentId,
     m_cacheWarmed[agentId] = true;
 }
 
+void AgentConfigStore::DeleteVaultEntryIfRef(const std::string& agentId,
+                                              const std::string& rawValue) {
+    if (!m_vault) return;
+    std::string name;
+    if (SecretsVault::IsRefValue(rawValue, name)) {
+        m_vault->Delete(SecretsVault::AgentScope(agentId), name);  // best-effort
+    }
+}
+
 void AgentConfigStore::Delete(const std::string& agentId,
                                const std::string& key) {
+    // PR #112 audit: a deleted row may be a vault ref — the ciphertext
+    // entry must die with it, or orphaned secrets keep replicating.
     if (m_store) {
+        auto read = m_store->Prepare(
+            "SELECT value FROM agent_config WHERE agent_id = ? AND key = ?");
+        if (read) {
+            read->BindText(1, agentId);
+            read->BindText(2, key);
+            if (read->Step()) DeleteVaultEntryIfRef(agentId, read->ColumnText(0));
+            read->Finalize();
+        }
         auto stmt = m_store->Prepare(
             "DELETE FROM agent_config WHERE agent_id = ? AND key = ?");
         if (stmt) {
@@ -141,12 +235,18 @@ void AgentConfigStore::Delete(const std::string& agentId,
 
 std::unordered_map<std::string, std::string>
 AgentConfigStore::GetAll(const std::string& agentId) const {
+    auto resolveAll = [this, &agentId](std::unordered_map<std::string, std::string> m) {
+        if (m_vault) {
+            for (auto& kv : m) kv.second = m_vault->ResolveAgentValue(agentId, kv.second);
+        }
+        return m;
+    };
     // Return from cache if warmed
     auto warmedIt = m_cacheWarmed.find(agentId);
     if (warmedIt != m_cacheWarmed.end() && warmedIt->second) {
         auto agentIt = m_cache.find(agentId);
         if (agentIt != m_cache.end()) {
-            return agentIt->second;
+            return resolveAll(agentIt->second);
         }
         return {};
     }
@@ -167,10 +267,15 @@ AgentConfigStore::GetAll(const std::string& agentId) const {
 
     std::cerr << "[config-store] GetAll(agentId='" << agentId << "'): " << result.size() << " entries" << std::endl;
 
-    // Cache it
+    // #108 audit F3: bulk reads resolve refs like Get() does — a caller of
+    // the bulk API must never receive a serialized {"secret_ref":...}
+    // object where a credential belongs. The cache stays raw; resolution
+    // happens at the API boundary, exactly like Get()'s GetRaw+resolve.
+
+    // Cache it (raw — resolution happens per-read at the API boundary)
     m_cache[agentId] = result;
     m_cacheWarmed[agentId] = true;
-    return result;
+    return resolveAll(std::move(result));
 }
 
 std::vector<std::string>
@@ -187,6 +292,17 @@ AgentConfigStore::ListKeys(const std::string& agentId) const {
 void AgentConfigStore::DeleteByPrefix(const std::string& agentId,
                                        const std::string& prefix) {
     if (m_store) {
+        // Sweep vault entries of the rows being deleted (best-effort,
+        // before the SQL delete — see Delete()).
+        auto read = m_store->Prepare(
+            "SELECT key, value FROM agent_config WHERE agent_id = ? AND key LIKE ?");
+        if (read) {
+            read->BindText(1, agentId);
+            read->BindText(2, prefix + "%");
+            while (read->Step())
+                DeleteVaultEntryIfRef(agentId, read->ColumnText(1));
+            read->Finalize();
+        }
         auto stmt = m_store->Prepare(
             "DELETE FROM agent_config WHERE agent_id = ? AND key LIKE ?");
         if (stmt) {

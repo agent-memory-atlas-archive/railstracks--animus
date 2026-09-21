@@ -9,6 +9,7 @@
 #include <json/json.h>
 
 #include "animus_kernel/AgentStore.h"
+#include "animus_kernel/ChannelContextStore.h"
 #include "animus_kernel/ChainRunner.h"
 #include "animus_kernel/CompactionService.h"
 #include "animus_kernel/CompactionSummaryGenerator.h"
@@ -82,6 +83,10 @@ bool ChatSessionService::EnqueueStreamingResponse(const Request& request) const 
     const std::string requestedReasoningEffort = request.requestedReasoningEffort;
     const bool requestedReasoningEnabled = request.requestedReasoningEnabled;
     const bool hasReasoningOverride = request.hasReasoningOverride;
+    const std::string authUserId = request.authUserId;
+    const std::string authUsername = request.authUsername;
+    const std::string authRole = request.authRole;
+    const bool isUserAuth = request.isUserAuth;
 
     SessionManager* const sessions = m_deps.sessions;
     ChainRunner* const chainRunner = m_deps.chainRunner;
@@ -92,6 +97,7 @@ bool ChatSessionService::EnqueueStreamingResponse(const Request& request) const 
     ProviderThrottle* const providerThrottle = m_deps.providerThrottle;
     AttachmentStore* const attachmentStore = m_deps.attachmentStore;
     AttachmentTokenManager* const attachmentTokenManager = m_deps.attachmentTokenManager;
+    ChannelContextStore* const channelContextStore = m_deps.channelContextStore;
     std::mutex* const chatMutex = m_deps.chatMutex;
     const KernelConfig::AgentRuntimeConfig* const agentConfig = m_deps.agentConfig;
 
@@ -103,8 +109,9 @@ bool ChatSessionService::EnqueueStreamingResponse(const Request& request) const 
         [wsConnPtr, session, sessionId, userContent, stopSignal,
          requestedProviderOverride, requestedModelOverride,
          requestedReasoningEffort, requestedReasoningEnabled, hasReasoningOverride,
+         authUserId, authUsername, authRole, isUserAuth,
          sessions, chainRunner, compactionService, providerRegistry, providerManager, agentStore, providerThrottle, chatMutex, agentConfig, configLookup,
-         attachmentStore, attachmentTokenManager]() {
+         attachmentStore, attachmentTokenManager, channelContextStore]() {
             std::string providerId = requestedProviderOverride.empty()
                 ? session->ProviderId()
                 : requestedProviderOverride;
@@ -346,6 +353,39 @@ bool ChatSessionService::EnqueueStreamingResponse(const Request& request) const 
 
             SessionAccess sessionAccess(session, SessionAccessMode::ReadWrite);
 
+            // #73: record a trusted arrival carrying the authenticated
+            // user identity so the ChannelContextProvider renders a context
+            // card naming who the agent is talking to. Written before the
+            // chain runs (same contract as AgentKernel::ExecuteChannelDispatch);
+            // marked consumed after the chain sees it. Unauthenticated
+            // connections (static-token instances, loopback) record nothing
+            // — absence of a card is the honest signal there, and the
+            // controller already logs the loud-absence case at WARN.
+            if (channelContextStore && isUserAuth) {
+                ChannelArrival arrival;
+                arrival.session_key = session->Key().ToString();
+                arrival.agent_id = session->AgentId().empty()
+                    ? "default" : session->AgentId();
+                arrival.channel_type = "admin";
+                arrival.channel_name = "ws_chat";
+                arrival.platform_id = "admin:ws_chat";
+                arrival.message_type = "chat";
+                arrival.delivery = "auto";
+                Json::Value origin(Json::objectValue);
+                origin["user"] = authUsername;
+                origin["user_id"] = authUserId;
+                origin["auth"] = "session";
+                if (!authRole.empty()) origin["role"] = authRole;
+                Json::StreamWriterBuilder originWriter;
+                originWriter["indentation"] = "";
+                arrival.origin = Json::writeString(originWriter, origin);
+                arrival.author_id = authUserId;
+                arrival.author_handle = authUsername;
+                channelContextStore->AddArrival(arrival);
+                channelContextStore->Prune(arrival.session_key,
+                                           arrival.agent_id);
+            }
+
             // Load the latest compaction summary from DB and inject into session.
             // This ensures the PromptAssembler uses the DB-backed compaction
             // rather than a stale in-memory copy.
@@ -420,6 +460,16 @@ bool ChatSessionService::EnqueueStreamingResponse(const Request& request) const 
             const auto& turns = session->Turns();
             if (!turns.empty()) {
                 assistantMessageId = turns.back().turn_id;
+            }
+
+            // #73: the chain has assembled its prompt — the context card for
+            // this arrival has been rendered (or the chain failed and the
+            // arrival is stale). Either way it must not leak into the next
+            // turn's prompt.
+            if (channelContextStore && isUserAuth) {
+                channelContextStore->MarkAllConsumed(
+                    session->Key().ToString(),
+                    session->AgentId().empty() ? "default" : session->AgentId());
             }
 
             if (!result.success && result.error != "stopped") {

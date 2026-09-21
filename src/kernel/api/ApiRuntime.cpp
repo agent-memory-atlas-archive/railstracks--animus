@@ -1,5 +1,7 @@
 #include "animus_kernel/api/ApiRuntime.h"
 
+#include "animus_kernel/api/SecretsVault.h"
+
 #include "animus_kernel/ApiPackageStore.h"
 #include "animus_kernel/Log.h"
 #include "animus_kernel/tools/HttpClient.h"
@@ -213,13 +215,17 @@ struct BridgeContext {
     std::string commandName;
     std::string packageId;
     int64_t filesQuotaBytes{256LL * 1024 * 1024};
-    Json::Value state;         // live values (real)
+    Json::Value state;         // live values (real; vault-resolved in memory)
+    Json::Value persistState;  // storage view: secrets stripped (vault owns them)
     Json::Value stateSchema;
+    SecretsVault* vault{nullptr};
     Json::Value args;
     std::vector<std::string> secretValues;
     std::set<std::string> secretKeys;
+    std::vector<std::string> egressHosts;  // #25: package egress scope
     ApiPackageStore* store{nullptr};
     HttpClient* http{nullptr};
+    ApiRuntime* runtime{nullptr};  // owns ExecuteScoped (per-hop redirect gate)
     std::string filesRoot;
     size_t fsReadCap{1024 * 1024};
     size_t stringTruncate{16 * 1024};
@@ -354,14 +360,65 @@ int CtxSetState(lua_State* L) {
     BridgeContext* bc = GetBridge(L, 1);
     const char* k = luaL_checkstring(L, 1);
     Json::Value v = LuaToJson(L, 2);
+    // #23: a {secret_ref = name} table is the indirection form for secret-typed
+    // keys — ValidateStateWrite only knows scalars, so vet it here instead:
+    // key must be declared AND secret-typed, ref name must be a valid vault name.
+    std::string refName;
+    const bool secretKey = bc->stateSchema.isObject() && bc->stateSchema.isMember(k) &&
+                           bc->stateSchema[k].get("secret", false).asBool();
+    const bool isRef = secretKey && SecretsVault::IsSecretRef(v, refName) &&
+                       SecretsVault::IsValidSecretName(refName);
     std::string err;
-    if (!ValidateStateWrite(bc->stateSchema, k, v, err)) {
+    if (isRef) {
+        if (!k[0] || k[0] == '_') {
+            lua_pushnil(L);
+            lua_pushstring(L, "key is framework-reserved (leading underscore)");
+            return 2;
+        }
+    } else if (!ValidateStateWrite(bc->stateSchema, k, v, err)) {
         lua_pushnil(L);
         lua_pushstring(L, err.c_str());
         return 2;
     }
+    if (secretKey) {
+        if (isRef) {
+            // Explicit indirection is config — persist the ref object itself.
+            bc->persistState[k] = v;
+            auto resolved = bc->vault ? bc->vault->Get(bc->packageId, refName) : std::nullopt;
+            if (resolved) {
+                bc->state[k] = *resolved;
+                // Refs resolve to secret bytes — they join this invocation's
+                // redaction set so they can't leak via results.
+                bc->secretValues.push_back(*resolved);
+            } else {
+                bc->state.removeMember(k);
+            }
+        } else {
+            std::string setErr;
+            if (!bc->vault || !bc->vault->Set(bc->packageId, k, v.asString(), setErr)) {
+                lua_pushnil(L);
+                lua_pushstring(L, ("secret vault write failed: " + setErr).c_str());
+                return 2;
+            }
+            bc->state[k] = v;               // resolved in-memory view
+            bc->persistState.removeMember(k);  // storage view stays secret-free
+            // Values written during THIS invocation join the redaction set —
+            // a script must not be able to set a secret and echo it back out.
+            bc->secretValues.push_back(v.asString());
+        }
+        // Ref objects persist; plain secret values never do. Only persist when
+        // the storage view actually changed (indirection case).
+        if (bc->store && bc->store->SetPackageState(bc->packageId, JsonWrite(bc->persistState))) {
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+        lua_pushnil(L);
+        lua_pushstring(L, "state persist failed");
+        return 2;
+    }
     bc->state[k] = v;
-    if (bc->store && bc->store->SetPackageState(bc->packageId, JsonWrite(bc->state))) {
+    bc->persistState[k] = v;
+    if (bc->store && bc->store->SetPackageState(bc->packageId, JsonWrite(bc->persistState))) {
         lua_pushboolean(L, 1);
         return 1;
     }
@@ -380,6 +437,23 @@ Json::Value DoHttp(BridgeContext* bc, const std::string& method, lua_State* L, i
         return out;
     }
     const char* url = luaL_checkstring(L, urlIdx);
+    // #25 egress gate for script-initiated fetches: same package scope as the
+    // transport path. Returned as a normal http-result table (status 0 +
+    // error) so scripts can handle it — but always audited.
+    {
+        std::string egressHost;
+        if (!ApiRuntime::EgressAllowed(bc->egressHosts, url, egressHost)) {
+            ALOG_WARNING("api", "[egress] DENIED " << bc->logPrefix << " -> "
+                         << (egressHost.empty() ? "<malformed url>" : egressHost)
+                         << " (sandbox fetch outside package scope)");
+            Json::Value denied(Json::objectValue);
+            denied["status"] = 0;
+            denied["error"] = "egress denied: host '" +
+                              (egressHost.empty() ? "<malformed>" : egressHost) +
+                              "' is not in this package's egress allowlist";
+            return denied;
+        }
+    }
     HttpClient::Request req;
     req.method = method;
     req.url = url;
@@ -400,7 +474,12 @@ Json::Value DoHttp(BridgeContext* bc, const std::string& method, lua_State* L, i
         lua_pop(L, 1);
     }
     bc->httpUsed++;
-    HttpClient::Response resp = bc->http->Execute(req);
+    // #25: sandbox fetches follow redirects under the same per-hop scope
+    // checks as the primary transport.
+    HttpClient::Response resp =
+        bc->http ? ApiRuntime::ExecuteScoped(bc->http, bc->egressHosts, req,
+                                             bc->logPrefix + " (sandbox)")
+                 : HttpClient::Response{};
     out["status"] = resp.status_code;
     {
         Json::Value headers(Json::objectValue);
@@ -647,10 +726,13 @@ void BuildCtx(lua_State* L, BridgeContext* bc, const Json::Value& request, bool 
               const Json::Value& eventJson) {
     lua_newtable(L);  // ctx
 
-    // masked state copy (display/branching only; get_state returns real values)
+    // masked state copy (display/branching only; get_state returns real values).
+    // Masks ANY present secret value regardless of JSON type — a stale or
+    // hand-edited non-string under a secret key never reaches scripts raw.
     Json::Value masked = bc->state;
     for (const std::string& k : bc->state.getMemberNames()) {
-        if (bc->secretKeys.count("state." + k) && masked[k].isString()) masked[k] = "***";
+        if (bc->secretKeys.count("state." + k) && !masked[k].isNull())
+            masked[k] = "***";
     }
 
     // ctx.package (single build: name, masked state, get_state, set_state)
@@ -740,8 +822,9 @@ void BuildCtx(lua_State* L, BridgeContext* bc, const Json::Value& request, bool 
 // ApiRuntime
 // ---------------------------------------------------------------------------
 
-ApiRuntime::ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg)
-    : m_store(store), m_http(http), m_cfg(std::move(cfg)) {}
+ApiRuntime::ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg,
+                       SecretsVault* vault)
+    : m_store(store), m_http(http), m_cfg(std::move(cfg)), m_vault(vault) {}
 
 std::string ApiRuntime::Interpolate(const std::string& tmpl, const Json::Value& state,
                                     const Json::Value& args,
@@ -801,6 +884,140 @@ std::string ApiRuntime::Interpolate(const std::string& tmpl, const Json::Value& 
         i = end + 2;
     }
     return out;
+}
+
+std::vector<std::string> ApiRuntime::ParseEgressHosts(const std::string& json) {
+    std::vector<std::string> out;
+    Json::Value arr;
+    std::string err;
+    if (!ParseJsonText(json.empty() ? "[]" : json, arr, err) || !arr.isArray()) return out;
+    for (const auto& h : arr)
+        if (h.isString() && !h.asString().empty()) out.push_back(h.asString());
+    return out;
+}
+
+bool ApiRuntime::EgressAllowed(const std::vector<std::string>& hostPatterns,
+                               const std::string& resolvedUrl, std::string& hostOut) {
+    // Extract host from the resolved URL (no templating left here).
+    const size_t sep = resolvedUrl.find("://");
+    if (sep == std::string::npos) {
+        hostOut = "";
+        return false;  // not an absolute URL — deny
+    }
+    size_t hostStart = sep + 3;
+    size_t hostEnd = hostStart;
+    while (hostEnd < resolvedUrl.size() && resolvedUrl[hostEnd] != '/' &&
+           resolvedUrl[hostEnd] != '?' && resolvedUrl[hostEnd] != '#')
+        ++hostEnd;
+    std::string host = resolvedUrl.substr(hostStart, hostEnd - hostStart);
+    const size_t at = host.rfind('@');
+    if (at != std::string::npos) host = host.substr(at + 1);
+    const size_t colon = host.rfind(':');
+    if (!host.empty() && host[0] != '[' && colon != std::string::npos)
+        host = host.substr(0, colon);
+    std::transform(host.begin(), host.end(), host.begin(), ::tolower);
+    hostOut = host;
+    // Empty scope = deny-all (script-only packages stay network-silent).
+    for (const auto& pat : hostPatterns) {
+        if (pat == host) return true;
+        if (pat.substr(0, 2) == "*.") {
+            const std::string suffix = pat.substr(1);  // ".example.com"
+            if (host.size() > suffix.size() &&
+                host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+std::string ApiRuntime::ResolveRedirectUrl(const std::string& requestUrl,
+                                           const std::string& location) {
+    if (location.empty()) return "";
+    if (location.find("://") != std::string::npos) return location;
+    const size_t sep = requestUrl.find("://");
+    if (sep == std::string::npos) return "";
+    const size_t pathStart = requestUrl.find('/', sep + 3);
+    const std::string origin = pathStart == std::string::npos
+                                   ? requestUrl
+                                   : requestUrl.substr(0, pathStart);
+    if (location[0] == '/') return origin + location;
+    const std::string basePath = pathStart == std::string::npos
+                                     ? "/"
+                                     : requestUrl.substr(pathStart);
+    if (location[0] == '?') {
+        std::string base = basePath;
+        const size_t q = base.find('?');
+        if (q != std::string::npos) base = base.substr(0, q);
+        return origin + base + location;
+    }
+    const size_t slash = basePath.rfind('/');
+    return origin + basePath.substr(0, slash + 1) + location;
+}
+
+HttpClient::Response ApiRuntime::ExecuteScoped(HttpClient* http,
+                                               const std::vector<std::string>& hostPatterns,
+                                               HttpClient::Request req,
+                                               const std::string& auditPrefix) {
+    std::string auditChain;
+    for (int hop = 0;; ++hop) {
+        std::string host;
+        if (!EgressAllowed(hostPatterns, req.url, host)) {
+            ALOG_WARNING("api", "[egress] DENIED " << auditPrefix << " -> "
+                         << (host.empty() ? "<malformed url>" : host) << auditChain
+                         << " (outside package scope)");
+            HttpClient::Response denied;
+            denied.status_code = 0;
+            denied.error = "egress denied: host '" +
+                           (host.empty() ? "<malformed>" : host) +
+                           "' is not in this package's egress allowlist" +
+                           (hop > 0 ? " (redirect target)" : "");
+            return denied;
+        }
+        auditChain += " -> " + host;
+        HttpClient::Request hopReq = req;
+        hopReq.follow_redirects = false;  // every hop is decided HERE, not by curl
+        HttpClient::Response resp = http->Execute(hopReq);
+        const int code = resp.status_code;
+        const bool isRedirect = code == 301 || code == 302 || code == 303 ||
+                                code == 307 || code == 308;
+        if (resp.error.empty() && isRedirect) {
+            std::string loc;
+            for (const auto& [k, v] : resp.headers) {
+                if (k == "Location" || k == "location") { loc = v; break; }
+            }
+            if (loc.empty()) return resp;  // malformed redirect: surface raw
+            const std::string next = ResolveRedirectUrl(req.url, loc);
+            if (next.empty()) return resp;
+            if (hop + 1 > kMaxRedirectHops) {
+                HttpClient::Response looped;
+                looped.status_code = 0;
+                looped.error = "redirect chain exceeded " +
+                               std::to_string(kMaxRedirectHops) + " hops";
+                return looped;
+            }
+            std::string nextHost;
+            EgressAllowed(hostPatterns, next, nextHost);  // parse only; loop re-checks
+            if (!nextHost.empty() && nextHost != host) {
+                // never forward credentials across hosts
+                req.headers.erase("Authorization");
+                req.headers.erase("authorization");
+                req.headers.erase("Proxy-Authorization");
+                req.headers.erase("proxy-authorization");
+                req.headers.erase("Cookie");
+                req.headers.erase("cookie");
+            }
+            if (code == 303 ||
+                ((code == 301 || code == 302) &&
+                 (req.method == "POST" || req.method == "PUT" ||
+                  req.method == "PATCH" || req.method == "DELETE"))) {
+                req.method = "GET";
+                req.body.clear();
+            }
+            req.url = next;
+            continue;
+        }
+        return resp;
+    }
 }
 
 std::string ApiRuntime::MaskSecrets(const std::string& text,
@@ -863,6 +1080,31 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     if (!m_store->EffectiveEnabled(pkg->id, agentId))
         return err("package '" + packageName + "' is not enabled for this agent (api enable " +
                    packageName + ")");
+    // #25 approval gate — the runtime backstop: unapproved packages execute
+    // nothing (actions, hooks, sandbox), regardless of the enable flag. The
+    // admin/tool enable refusals are UX; THIS check is the boundary.
+    if (pkg->approval_status != "approved") {
+        const std::string state = pkg->approval_status == "rejected"
+                                      ? "was rejected by the owner"
+                                      : (pkg->approval_status.empty()
+                                             ? "is awaiting owner approval"
+                                             : "is " + pkg->approval_status +
+                                                   " (awaiting owner approval)");
+        ALOG_WARNING("api", "[approval] DENIED execute " << packageName << ":"
+                     << commandName << " (" << state << ")");
+        return err("package '" + packageName + "' " + state +
+                   " — execution blocked until the owner approves it via the admin API");
+    }
+    // #106 audit backstop: approval binds to content — independently verify
+    // the stored content still matches approved_hash. Catches any mutation
+    // path that skipped RefreshApproval (including direct DB writes);
+    // mismatches self-heal to pending via RefreshApproval inside.
+    if (!m_store->VerifyApprovalBinding(pkg->id))
+        return err("package '" + packageName +
+                   "' content changed since approval — returned to pending; the owner "
+                   "must re-approve it (or the content must be restored to the "
+                   "approved bytes)");
+    const std::vector<std::string> egressScope = ParseEgressHosts(pkg->egress_hosts);
     auto cmd = m_store->GetCommand(pkg->id, commandName);
     if (!cmd) {
         std::string avail;
@@ -877,11 +1119,12 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
                    ", not invocable on this path");
 
     // --- state, secrets, args ------------------------------------------------
-    Json::Value stateSchema, liveState;
+    Json::Value stateSchema, liveState, persistState;
     {
         std::string e;
         ParseJsonText(pkg->state_schema.empty() ? "{}" : pkg->state_schema, stateSchema, e);
         ParseJsonText(pkg->state.empty() ? "{}" : pkg->state, liveState, e);
+        persistState = liveState;  // storage view: pre-defaults, pre-resolution
         // Overlay schema defaults for unset keys (values win over defaults).
         if (stateSchema.isObject()) {
             for (const std::string& k : stateSchema.getMemberNames()) {
@@ -889,6 +1132,11 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
                     liveState[k] = stateSchema[k]["default"];
             }
         }
+        // Vault resolution (#23): secret-typed keys resolve from the encrypted
+        // vault (or {"secret_ref": ...} indirection) into this in-memory copy
+        // only — stored state never holds secret bytes. Unset secrets resolve
+        // absent, so the missing-key machinery below names them at first use.
+        if (m_vault) m_vault->ResolveState(pkg->id, stateSchema, liveState);
     }
 
     if (args.isNull()) args = Json::Value(Json::objectValue);
@@ -937,10 +1185,29 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
             if (!ierr.empty()) return err(ierr);
             hreq.body = body;
         }
+        // #25 egress gate: the resolved URL's host must be in this package's
+        // scope. Audited loudly — every denial names package, command, host.
+        {
+            std::string egressHost;
+            if (!EgressAllowed(egressScope, url, egressHost)) {
+                ALOG_WARNING("api", "[egress] DENIED " << packageName << ":" << commandName
+                             << " -> " << (egressHost.empty() ? "<malformed url>" : egressHost)
+                             << " (package scope has " << egressScope.size()
+                             << " pattern(s); declare egress_hosts in the manifest)");
+                return err("egress denied: host '" +
+                           (egressHost.empty() ? "<malformed>" : egressHost) +
+                           "' is not in this package's egress allowlist");
+            }
+        }
         ALOG_INFO("api", "[" << packageName << ":" << commandName << "] "
                              << method << " " << MaskSecrets(url, secretValues) << " (body "
                              << hreq.body.size() << " B)");
-        HttpClient::Response resp = m_http->Execute(hreq);
+        // redirects followed under the same scope (#25 audit: per-hop checks)
+        HttpClient::Response resp =
+            ExecuteScoped(m_http, egressScope, hreq,
+                          packageName + ":" + commandName + " (transport)");
+        if (resp.status_code == 0 && resp.error.rfind("egress denied", 0) == 0)
+            return err(resp.error);  // scope violation, not a status the script sees
         request = Json::Value(Json::objectValue);
         request["status"] = resp.status_code;
         Json::Value headers(Json::objectValue);
@@ -966,10 +1233,14 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     bc.packageId = pkg->id;
     bc.filesQuotaBytes = pkg->files_quota_mb * 1024LL * 1024LL;
     bc.state = liveState;
+    bc.persistState = persistState;
     bc.stateSchema = stateSchema;
+    bc.vault = m_vault;
     bc.args = args;
     bc.secretValues = secretValues;
     bc.secretKeys = secretKeys;
+    bc.egressHosts = egressScope;
+    bc.runtime = this;
     bc.store = m_store;
     bc.http = m_http;
     bc.filesRoot = m_cfg.filesRoot;
@@ -1000,17 +1271,30 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
         return err("script must define run(ctx)");
     }
     BuildCtx(L, &bc, request, isHook, eventJson);
+    // Redaction basis for script-produced text: the pre-execution set PLUS
+    // anything the script wrote/resolved into the vault while running — a
+    // set_state followed by error('...' .. get_state(...)) must not smuggle
+    // the new value out through the error path. `bc.secretValues` stays live
+    // until the VM closes, so refresh from it per branch.
+    auto masked = [&](const std::string& s) {
+        std::vector<std::string> all = secretValues;
+        all.insert(all.end(), bc.secretValues.begin(), bc.secretValues.end());
+        return MaskSecrets(s, all);
+    };
     if (lua_pcall(L, 1, 1, 0)) {
         const char* msg = lua_tostring(L, -1);
         result["success"] = false;
-        result["error"] = MaskSecrets(std::string("run error: ") + (msg ? msg : "?"),
-                                       secretValues);
+        result["error"] = masked(std::string("run error: ") + (msg ? msg : "?"));
         lua_close(L);
         return result;
     }
     Json::Value returned = lua_isnil(L, -1) ? Json::Value(Json::objectValue)
                                             : LuaToJson(L, -1);
     lua_close(L);
+    // Fold execution-written secrets into the redaction basis for the success
+    // path (truncate + final mask below); the error path handled its own via
+    // `masked` above.
+    secretValues.insert(secretValues.end(), bc.secretValues.begin(), bc.secretValues.end());
 
     if (!returned.isObject()) {
         result["success"] = false;
@@ -1048,9 +1332,24 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
             std::error_code nec;
             auto canon = fs::weakly_canonical(p, nec);
             auto rootCanon = fs::weakly_canonical(root, nec);
-            if (canon.string().find(rootCanon.string()) != 0) {
+            // Component-aware containment: a string-prefix check would accept
+            // sibling dirs (/…/pkg-escape passes for root /…/pkg). Relative
+            // form must be non-escaping (not absolute, not leading "..");
+            // canonicalization errors reject — boundary unprovable = outside.
+            std::error_code rec;
+            const fs::path rel = fs::relative(canon, rootCanon, rec);
+            const bool escapes = nec || rec || rel.empty() || rel.is_absolute() ||
+                                 rel.native() == ".." ||
+                                 rel.native().rfind("../", 0) == 0;
+            if (escapes) {
                 result["success"] = false;
-                result["error"] = "file path escapes package filespace: " + p.string();
+                // Masked through the full redaction basis: a script can smuggle a
+                // secret (get_state or one it just wrote) into an escaping file
+                // path. The rejected files array is stripped entirely — error
+                // responses never echo the offending artifact.
+                result["error"] = masked(
+                    std::string("file path escapes package filespace: ") + p.string());
+                result.removeMember("files");
                 return result;
             }
             Json::Value vf = f;

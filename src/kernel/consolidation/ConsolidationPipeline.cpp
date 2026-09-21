@@ -1095,7 +1095,12 @@ bool ConsolidationPipeline::RunPerspectiveRevision(
         ? parsed["future"].asString() : "";
     perspective.updated_at_unix_ms = NowMs();
 
-    m_memoryStore->SetPerspective(perspective);
+    if (!m_memoryStore->SetPerspective(perspective)) {
+        m_store.FinishRun(runId, "failed", "{}",
+                          "perspective write not confirmed for layer " + layerName);
+        if (error) *error = "perspective write not confirmed for layer " + layerName;
+        return false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(m_statsMutex);

@@ -40,6 +40,16 @@ public:
                                                        std::size_t page,
                                                        std::size_t limit) override;
 
+    // #77: persisted-session fallback reads. Pure SQL (like ListPaginated) —
+    // the m_entries cache is keyed for lookup by id/key but carries no
+    // reliable recency ordering.
+    std::shared_ptr<Session> FindByKey(const SessionKey& key) override;
+    std::shared_ptr<Session> FindByConversationId(
+        const std::string& conversationId) override;
+    std::vector<TurnHit> SearchTurns(const std::string& agentId,
+                                     const std::string& needle,
+                                     std::size_t limit) override;
+
 
     bool DeleteById(SessionId id) override;
     void FlushSession(SessionId id) override;

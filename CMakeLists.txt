@@ -327,6 +327,7 @@ add_library(animus_kernel
   src/kernel/api/ApiRuntime.cpp
   src/kernel/api/ManifestV1.cpp
   src/kernel/api/RegistryClient.cpp
+  src/kernel/api/SecretsVault.cpp
   src/kernel/api/ApiConnectionManager.cpp
   src/kernel/PromptLogStore.cpp
   src/kernel/auth/AuthStore.cpp
@@ -371,6 +372,11 @@ add_library(animus_kernel
   src/kernel/email/EmailTool.cpp
   src/kernel/scheduler/ScheduleStore.cpp
   src/kernel/scheduler/Scheduler.cpp
+  src/kernel/scheduler/TaskRunStore.cpp
+  src/kernel/scheduler/ScheduleLeaseStore.cpp
+  src/kernel/data/IdRanges.cpp
+  src/kernel/data/SyncStore.cpp
+  src/kernel/PeerSyncService.cpp
   src/kernel/social/SocialEventPoller.cpp
   src/kernel/social/TelegramBotApi.cpp
   src/kernel/ChannelManager.cpp
@@ -615,6 +621,71 @@ if(ANIMUS_BUILD_TESTS)
     )
     add_test(NAME SchedulerTests COMMAND animus_scheduler_tests)
 
+    add_executable(animus_node_id_tests
+      tests/NodeIdRangeTests.cpp
+    )
+    target_link_libraries(animus_node_id_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_node_id_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_node_id_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME NodeIdRangeTests COMMAND animus_node_id_tests)
+
+    add_executable(animus_pg_id_smoke
+      tests/PgIdRangeSmoke.cpp
+    )
+    target_link_libraries(animus_pg_id_smoke PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_pg_id_smoke PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_pg_id_smoke PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME PgIdRangeSmoke COMMAND animus_pg_id_smoke)
+
+    add_executable(animus_outbox_sync_tests
+      tests/OutboxSyncTests.cpp
+    )
+    target_link_libraries(animus_outbox_sync_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_outbox_sync_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_outbox_sync_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME OutboxSyncTests COMMAND animus_outbox_sync_tests)
+
+    add_executable(animus_peer_sync_tests
+      tests/PeerSyncServiceTests.cpp
+    )
+    target_link_libraries(animus_peer_sync_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_peer_sync_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_peer_sync_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME PeerSyncServiceTests COMMAND animus_peer_sync_tests)
+
+    add_executable(animus_pg_sync_smoke
+      tests/PgSyncSmoke.cpp
+    )
+    target_link_libraries(animus_pg_sync_smoke PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_pg_sync_smoke PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_pg_sync_smoke PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME PgSyncSmoke COMMAND animus_pg_sync_smoke)
+
     add_executable(animus_consolidation_tests
       tests/ConsolidationTests.cpp
     )
@@ -653,6 +724,45 @@ if(ANIMUS_BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
     )
     add_test(NAME ChannelContextStoreTests COMMAND animus_channel_context_store_tests)
+
+    add_executable(animus_auth_manager_tests
+      tests/AuthManagerTests.cpp
+    )
+    target_link_libraries(animus_auth_manager_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_auth_manager_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_auth_manager_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME AuthManagerTests COMMAND animus_auth_manager_tests)
+
+    add_executable(animus_node_manager_binding_tests
+      tests/NodeManagerBindingTests.cpp
+    )
+    target_link_libraries(animus_node_manager_binding_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_node_manager_binding_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_node_manager_binding_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME NodeManagerBindingTests COMMAND animus_node_manager_binding_tests)
+
+    add_executable(animus_datastore_concurrency_tests
+      tests/DataStoreConcurrencyTests.cpp
+    )
+    target_link_libraries(animus_datastore_concurrency_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_datastore_concurrency_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_datastore_concurrency_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME DataStoreConcurrencyTests COMMAND animus_datastore_concurrency_tests)
 
     add_executable(animus_reply_resolution_tests
       tests/ReplyResolutionTests.cpp
@@ -695,6 +805,33 @@ if(ANIMUS_BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
     )
     add_test(NAME ApiPackageStoreTests COMMAND animus_api_package_store_tests)
+
+    add_executable(animus_registry_client_tests
+      tests/RegistryClientTests.cpp
+    )
+    target_link_libraries(animus_registry_client_tests PRIVATE animus_kernel)
+    set_target_properties(animus_registry_client_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME RegistryClientTests COMMAND animus_registry_client_tests)
+
+    add_executable(animus_secrets_vault_tests
+      tests/SecretsVaultTests.cpp
+    )
+    target_link_libraries(animus_secrets_vault_tests PRIVATE animus_kernel)
+    set_target_properties(animus_secrets_vault_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME SecretsVaultTests COMMAND animus_secrets_vault_tests)
+
+    add_executable(animus_provider_store_tests
+      tests/ProviderStoreTests.cpp
+    )
+    target_link_libraries(animus_provider_store_tests PRIVATE animus_kernel)
+    set_target_properties(animus_provider_store_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME ProviderStoreTests COMMAND animus_provider_store_tests)
 
     add_executable(animus_manifest_v1_tests
       tests/ManifestV1Tests.cpp
@@ -777,6 +914,32 @@ if(ANIMUS_BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
     )
     add_test(NAME ChannelsToolTests COMMAND animus_social_tool_tests)
+
+    add_executable(animus_file_tool_tests
+      tests/FileToolTests.cpp
+    )
+    target_link_libraries(animus_file_tool_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_file_tool_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_file_tool_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME FileToolTests COMMAND animus_file_tool_tests)
+
+    add_executable(animus_channel_helpers_tests
+      tests/ChannelHelpersTests.cpp
+    )
+    target_link_libraries(animus_channel_helpers_tests PRIVATE jsoncpp_lib)
+    target_include_directories(animus_channel_helpers_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_channel_helpers_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME ChannelHelpersTests COMMAND animus_channel_helpers_tests)
 
     add_executable(animus_signal_protocol_tests
       tests/SignalProtocolTests.cpp

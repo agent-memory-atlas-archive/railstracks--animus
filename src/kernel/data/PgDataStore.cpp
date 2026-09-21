@@ -243,17 +243,27 @@ private:
             // transaction (2026-09-06: registry installs silently rolled back).
             // Savepoint-wrap the probe so failure is recoverable in both modes.
             if (changes > 0) {
-                PQclear(PQexec(m_pc->conn, "SAVEPOINT _lastval_probe"));
+                // Savepoint-wrap the probe ONLY inside an explicit
+                // transaction — in autocommit a failed SAVEPOINT/lastval is
+                // statement-local noise (it previously logged 4-error bursts
+                // on every no-sequence DML in autocommit).
+                const bool inTxn =
+                    PQtransactionStatus(m_pc->conn) == PQTRANS_INTRANS;
+                if (inTxn)
+                    PQclear(PQexec(m_pc->conn, "SAVEPOINT _lastval_probe"));
                 PGresult* idResult = PQexec(m_pc->conn, "SELECT lastval()");
                 if (idResult) {
                     if (PQresultStatus(idResult) == PGRES_TUPLES_OK && PQntuples(idResult) > 0) {
                         int64_t id = std::atoll(PQgetvalue(idResult, 0, 0));
                         m_owner->SetConnLastInsertId(m_pc, id);
-                        PQclear(PQexec(m_pc->conn, "RELEASE SAVEPOINT _lastval_probe"));
+                        if (inTxn)
+                            PQclear(PQexec(m_pc->conn, "RELEASE SAVEPOINT _lastval_probe"));
                     } else {
                         // No sequence consumed — recover and release.
-                        PQclear(PQexec(m_pc->conn, "ROLLBACK TO SAVEPOINT _lastval_probe"));
-                        PQclear(PQexec(m_pc->conn, "RELEASE SAVEPOINT _lastval_probe"));
+                        if (inTxn) {
+                            PQclear(PQexec(m_pc->conn, "ROLLBACK TO SAVEPOINT _lastval_probe"));
+                            PQclear(PQexec(m_pc->conn, "RELEASE SAVEPOINT _lastval_probe"));
+                        }
                     }
                     PQclear(idResult);
                 }
