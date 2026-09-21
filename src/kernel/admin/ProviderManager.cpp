@@ -1285,17 +1285,29 @@ bool ProviderManager::SaveProviders(std::string* error) const {
 
     // Reconcile: delete rows of providers no longer in memory (handles
     // DeleteProvider -> SaveProviders, which orphans cfg.<id>* rows).
+    // PR #112 audit: every row decomposes to its OWNER id — suffix rows
+    // (cfg.<id>.api_key / .auth_secret) are reconciled directly, not only
+    // transitively via the plain row's prefix sweep. A suffix row whose
+    // plain row never arrived (partial replication gap, mixed-version
+    // peer) used to strand forever; its vault entry now dies with the
+    // ref row inside AgentConfigStore::Delete.
     for (const auto& k : m_configStore->ListKeys(kProviderConfigAgent)) {
         if (k == kDefaultRow || k.rfind("cfg.", 0) != 0) continue;
-        const std::string id = (k.find(".api_key") == std::string::npos &&
-                                k.find(".auth_secret") == std::string::npos)
-                                   ? k.substr(4)
-                                   : std::string();
-        if (id.empty()) continue;
-        if (m_providersByName.find(id) == m_providersByName.end()) {
-            m_configStore->DeleteByPrefix(kProviderConfigAgent, CfgRow(id) + ".");
-            m_configStore->Delete(kProviderConfigAgent, CfgRow(id));
+        std::string id;
+        bool plain = true;
+        if (k.size() > 8 && k.compare(k.size() - 8, 8, ".api_key") == 0) {
+            id = k.substr(4, k.size() - 4 - 8);
+            plain = false;
+        } else if (k.size() > 12 && k.compare(k.size() - 12, 12, ".auth_secret") == 0) {
+            id = k.substr(4, k.size() - 4 - 12);
+            plain = false;
+        } else {
+            id = k.substr(4);
         }
+        if (m_providersByName.find(id) != m_providersByName.end()) continue;
+        if (plain)
+            m_configStore->DeleteByPrefix(kProviderConfigAgent, CfgRow(id) + ".");
+        m_configStore->Delete(kProviderConfigAgent, k);
     }
     return true;
 }

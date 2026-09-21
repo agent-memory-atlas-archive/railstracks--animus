@@ -158,6 +158,15 @@ void TestBootImport() {
     Assert(!mgr.HasProvider("rogue"), "late-arriving file is ignored");
 }
 
+long ProviderVaultEntries(SqliteDataStore& db) {
+    auto q = db.Prepare(
+        "SELECT COUNT(*) FROM api_package_secrets WHERE package_id = 'agent:__providers'");
+    long n = -1;
+    if (q && q->Step()) n = q->ColumnInt64(0);
+    if (q) q->Finalize();
+    return n;
+}
+
 void TestCrudReconcile() {
     std::cerr << "  [crud] upsert + orphan deletion...\n";
     const std::string dir = MakeDir();
@@ -185,20 +194,42 @@ void TestCrudReconcile() {
     ProviderState b = a;
     b.providerId = "ollama-local";
     b.providerType = "ollama";
-    b.authType = "none";
-    b.apiKey.clear();
+    b.authType = "api_key";
+    b.apiKey = "sk-crud-b";          // PR #112 audit: secrets ride the deleted provider
     Assert(mgr.CreateProvider(b, &err), "create b: " + err);
+    Json::Value bAuth(Json::objectValue);
+    bAuth["access_token"] = "tok-crud-b";
+    Assert(mgr.SaveAuthProvider("ollama-local", bAuth, &err),
+           "auth blob for b: " + err);
     Assert(mgr.SaveProviders(&err), "persist: " + err);
 
     Assert(!config.GetRaw("__providers", "cfg.zai").empty(), "config row written");
-    Assert(config.GetRaw("__providers", "cfg.ollama-local.api_key").empty(),
-           "authless provider has no api_key row");
+    Assert(config.GetRaw("__providers", "cfg.ollama-local.api_key").find("secret_ref") !=
+               std::string::npos, "b api_key vaulted");
+    const long secretsBefore = ProviderVaultEntries(db);
+    Assert(secretsBefore >= 3, "three vault entries (a key, b key, b auth)");
 
-    // Delete b, persist -> its rows must be gone.
+    // Delete b, persist -> rows AND vault ciphertext must be gone.
     ProviderState removed;
     Assert(mgr.DeleteProvider("ollama-local", &removed, &err), "delete b: " + err);
     Assert(mgr.SaveProviders(&err), "persist after delete: " + err);
     Assert(config.GetRaw("__providers", "cfg.ollama-local").empty(), "orphan config row deleted");
+    Assert(config.GetRaw("__providers", "cfg.ollama-local.api_key").empty(),
+           "orphan api_key row deleted");
+    Assert(config.GetRaw("__providers", "cfg.ollama-local.auth_secret").empty(),
+           "orphan auth_secret row deleted");
+    Assert(ProviderVaultEntries(db) == 1,
+           "b's ciphertext died with its ref rows (no orphan vault entries replicating)");
+
+    // PR #112 audit, anchor-less case: a secret row whose plain row never
+    // arrived (partial replication gap / mixed-version peer) must be
+    // reconciled on the next SaveProviders, ciphertext included.
+    config.Set("__providers", "cfg.ghost.api_key", "sk-ghost");
+    Assert(ProviderVaultEntries(db) == 2, "ghost secret vaulted (anchor-less)");
+    Assert(mgr.SaveProviders(&err), "persist with ghost row present: " + err);
+    Assert(config.GetRaw("__providers", "cfg.ghost.api_key").empty(),
+           "anchor-less suffix row reconciled away");
+    Assert(ProviderVaultEntries(db) == 1, "ghost ciphertext cleaned too");
 
     // Rotation: new key on a -> row still a ref, resolved value new.
     ProviderState a2 = a;
