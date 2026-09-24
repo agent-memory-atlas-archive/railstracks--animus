@@ -16,6 +16,7 @@ Animus is a **C++ agent framework** — a modular, efficient runtime for AI agen
 - **Performant**: C++ kernel with native multithreading and async I/O. Drogon HTTP framework.
 - **Secure**: Default-deny tool sandboxing, SSRF protection, TLS verification, per-agent permissions, two-tier HTTP authentication with rate limiting.
 - **Multi-tenant**: Multiple agents on a single substrate — each with their own config, memory, tools, sessions.
+- **Federated**: Multi-master configuration replication across verified nodes — a scratch node rebuilds its entire configuration from peers.
 - **Communicative**: 12 channel adapters (IRC, Telegram, Discord, Slack, WhatsApp, Email, VK, Bluesky, Mastodon, Twitter, Nextcloud Talk, Moltbook) with unified routing and session dispatch.
 - **Extensible**: Lua 5.4 scripting runtime for custom tools and behaviors. Register scripts at runtime from the admin UI.
 - **Provider-agnostic**: 11 LLM providers with runtime capability detection. The model is the vessel, not the identity.
@@ -23,7 +24,7 @@ Animus is a **C++ agent framework** — a modular, efficient runtime for AI agen
 
 ## Current Status
 
-**v0.4.0** — Active development. Core kernel, admin server, LLM pipeline, tool system, **API packages**, multi-tenant architecture, channel system, Lua scripting, memory system, social adapters, authentication, scheduled tasks, external nodes, agent export/import, and diffusion are all operational.
+**v0.4.1** — Active development. Core kernel, admin server, LLM pipeline, tool system, **API packages**, **verified-node federation** (multi-master config replication), **secrets vault**, egress control, multi-tenant architecture, channel system, Lua scripting, memory system, social adapters, authentication, scheduled tasks, external nodes, agent export/import, and diffusion are all operational.
 
 | Area | Status |
 |------|--------|
@@ -32,7 +33,8 @@ Animus is a **C++ agent framework** — a modular, efficient runtime for AI agen
 | Chain execution (streaming) | ✅ Live |
 | Tool system (26 tools) | ✅ Live |
 | API packages (manifest v1: Lua actions, connections, state, egress allowlist) | ✅ Live |
-| Animus Registry integration (fetch, re-hash, loud-reject on mismatch) | ✅ Live |
+| Egress control + owner-approval gate (deny-by-default, content-bound approvals) | ✅ Live |
+| Animus Registry integration (browse, fetch, re-hash, loud-reject on mismatch) | ✅ Live |
 | Multi-tenant (agent CRUD, per-agent config) | ✅ Complete |
 | Channel architecture (12 adapters) | ✅ Live |
 | Lua scripting (sandboxed runtime, tool bridge, admin CRUD) | ✅ Live |
@@ -46,11 +48,13 @@ Animus is a **C++ agent framework** — a modular, efficient runtime for AI agen
 | Session reports (temporal summaries + embeddings) | ✅ Live |
 | Diary (encrypted, private, per-agent) | ✅ Complete |
 | HTTP authentication (static token + user accounts + rate limiting) | ✅ Live |
+| Secrets vault (AES-GCM, secret_ref indirection, encrypted replication) | ✅ Live |
 | Diffusion (GetImg + Stability AI) | ✅ Live |
 | Chat attachments (per-channel, token-secured) | ✅ Live |
 | SOP system (Standard Operating Procedures) | ✅ Live |
 | Scheduled tasks (cron + interval, per-agent isolation) | ✅ Live |
 | External nodes (HMAC-signed remote commands) | ✅ Live |
+| Federation (multi-master replication, verified nodes, scratch-join rebuild) | ✅ Live |
 | Agent export/import (composable `.agent` archives) | ✅ Live |
 | Session notes + agenda tool | ✅ Live |
 | Temporal context provider (time-aware assembly) | ✅ Live |
@@ -78,6 +82,7 @@ IncomingEvent → SessionRouter → Session → Agent → ChainRunner
 - **ChainRunner**: executes one activation (event → response) with step loop, budget enforcement, streaming. Supports interjection into active chains.
 - **ChannelManager**: owns all communication channels. Unified dispatch path, session routing, and auto-reply.
 - **ToolRegistry**: register/execute tools with JSON I/O. Tools are agent-scoped at runtime. Lua scripts register as tools.
+- **PeerSyncService**: federation member — replicates agent-global state (memory, schedules, agent/channel/provider config, vault ciphertext) across verified nodes via outbox capture and anti-entropy pull.
 
 Detailed architecture docs: see `AGENTS.orm.md` (object-relational model), `AGENTS.md` (project overview).
 
@@ -176,9 +181,26 @@ The lifecycle runs through the **Animus Registry**:
 - **Install** on any daemon — fetched from the registry, re-canonicalized, and loudly rejected on any hash mismatch
 - **Browse** what's out there — a live registry is running at [animus-registry.steadyfort.com/packages](https://animus-registry.steadyfort.com/packages)
 
+Two enforcement layers gate packages at runtime: **egress allowlists** are deny-by-default and enforced at three gates with a boot-time sweep (packages without a declared allowlist get derived defaults from URL templates and state), and installs land **disabled, pending owner approval** — the approval is bound to the stored content, so it cannot be replayed against a modified payload.
+
 **Reference implementation:** [animus-package-alpaca](https://github.com/railstracks/animus-package-alpaca) — 24 commands (market data, orders, positions, one-shot price triggers, watchlists) plus two live-polling connections; field-tested by a trading agent running against a paper account.
 
 Adding a service you use? The [standing contributor lane](https://github.com/railstracks/animus/issues/29) is open.
+
+### Federation
+
+Multiple Animus daemons can operate as one substrate — a verified-node mesh:
+
+- **Multi-master writes** — per-node id ranges prevent collisions; trigger-based outbox capture and HTTP pull with per-node Bearer tokens keep peers converged (digest handshake on every pass, bounded batches, catch-up from persisted cursors after downtime)
+- **Replicated set** — memory (layers, observations, perspectives, ontology, diary), schedules, task runs and leases, agent + channel config, provider config, and vault secrets — the last only ever as ciphertext; the master key never crosses the wire
+- **Scratch-join rebuild** — an empty node boots its entire configuration from peers and joins the mesh (validated with four scratch nodes on live PostgreSQL, chain topology)
+- **Mixed-version grace** — unknown tables and future columns defer instead of blocking, so nodes on different versions stay converged
+
+Trust is established with per-node tokens; the vault master key is distributed out-of-band to verified nodes only.
+
+### Secrets Vault
+
+Credential-shaped values (API keys, tokens, JSON service-account keys) never live in plaintext config. The vault encrypts them with AES-GCM under a master key held in an out-of-band key file; config rows and sync payloads carry `secret_ref`s only. Vaulted secrets replicate as ciphertext and resolve transparently on peers holding the master key — and a secret dies with its referencing row, so no orphaned ciphertext outlives the provider that used it.
 
 ### Reasoning
 Unified reasoning model: `thinking_content` on the same SessionTurn as the assistant reply (not a separate turn). Effort levels (low/medium/high/xhigh) with provider-native mapping. Streaming thinking deltas alongside content in the chat UI.
