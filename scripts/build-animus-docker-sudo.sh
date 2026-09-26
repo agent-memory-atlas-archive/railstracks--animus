@@ -193,7 +193,7 @@ ADMIN_HOST="${ADMIN_HOST:-0.0.0.0}"
 ADMIN_PORT="${ADMIN_PORT:-8080}"
 
 exec animusd --daemon --config-dir /data/config --data-dir /data/data \
-    --admin-host "${ADMIN_HOST}" --admin-port "${ADMIN_PORT}"
+    --admin-host "${ADMIN_HOST}" --admin-port "${ADMIN_PORT}" ${EXTRA_ARGS:-}
 ENTRYPOINT
 RUN chmod +x /usr/local/bin/animus-entrypoint.sh
 
