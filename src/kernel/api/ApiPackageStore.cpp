@@ -1303,10 +1303,14 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
 
     // #126: per-invocation write gate (sandbox POST/PUT/DELETE require an
     // approved digest). Opt-in, package-level.
-    const Json::Value jWritesGated = m.get("writes_gated", Json::Value(false));
-    if (!jWritesGated.isBool())
-        lint.Add("writes_gated must be a boolean");
-    const bool writesGated = jWritesGated.asBool();
+    bool writesGated = false;
+    if (m.isMember("writes_gated")) {
+        const Json::Value& jWritesGated = m["writes_gated"];
+        if (jWritesGated.isBool())
+            writesGated = jWritesGated.asBool();
+        else
+            lint.Add("writes_gated must be a boolean");
+    }
 
     // state_schema: object; values are {type: string, default?: any, secret?: bool}
     Json::Value stateSchema = m.get("state_schema", Json::Value(Json::objectValue));
