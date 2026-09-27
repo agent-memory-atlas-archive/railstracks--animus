@@ -289,8 +289,12 @@ int TestManifestInstall() {
         }
 
         // #126: writes_gated manifest field — bool lint + row round-trip
+        // (isolated db: the residue checks below assert exactly ONE package
+        // in the shared store)
         {
-            ApiPackageStore store2(&db);
+            const std::string wgPath = MakeTempDbPath();
+            SqliteDataStore wgDb(wgPath);
+            ApiPackageStore store2(&wgDb);
             ApiPackage wg = store2.InstallFromManifest(
                 R"({"kind":"api_package","name":"wg","version":"1","description":"x",
                      "writes_gated":true,
@@ -313,6 +317,7 @@ int TestManifestInstall() {
                      "commands":[{"name":"a","kind":"action","description":"d","script":"s"}]})");
             Assert(!store2.GetPackage(plain.id)->writes_gated,
                    "writes_gated: defaults false");
+            unlink(wgPath.c_str());
         }
 
         // --- lint rejects -----------------------------------------------------
