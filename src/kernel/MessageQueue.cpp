@@ -35,7 +35,8 @@ void MessageQueue::Push(const std::string& sessionKey,
                         const std::string& content,
                         std::uint64_t unixMs,
                         int intervalSeconds,
-                        int maxQueued) {
+                        int maxQueued,
+                        int aggregationWindowMs) {
     std::string flushedMsg;
 
     {
@@ -43,6 +44,7 @@ void MessageQueue::Push(const std::string& sessionKey,
 
         auto& state = m_sessions[sessionKey];
         state.interval_seconds = intervalSeconds;
+        state.aggregation_window_ms = aggregationWindowMs;
 
         // If a chain is active, just accumulate — timer will be set when chain ends.
         // If no chain is active, set/update the timer.
@@ -51,24 +53,52 @@ void MessageQueue::Push(const std::string& sessionKey,
         // Safety valve: force flush if max queued exceeded
         bool forceFlush = (maxQueued > 0 && static_cast<int>(state.messages.size()) >= maxQueued);
 
-        // If not force-flushing and no chain/timer active, decide when to fire:
-        if (!forceFlush && !state.chain_active && !state.timer_running && intervalSeconds > 0) {
-            if (!state.has_responded) {
-                // First ever message on this session — no prior response to wait out
-                forceFlush = true;
-            } else {
-                // Interval is measured from the agent's last response, not from
-                // when the message arrived. If enough time has already passed,
-                // fire immediately.
-                auto deadline = state.chain_end_time
-                    + std::chrono::seconds(intervalSeconds);
-                if (deadline <= std::chrono::steady_clock::now()) {
-                    forceFlush = true;
+        // Fire decision for the no-chain, no-timer path. Two timers can
+        // apply, composed by taking the LATER deadline:
+        //   - aggregation window (#rpg debounce): burst arrivals (a long
+        //     IRC reply split into several PRIVMSGs, or several people
+        //     talking at once) batch into ONE chain. First message arms a
+        //     FIXED window (later messages do NOT extend it, so a busy
+        //     channel can't hold the window open); expiry flushes the batch
+        //     as one concatenated turn.
+        //   - response cooldown (min_response_interval): measured from the
+        //     agent's last response.
+        // A window set with cooldown remaining waits out BOTH — the window
+        // never short-circuits the cooldown.
+        if (!forceFlush && !state.chain_active && !state.timer_running) {
+            const auto now = std::chrono::steady_clock::now();
+            bool armTimer = false;
+            std::chrono::steady_clock::time_point deadline = now;
+
+            if (aggregationWindowMs > 0) {
+                armTimer = true;
+                deadline = now + std::chrono::milliseconds(aggregationWindowMs);
+            }
+
+            if (intervalSeconds > 0) {
+                if (!state.has_responded) {
+                    // First ever message on this session — no prior response
+                    // to wait out; only the window (if set) applies.
+                    if (!armTimer) forceFlush = true;
                 } else {
-                    state.timer_deadline = deadline;
-                    state.timer_running = true;
-                    m_cv.notify_all();
+                    auto cooldownDeadline = state.chain_end_time
+                        + std::chrono::seconds(intervalSeconds);
+                    if (cooldownDeadline <= now) {
+                        // Cooldown already elapsed; only the window applies.
+                        if (!armTimer) forceFlush = true;
+                    } else {
+                        // Cooldown pending — wait it out; window (if set)
+                        // extends to the later deadline.
+                        armTimer = true;
+                        deadline = std::max(deadline, cooldownDeadline);
+                    }
                 }
+            }
+
+            if (armTimer) {
+                state.timer_deadline = deadline;
+                state.timer_running = true;
+                m_cv.notify_all();
             }
         }
 
@@ -143,12 +173,29 @@ void MessageQueue::NotifyChainEnd(const std::string& sessionKey, int intervalSec
     state.has_responded = true;
     state.interval_seconds = intervalSeconds;
 
-    // If there are pending messages, start the cooldown timer
-    if (!state.messages.empty() && intervalSeconds > 0) {
-        state.timer_deadline = std::chrono::steady_clock::now()
-            + std::chrono::seconds(intervalSeconds);
-        state.timer_running = true;
-        m_cv.notify_all();
+    // If there are pending messages, arm the flush timer. Cooldown applies
+    // when configured; otherwise the aggregation window (if set) debounces
+    // the backlog — with neither, the next Push's no-timer path decides.
+    if (!state.messages.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        bool armTimer = false;
+        std::chrono::steady_clock::time_point deadline = now;
+
+        if (intervalSeconds > 0) {
+            armTimer = true;
+            deadline = now + std::chrono::seconds(intervalSeconds);
+        }
+        if (state.aggregation_window_ms > 0) {
+            armTimer = true;
+            deadline = std::max(deadline,
+                now + std::chrono::milliseconds(state.aggregation_window_ms));
+        }
+
+        if (armTimer) {
+            state.timer_deadline = deadline;
+            state.timer_running = true;
+            m_cv.notify_all();
+        }
     }
 }
 

@@ -535,6 +535,15 @@ if(ANIMUS_BUILD_TESTS)
     )
     add_test(NAME JobsTests COMMAND animus_jobs_tests)
 
+    add_executable(animus_message_queue_tests
+      tests/MessageQueueTests.cpp
+    )
+    target_link_libraries(animus_message_queue_tests PRIVATE animus_kernel)
+    set_target_properties(animus_message_queue_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME MessageQueueTests COMMAND animus_message_queue_tests)
+
     add_executable(animus_module_loader_tests
       tests/ModuleLoaderTests.cpp
     )

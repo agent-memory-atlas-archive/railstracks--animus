@@ -47,12 +47,21 @@ public:
     // Push a message into a session's queue.
     // If no timer is running for this session, starts one.
     // If a timer is already running, the message accumulates.
+    //
+    // aggregation_window_ms: pre-chain debounce for burst arrivals (e.g.
+    // multi-PRIVMSG splits of one long IRC reply). When > 0 and no chain is
+    // active, the FIRST message starts a fixed window timer (deadline =
+    // arrival + window; the window does NOT extend on later messages) and
+    // the batch flushes as one concatenated turn when it expires. Messages
+    // arriving while a chain is active are unaffected — they take the
+    // existing interjection/cooldown path.
     void Push(const std::string& sessionKey,
               const std::string& sender,
               const std::string& content,
               std::uint64_t unixMs,
               int intervalSeconds,
-              int maxQueued);
+              int maxQueued,
+              int aggregationWindowMs = 0);
 
     // Drain pending messages for a session without waiting for the timer.
     // Returns concatenated text. Used when forcing a flush (e.g., max queue hit).
@@ -93,6 +102,7 @@ private:
         bool allow_interjection{false};
         bool has_responded{false};  // true once the agent has completed at least one chain
         int interval_seconds{0};
+        int aggregation_window_ms{0};  // pre-chain debounce window (0 = off)
     };
 
     void TimerLoop();
