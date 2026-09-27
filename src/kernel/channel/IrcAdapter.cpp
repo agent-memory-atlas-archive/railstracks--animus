@@ -135,11 +135,19 @@ void IrcAdapter::OnMessage(const std::string& sourceNick,
     if (channelMessage) origin["channel"] = target;
     Json::Value dispatchMeta;
     dispatchMeta["origin"] = origin;
+    // Context card (#15/#42) — tool-only delivery: channels may be busy and
+    // the agent may narrate its reasoning; auto-forwarding the raw chain
+    // text duplicates the explicit tool send and leaks narration to the
+    // channel. Silence stays a first-class outcome.
+    dispatchMeta["message_type"] = "chat";
+    dispatchMeta["delivery"] = "tool";
     // Channel-definition good form (#42): adapters state their delivery
     // semantics explicitly rather than relying on the kernel default.
     dispatchMeta["reply_instructions"] =
-        "Your text replies are delivered automatically; do NOT use the "
-        "channels tool to send your reply";
+        "Reply using the channels tool with action=reply (or action=post); "
+        "the channel is provided by the arrival and filled automatically. "
+        "Text replies are NOT delivered. In channels, if the message is not "
+        "addressed to you, staying silent is correct.";
     Json::StreamWriterBuilder wb;
     wb["indentation"] = "";
     const std::string metadata = Json::writeString(wb, dispatchMeta);
@@ -148,6 +156,11 @@ void IrcAdapter::OnMessage(const std::string& sourceNick,
     replyTarget.channel_name = m_channelName;
     replyTarget.channel_type = "irc";
     replyTarget.type = ChannelReplyTarget::Chat;
+    // peer_id carries the reply destination (#rpg or the DM nick) so the
+    // channels tool's reply-target resolution (fillIfMissing("channel",
+    // latest->peer_id)) has a server-resolved value to fill from. Without
+    // it, tool replies arrive with an empty channel and 400 in the bridge.
+    replyTarget.peer_id = channelMessage ? target : sourceNick;
     replyTarget.irc_target = channelMessage ? target : sourceNick;
     replyTarget.interface_name = m_channelName;
 

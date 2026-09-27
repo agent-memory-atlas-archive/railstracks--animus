@@ -35,15 +35,21 @@ function actions.post(args)
     end
 
     -- Proactive IRC send requires C++ bridge (IrcLoop owns the socket).
-    -- For now, advise using the standard reply mechanism.
+    -- The C++ bridge in ChannelsTool intercepts irc post/reply before this
+    -- handler runs, so reaching here means no channel instance matched —
+    -- advise the standard reply path.
     return {
         success = false,
-        output = "Proactive IRC send not yet available via tool. " ..
-                 "Use the standard reply mechanism — your text output will be " ..
-                 "routed to the IRC channel or query automatically.",
+        output = "IRC send not available for this instance (no C++ bridge match). " ..
+                 "Check the platform_id with channels list, or use the configured " ..
+                 "IRC instance.",
         target = target,
     }
 end
+
+-- reply shares post's send path in the C++ bridge (same SendReply route);
+-- the Lua handler mirrors the same limitation and error text.
+actions.reply = actions.post
 
 function actions.list_channels(args)
     local platform_id = args.platform_id or ""
@@ -121,10 +127,14 @@ animus.register_channel({
     id = "irc",
     name = "IRC",
     capabilities = {"read", "write"},
-    actions = {"post", "list_channels", "join", "part", "get_channel"},
+    actions = {"post", "reply", "list_channels", "join", "part", "get_channel"},
     schema = {
         post = {
             { name = "channel", type = "string", required = true, description = "Target channel (e.g. #steadyfort)" },
+            { name = "content", type = "string", required = true, description = "Message text" },
+        },
+        reply = {
+            { name = "channel", type = "string", required = false, description = "Target channel (e.g. #steadyfort); filled automatically from the arrival when omitted" },
             { name = "content", type = "string", required = true, description = "Message text" },
         },
         list_channels = {},
