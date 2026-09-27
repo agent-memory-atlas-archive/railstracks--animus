@@ -412,6 +412,72 @@
             },
             {drogon::Post});
 
+        // ------------------------------------------------------------------
+        // #126 per-invocation write gate — owner surface.
+        // GET    /api/v1/api/packages/{id}/approvals          -> pending list
+        // POST   /api/v1/api/packages/{id}/approvals/{digest}  -> approve
+        //
+        // Approvals are one-shot, payload-bound, TTL-capped. Held write
+        // results carry the digest; approving out-of-band is the point —
+        // the agent's own channel can relay the digest but never clear it.
+        // ------------------------------------------------------------------
+
+        // GET /api/v1/api/packages/{id}/approvals
+        drogon::app().registerHandler(
+            "/api/v1/api/packages/{id}/approvals",
+            [](const drogon::HttpRequestPtr& req,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+               const std::string& id) {
+                (void)req;
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                if (!server->m_apiPackageStore || !server->m_apiRuntime) {
+                    SendJsonError(callback, "api subsystem not available",
+                        drogon::k503ServiceUnavailable);
+                    return;
+                }
+                auto pkg = server->m_apiPackageStore->GetPackage(id);
+                if (!pkg) { SendJsonError(callback, "package not found", drogon::k404NotFound); return; }
+                Json::Value body(Json::objectValue);
+                body["writes_gated"] = pkg->writes_gated;
+                body["pending"] = server->m_apiRuntime->ListPendingWrites(id);
+                body["count"] = body["pending"].size();
+                SendJsonResponse(callback, body);
+            },
+            {drogon::Get});
+
+        // POST /api/v1/api/packages/{id}/approvals/{digest}
+        drogon::app().registerHandler(
+            "/api/v1/api/packages/{id}/approvals/{digest}",
+            [](const drogon::HttpRequestPtr& req,
+               std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+               const std::string& id, const std::string& digest) {
+                (void)req;
+                AdminServer* server = g_activeAdminServer.load();
+                if (!server) { SendServerNotActive(callback); return; }
+                if (!server->m_apiPackageStore || !server->m_apiRuntime) {
+                    SendJsonError(callback, "api subsystem not available",
+                        drogon::k503ServiceUnavailable);
+                    return;
+                }
+                if (!server->m_apiPackageStore->GetPackage(id)) {
+                    SendJsonError(callback, "package not found", drogon::k404NotFound);
+                    return;
+                }
+                if (!server->m_apiRuntime->ApproveWrite(id, digest)) {
+                    SendJsonError(callback,
+                        "no pending approval for this digest (unknown, expired, or "
+                        "bound to another package)", drogon::k404NotFound);
+                    return;
+                }
+                Json::Value body(Json::objectValue);
+                body["ok"] = true;
+                body["digest"] = digest;
+                body["note"] = "one-shot: the identical retry passes, any other payload re-queues";
+                SendJsonResponse(callback, body);
+            },
+            {drogon::Post});
+
         // POST /api/v1/api/packages/install-from-registry
         // body: {registry: str, name: str, version?: str}
         // Blocking (HTTP timeout ~10s). Verifies content hash before install.

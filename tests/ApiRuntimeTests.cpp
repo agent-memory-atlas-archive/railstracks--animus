@@ -173,7 +173,8 @@ struct Fixture {
 // Installs a package shaped for these tests.
 ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "",
                              const std::string& egressField = "",
-                             bool ownerInstalled = true) {
+                             bool ownerInstalled = true,
+                             bool writesGated = false) {
     std::string manifest = R"({
       "kind": "api_package", "name": "testpkg", "version": "0.1.0",
       "description": "fixture",
@@ -223,6 +224,12 @@ ApiPackage InstallFixturePkg(Fixture& fx, const std::string& extra = "",
         assert(cpos != std::string::npos);
         manifest.replace(cpos, 0,
                          "      \"egress_hosts\": " + egressField + ",\n");
+    }
+    // #126: writes_gated flag
+    if (writesGated) {
+        size_t cpos = manifest.find("      \"connections\": []");
+        assert(cpos != std::string::npos);
+        manifest.replace(cpos, 0, "      \"writes_gated\": true,\n");
     }
     ApiPackage pkg = fx.store.InstallFromManifest(manifest, "", "", ownerInstalled);
     fx.store.SetPackageEnabled(pkg.id, true);
@@ -973,6 +980,110 @@ int TestFilesResultPaths() {
 // (pixellab field test: image generation routinely takes 20-45s, default 30
 // races). Fixture /slow sleeps 1.2s; timeout_s=1 must fail transport,
 // timeout_s=5 must succeed. Template site gets the same pair via JSON.
+int TestWritesGate() {
+    std::cerr << "  [runtime] #126 writes gate: digest-bound egress approvals...\n";
+
+    // --- unit: digest framing (length-prefix = collision-proof) ----------
+    Assert(ApiRuntime::WriteDigest("p1", "ab", "c", "") !=
+           ApiRuntime::WriteDigest("p1", "a", "bc", ""),
+           "digest: component boundary is unambiguous");
+    Assert(ApiRuntime::WriteDigest("p1", "POST", "/u", "b") !=
+           ApiRuntime::WriteDigest("p2", "POST", "/u", "b"),
+           "digest: package-bound");
+    Assert(ApiRuntime::WriteDigest("p1", "POST", "/u", "b") ==
+           ApiRuntime::WriteDigest("p1", "POST", "/u", "b"),
+           "digest: deterministic");
+
+    // --- held / approve / consume / one-shot ------------------------------
+    Fixture fx;
+    std::string extra = R"({"name": "sandbox post", "kind": "action", "description": "d",
+        "parameters": {"sym": {"type": "string", "required": true}},
+        "script": "function run(ctx) local r = ctx.http.post(ctx.package.get_state('base_url')..'/orders', {body='{\"sym\":\"'..ctx.args.sym..'\"}'}) return {output='held '..tostring(r.approval_required ~= nil), data={held=r.approval_required ~= nil, digest=tostring(r.digest), status=r.status}} end"},)"
+        R"({"name": "sandbox get", "kind": "action", "description": "d",
+        "parameters": {},
+        "script": "function run(ctx) local r = ctx.http.get(ctx.package.get_state('base_url')..'/ping') return {output='status '..tostring(r.status), data={held=r.approval_required ~= nil}} end"},)";
+    auto pkg = InstallFixturePkg(fx, extra, "", /*ownerInstalled=*/true, /*writesGated=*/true);
+
+    Json::Value args;
+    args["sym"] = "NVDA";
+    auto r = fx.runtime->ExecuteAction("testpkg", "sandbox post", "agent", args);
+    Assert(r["success"].asBool(), "held write still returns success (script handles)");
+    Assert(r["data"]["held"].asBool(), "write held pending approval");
+    const std::string digest = r["data"]["digest"].asString();
+    Assert(digest.size() == 64, "digest is 64 hex chars (got " + digest + ")");
+    Assert(fx.server.hits == 0, "held request never touched the network");
+
+    // pending list + wrong-package approval refusal
+    Json::Value pending = fx.runtime->ListPendingWrites(pkg.id);
+    Assert(pending.size() == 1 && pending[0]["method"].asString() == "POST",
+           "one pending POST listed");
+    Assert(!fx.runtime->ApproveWrite("other-package", digest),
+           "digest is package-bound on approve too");
+
+    // re-held while pending (not approved yet)
+    r = fx.runtime->ExecuteAction("testpkg", "sandbox post", "agent", args);
+    Assert(r["data"]["held"].asBool() && fx.server.hits == 0, "re-held while pending");
+
+    // approve → identical retry passes
+    Assert(fx.runtime->ApproveWrite(pkg.id, digest), "approve ok");
+    r = fx.runtime->ExecuteAction("testpkg", "sandbox post", "agent", args);
+    Assert(!r["data"]["held"].asBool(), "approved digest passes");
+    Assert(fx.server.hits == 1, "exactly one network hit after approval");
+    Assert(r["data"]["status"].asInt() == 200, "server answered 200");
+
+    // one-shot: consumed by the passing call
+    r = fx.runtime->ExecuteAction("testpkg", "sandbox post", "agent", args);
+    Assert(r["data"]["held"].asBool() && fx.server.hits == 1,
+           "one-shot consumed — identical write re-queues");
+    const std::string digest2 = r["data"]["digest"].asString();
+    Assert(digest2 == digest, "same payload = same digest (stable)");
+
+    // modified payload = new digest
+    args["sym"] = "AAPL";
+    r = fx.runtime->ExecuteAction("testpkg", "sandbox post", "agent", args);
+    Assert(r["data"]["held"].asBool(), "modified body held");
+    Assert(r["data"]["digest"].asString() != digest, "modified body = new digest");
+
+    // reads unaffected
+    r = fx.runtime->ExecuteAction("testpkg", "sandbox get", "agent", Json::Value());
+    Assert(r["success"].asBool() && !r["data"]["held"].asBool(),
+           "GET passes ungated");
+    Assert(fx.server.hits == 2, "read hit the server");
+
+    // --- TTL expiry --------------------------------------------------------
+    {
+        Fixture fx2;
+        ApiRuntime::Config cfg;
+        cfg.filesRoot = fx2.filesRoot;
+        cfg.writeApprovalTtlMs = 1;  // ~immediate expiry
+        fx2.runtime = std::make_unique<ApiRuntime>(&fx2.store, &fx2.http, cfg, &fx2.vault);
+        auto pkg2 = InstallFixturePkg(fx2, extra, "", true, true);
+        Json::Value a2;
+        a2["sym"] = "MSFT";
+        auto r2 = fx2.runtime->ExecuteAction("testpkg", "sandbox post", "agent", a2);
+        Assert(r2["data"]["held"].asBool(), "ttl fixture: first write held");
+        const std::string dg = r2["data"]["digest"].asString();
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        Assert(!fx2.runtime->ApproveWrite(pkg2.id, dg),
+               "expired digest cannot be approved");
+        r2 = fx2.runtime->ExecuteAction("testpkg", "sandbox post", "agent", a2);
+        Assert(r2["data"]["held"].asBool(), "retry after expiry re-held (new window)");
+    }
+
+    // --- ungated package: zero behavior change ----------------------------
+    {
+        Fixture fx3;
+        auto pkg3 = InstallFixturePkg(fx3, extra, "", true, /*writesGated=*/false);
+        (void)pkg3;
+        Json::Value a3;
+        a3["sym"] = "TSLA";
+        auto r3 = fx3.runtime->ExecuteAction("testpkg", "sandbox post", "agent", a3);
+        Assert(!r3["data"]["held"].asBool(), "ungated package write passes");
+        Assert(fx3.server.hits == 1, "ungated write hit the server");
+    }
+    return 0;
+}
+
 int TestHttpTimeoutOption() {
     std::cerr << "  [runtime] http timeout_s option (script + template)...\n";
     Fixture fx;
@@ -1021,6 +1132,7 @@ int main() {
     TestHookContext();
     TestFilesResultPaths();
     TestHttpTimeoutOption();
+    TestWritesGate();
     if (g_failures == 0) std::cerr << "All api runtime tests passed.\n";
     else std::cerr << g_failures << " failures.\n";
     return g_failures == 0 ? 0 : 1;

@@ -3,6 +3,7 @@
 #include "animus_kernel/api/SecretsVault.h"
 
 #include "animus_kernel/ApiPackageStore.h"
+#include "animus_kernel/CryptoUtils.h"
 #include "animus_kernel/Log.h"
 #include "animus_kernel/tools/HttpClient.h"
 
@@ -223,6 +224,7 @@ struct BridgeContext {
     std::vector<std::string> secretValues;
     std::set<std::string> secretKeys;
     std::vector<std::string> egressHosts;  // #25: package egress scope
+    bool writesGated{false};               // #126: write methods need approval
     ApiPackageStore* store{nullptr};
     HttpClient* http{nullptr};
     ApiRuntime* runtime{nullptr};  // owns ExecuteScoped (per-hop redirect gate)
@@ -480,6 +482,36 @@ Json::Value DoHttp(BridgeContext* bc, const std::string& method, lua_State* L, i
         lua_getfield(L, optsIdx, "body");
         if (lua_isstring(L, -1)) req.body = lua_tostring(L, -1);
         lua_pop(L, 1);
+    }
+    // #126 per-invocation write gate: writes_gated packages must have each
+    // sandbox write (POST/PUT/DELETE) approved as an exact payload digest.
+    // The request-template path is already #106-bound (declared content);
+    // this is the complementary gate for runtime-composed requests. Held
+    // requests never touch the network — the budget is not spent either.
+    if (bc->writesGated && method != "GET" && bc->runtime) {
+        const std::string digest =
+            ApiRuntime::WriteDigest(bc->packageId, method, url, req.body);
+        const std::string maskedUrl = ApiRuntime::MaskSecrets(url, bc->secretValues);
+        int64_t expiresMs = 0;
+        if (bc->runtime->GateWrite(bc->packageId, digest, method, maskedUrl,
+                                   expiresMs) == ApiRuntime::WriteGateDecision::kHeld) {
+            ALOG_WARNING("api", "[writes-gate] HELD " << bc->logPrefix << " "
+                         << method << " " << maskedUrl << " digest "
+                         << digest.substr(0, 12) << " — awaiting owner approval");
+            Json::Value held(Json::objectValue);
+            held["status"] = 0;
+            held["error"] = "approval_required: write " + method + " held pending owner "
+                            "approval (digest " + digest + "). Approve via "
+                            "POST /api/v1/api/packages/" + bc->packageId +
+                            "/approvals/" + digest + " then retry — approval is "
+                            "one-shot and payload-bound (modified request = new digest).";
+            held["approval_required"] = true;
+            held["digest"] = digest;
+            held["expires_at_unix_ms"] = static_cast<Json::Int64>(expiresMs);
+            return held;
+        }
+        ALOG_INFO("api", "[writes-gate] PASSED " << bc->logPrefix << " "
+                  << method << " " << maskedUrl << " digest " << digest.substr(0, 12));
     }
     bc->httpUsed++;
     // #25: sandbox fetches follow redirects under the same per-hop scope
@@ -904,6 +936,112 @@ std::vector<std::string> ApiRuntime::ParseEgressHosts(const std::string& json) {
     return out;
 }
 
+// --- #126 per-invocation write gate -----------------------------------------
+
+std::string ApiRuntime::WriteDigest(const std::string& packageId,
+                                    const std::string& method,
+                                    const std::string& url,
+                                    const std::string& body) {
+    // "w1" framing version — bump if the input set ever changes. Length-
+    // prefixed segments make the concatenation collision-proof regardless
+    // of component contents.
+    const auto seg = [](const std::string& s) {
+        return std::to_string(s.size()) + ":" + s;
+    };
+    return crypto::Sha256Hex("w1|" + seg(packageId) + seg(method) + seg(url) + seg(body));
+}
+
+void ApiRuntime::SweepExpiredWritesLocked(int64_t nowMs) const {
+    for (auto it = m_pendingWrites.begin(); it != m_pendingWrites.end();) {
+        if (nowMs >= it->second.expiresMs)
+            it = m_pendingWrites.erase(it);
+        else
+            ++it;
+    }
+}
+
+ApiRuntime::WriteGateDecision ApiRuntime::GateWrite(const std::string& packageId,
+                                                     const std::string& digest,
+                                                     const std::string& method,
+                                                     const std::string& maskedUrl,
+                                                     int64_t& expiresOutMs) {
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::lock_guard<std::mutex> lk(m_pendingWritesMu);
+    SweepExpiredWritesLocked(now);
+    auto it = m_pendingWrites.find(digest);
+    if (it != m_pendingWrites.end() && it->second.approved) {
+        // Approved + unexpired (expired entries were swept above). One-shot:
+        // consumed by this pass.
+        m_pendingWrites.erase(it);
+        return WriteGateDecision::kPass;
+    }
+    if (it != m_pendingWrites.end()) {
+        // Still-pending unapproved digest: re-held. Keep the original window —
+        // re-holding is not a TTL refresh; expiry is the owner's deadline too.
+        expiresOutMs = it->second.expiresMs;
+        return WriteGateDecision::kHeld;
+    }
+    PendingWrite pw;
+    pw.packageId = packageId;
+    pw.method = method;
+    pw.maskedUrl = maskedUrl;
+    pw.createdMs = now;
+    pw.expiresMs = now + m_cfg.writeApprovalTtlMs;
+    if (m_pendingWrites.size() >= kMaxPendingWrites) {
+        // Oldest non-approved entry out — never evicts an approved digest.
+        auto oldest = m_pendingWrites.end();
+        for (auto i = m_pendingWrites.begin(); i != m_pendingWrites.end(); ++i) {
+            if (i->second.approved) continue;
+            if (oldest == m_pendingWrites.end() ||
+                i->second.createdMs < oldest->second.createdMs)
+                oldest = i;
+        }
+        if (oldest != m_pendingWrites.end()) m_pendingWrites.erase(oldest);
+    }
+    m_pendingWrites[digest] = pw;
+    expiresOutMs = pw.expiresMs;
+    return WriteGateDecision::kHeld;
+}
+
+bool ApiRuntime::ApproveWrite(const std::string& packageId, const std::string& digest) {
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::lock_guard<std::mutex> lk(m_pendingWritesMu);
+    SweepExpiredWritesLocked(now);
+    auto it = m_pendingWrites.find(digest);
+    if (it == m_pendingWrites.end()) return false;
+    if (it->second.packageId != packageId) return false;  // digest is package-bound
+    it->second.approved = true;  // window unchanged: approving late = short window
+    ALOG_INFO("api", "[writes-gate] digest " << digest.substr(0, 12)
+               << " APPROVED for package " << packageId
+               << " (" << it->second.method << " " << it->second.maskedUrl << ")");
+    return true;
+}
+
+Json::Value ApiRuntime::ListPendingWrites(const std::string& packageId) const {
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::lock_guard<std::mutex> lk(m_pendingWritesMu);
+    SweepExpiredWritesLocked(now);
+    std::vector<const PendingWrite*> rows;
+    for (const auto& [dg, pw] : m_pendingWrites)
+        if (pw.packageId == packageId && !pw.approved) rows.push_back(&pw);
+    std::sort(rows.begin(), rows.end(), [](auto* a, auto* b) {
+        return a->createdMs > b->createdMs;  // newest first
+    });
+    Json::Value out(Json::arrayValue);
+    for (const PendingWrite* pw : rows) {
+        Json::Value o(Json::objectValue);
+        o["method"] = pw->method;
+        o["url"] = pw->maskedUrl;
+        o["created_at_unix_ms"] = static_cast<Json::Int64>(pw->createdMs);
+        o["expires_at_unix_ms"] = static_cast<Json::Int64>(pw->expiresMs);
+        out.append(o);
+    }
+    return out;
+}
+
 bool ApiRuntime::EgressAllowed(const std::vector<std::string>& hostPatterns,
                                const std::string& resolvedUrl, std::string& hostOut) {
     // Extract host from the resolved URL (no templating left here).
@@ -1252,6 +1390,7 @@ Json::Value ApiRuntime::ExecuteInternal(const std::string& packageName,
     bc.secretValues = secretValues;
     bc.secretKeys = secretKeys;
     bc.egressHosts = egressScope;
+    bc.writesGated = pkg->writes_gated;
     bc.runtime = this;
     bc.store = m_store;
     bc.http = m_http;

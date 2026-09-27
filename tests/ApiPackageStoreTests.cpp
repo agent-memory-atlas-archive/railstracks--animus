@@ -277,12 +277,48 @@ int TestManifestInstall() {
         Assert(hooks.size() == 1 && hooks[0].hooks.find("on_message") != std::string::npos,
                "1 connection installed");
 
-        bool threw = false;
-        try { store.InstallFromManifest(kAlpacaManifest); }
-        catch (const std::runtime_error& e) {
-            threw = std::string(e.what()).find("already installed") != std::string::npos;
+        // Reinstalling an identical manifest is an in-place UPGRADE (db84ef3):
+        // no throw, operator state + enabled flag preserved. This test
+        // asserted "already installed" rejection until Sept 27 (#126 run) —
+        // it had been stale since db84ef3 landed; subset runs missed it.
+        {
+            store.SetPackageEnabled(p.id, true);
+            ApiPackage again = store.InstallFromManifest(kAlpacaManifest);
+            Assert(again.id == p.id, "identical reinstall upgrades in place");
+            Assert(again.enabled, "enabled flag survives reinstall");
         }
-        Assert(threw, "duplicate install rejected");
+
+        // #126: writes_gated manifest field — bool lint + row round-trip
+        // (isolated db: the residue checks below assert exactly ONE package
+        // in the shared store)
+        {
+            const std::string wgPath = MakeTempDbPath();
+            SqliteDataStore wgDb(wgPath);
+            ApiPackageStore store2(&wgDb);
+            ApiPackage wg = store2.InstallFromManifest(
+                R"({"kind":"api_package","name":"wg","version":"1","description":"x",
+                     "writes_gated":true,
+                     "commands":[{"name":"a","kind":"action","description":"d","script":"s"}]})");
+            Assert(store2.GetPackage(wg.id)->writes_gated,
+                   "writes_gated: true round-trips");
+            bool rejected = false;
+            try {
+                store2.InstallFromManifest(
+                    R"({"kind":"api_package","name":"wg2","version":"1","description":"x",
+                         "writes_gated":"yes",
+                         "commands":[{"name":"a","kind":"action","description":"d","script":"s"}]})");
+            } catch (const std::runtime_error& e) {
+                rejected = std::string(e.what()).find("writes_gated must be a boolean")
+                           != std::string::npos;
+            }
+            Assert(rejected, "writes_gated: non-bool rejected");
+            ApiPackage plain = store2.InstallFromManifest(
+                R"({"kind":"api_package","name":"plain","version":"1","description":"x",
+                     "commands":[{"name":"a","kind":"action","description":"d","script":"s"}]})");
+            Assert(!store2.GetPackage(plain.id)->writes_gated,
+                   "writes_gated: defaults false");
+            unlink(wgPath.c_str());
+        }
 
         // --- lint rejects -----------------------------------------------------
         auto Rejects = [&](const std::string& manifest, const std::string& needle,
