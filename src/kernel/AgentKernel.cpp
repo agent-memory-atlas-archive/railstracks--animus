@@ -1491,10 +1491,21 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             replyTarget.session_key = sessionKey;
             replyTarget.agent_id = agentId;
 
-            // Check if this channel has a minimum response interval configured
+            // Channel queueing knobs (read per-arrival, both optional):
+            //   min_response_interval — cooldown between chains (seconds)
+            //   aggregation_window_ms — pre-chain debounce for burst arrivals
+            //     (multi-PRIVMSG splits, cross-talk): first arrival arms a
+            //     fixed window, the batch flushes as one concatenated turn.
             const int interval = GetChannelInterval(replyTarget.channel_name);
+            int aggregationWindowMs = 0;
+            if (m_channelManager) {
+                auto ch = m_channelManager->GetChannel(replyTarget.channel_name);
+                if (ch) {
+                    aggregationWindowMs = ch->config.get("aggregation_window_ms", 0).asInt();
+                }
+            }
 
-            if (interval > 0 && m_messageQueue) {
+            if ((interval > 0 || aggregationWindowMs > 0) && m_messageQueue) {
                 // Determine sender label — empty for DM channels, populated for community
                 // Heuristic: if sessionType is "chat" and it's a DM channel (IRC nick,
                 // Telegram private, Discord DM), sender is empty. For group channels,
@@ -1537,7 +1548,8 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
                 m_messageQueue->Push(queueKey, sender, message,
                     static_cast<std::uint64_t>(unixMs),
                     interval,
-                    50);  // max queued — TODO: read from channel config
+                    50,  // max queued — TODO: read from channel config
+                    aggregationWindowMs);
 
                 // If no chain is active and no timer is running, the Push already
                 // started a timer. When it fires, the flush callback will execute.
@@ -1888,8 +1900,13 @@ void AgentKernel::ExecuteChannelDispatch(
                                                        session->AgentId());
             }
 
-            // Notify queue that the chain has ended — starts cooldown if interval > 0
-            if (m_messageQueue && interval > 0) {
+            // Notify queue that the chain has ended — arms cooldown and/or
+            // aggregation-window timers for any messages that accumulated
+            // mid-chain (NotifyChainEnd itself decides by the session's
+            // stored knobs; calling unconditionally is safe and covers the
+            // aggregation_window-only case, which previously fell through
+            // the interval>0 guard and left post-chain backlog stalled).
+            if (m_messageQueue) {
                 m_messageQueue->NotifyChainEnd("channel:" + sessionKey, interval);
             }
         });
