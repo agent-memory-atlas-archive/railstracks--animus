@@ -4,7 +4,9 @@
 #include <json/json.h>
 
 #include <set>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace animus::kernel {
@@ -35,6 +37,7 @@ public:
         size_t fsReadCapBytes{1024 * 1024};       // 1 MB per read
         size_t stringTruncateBytes{16 * 1024};    // ~16 KB truncation rule
         size_t instructionLimit{10'000'000};
+        int64_t writeApprovalTtlMs{600000};       // #126: unused approvals expire
     };
 
     ApiRuntime(ApiPackageStore* store, HttpClient* http, Config cfg,
@@ -64,6 +67,33 @@ public:
     // location cannot be resolved (caller surfaces the raw redirect).
     static std::string ResolveRedirectUrl(const std::string& requestUrl,
                                           const std::string& location);
+
+    // --- #126 per-invocation write gate ----------------------------------
+    // Payload-bound digest of a sandbox write request. "w1" framing version;
+    // length-prefixed segments so components can never collide.
+    static std::string WriteDigest(const std::string& packageId,
+                                   const std::string& method,
+                                   const std::string& url,
+                                   const std::string& body);
+
+    enum class WriteGateDecision { kPass, kHeld };
+    // Called from DoHttp for write methods on writes_gated packages. A new
+    // (or still-pending) digest is queued for owner approval and kHeld is
+    // returned; an approved, unexpired digest is CONSUMED (one-shot) and
+    // kPass returned. expiresOutMs carries the pending window on kHeld.
+    // maskedUrl is stored for the admin list (secrets masked by caller).
+    WriteGateDecision GateWrite(const std::string& packageId,
+                                const std::string& digest,
+                                const std::string& method,
+                                const std::string& maskedUrl,
+                                int64_t& expiresOutMs);
+
+    // Owner approves a pending digest (out-of-band admin surface).
+    // False: unknown digest, expired, or package mismatch.
+    bool ApproveWrite(const std::string& packageId, const std::string& digest);
+
+    // Pending (unapproved) writes for a package, newest first.
+    Json::Value ListPendingWrites(const std::string& packageId) const;
 
     // Executes an action command for an agent. argsJson must be a JSON
     // object (empty object for no-arg commands). Returns the agent-facing
@@ -125,6 +155,23 @@ private:
     HttpClient* m_http;
     Config m_cfg;
     SecretsVault* m_vault{nullptr};
+
+    // #126 write gate state. In-memory by design: approvals are ephemeral
+    // trust decisions; a restart revoking outstanding approvals is the safe
+    // direction. Digest-keyed; see GateWrite for the lifecycle.
+    struct PendingWrite {
+        std::string packageId;
+        std::string method;
+        std::string maskedUrl;
+        int64_t createdMs{0};
+        int64_t expiresMs{0};
+        bool approved{false};
+    };
+    static constexpr size_t kMaxPendingWrites = 256;
+    mutable std::mutex m_pendingWritesMu;
+    mutable std::unordered_map<std::string, PendingWrite> m_pendingWrites;
+
+    void SweepExpiredWritesLocked(int64_t nowMs) const;
 };
 
 }  // namespace animus::kernel

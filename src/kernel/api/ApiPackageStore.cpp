@@ -202,6 +202,15 @@ void ApiPackageStore::EnsureSchema() {
     // algorithm before re-binding under v2; new writes always stamp 'v2'.
     if (!schema::ColumnExists(m_store, "api_packages", "hash_algo"))
         schema::CreateTable(m_store, "ALTER TABLE api_packages ADD COLUMN hash_algo TEXT");
+    // #126 write gate. Column addition doubles as the one-shot sentinel for
+    // the re-hash pass below: the projection gains "writes_gated", so every
+    // stored content_hash changes once. Approval bindings are re-established
+    // in the same pass (approved rows keep status, both hashes re-stamped).
+    const bool writesGateFresh =
+        !schema::ColumnExists(m_store, "api_packages", "writes_gated");
+    if (writesGateFresh)
+        schema::CreateTable(m_store,
+            "ALTER TABLE api_packages ADD COLUMN writes_gated INTEGER NOT NULL DEFAULT 0");
 
     schema::CreateTable(m_store, R"(
         CREATE TABLE IF NOT EXISTS api_package_agents (
@@ -251,6 +260,7 @@ void ApiPackageStore::EnsureSchema() {
     MigrateEgressScopes();
     MigrateApprovalGate();
     MigrateHashV2();
+    if (writesGateFresh) MigrateWritesGateHash();
 }
 
 void ApiPackageStore::MigrateEgressScopes() {
@@ -399,6 +409,28 @@ void ApiPackageStore::MigrateHashV2() {
     }
 }
 
+void ApiPackageStore::MigrateWritesGateHash() {
+    // #126: ComputeContentHash gains "writes_gated" in the projection, so
+    // every stored hash changes once. Unlike v1->v2 this is a pure
+    // projection change — no content semantics moved — so bindings are
+    // re-established unconditionally (status preserved, both hashes
+    // re-stamped). Runs exactly once: gated on the column-add branch.
+    for (const auto& pkg : ListPackages()) {
+        const std::string h =
+            ComputeContentHash(pkg, ListCommands(pkg.id), ListConnections(pkg.id));
+        auto stmt = m_store->Prepare(
+            "UPDATE api_packages SET content_hash = ?, approved_hash = ? WHERE id = ?");
+        if (!stmt) continue;
+        stmt->BindText(1, h);
+        // Rows that were never approved have empty approved_hash and keep it.
+        stmt->BindText(2, pkg.approval_status == "approved" ? h : pkg.approved_hash);
+        stmt->BindText(3, pkg.id);
+        stmt->ExecDML();
+    }
+    ALOG_INFO("api", "[writes-gate] content hashes re-stamped for the "
+               "writes_gated projection (approval bindings preserved)");
+}
+
 void ApiPackageStore::RefreshApproval(const std::string& packageId, bool ownerActed) {
     auto pkg = GetPackage(packageId);
     if (!pkg) return;
@@ -472,6 +504,8 @@ std::string ApiPackageStore::ComputeContentHash(const ApiPackage& pkg,
     Json::Value j(Json::objectValue);
     j["name"] = pkg.name;
     j["version"] = pkg.version;
+    j["writes_gated"] = pkg.writes_gated;  // #126: the write-lane master
+                                           // switch is security-relevant
     j["state_schema"] = CanonicalNested(pkg.state_schema.empty() ? "{}" : pkg.state_schema,
                                         Json::Value(Json::objectValue));
     j["egress_hosts"] = CanonicalHostSet(pkg.egress_hosts);
@@ -606,6 +640,7 @@ ApiPackage RowToPackage(const std::unique_ptr<IStatement>& stmt) {
     p.hash_algo = stmt->ColumnText(20);
     p.created_at_unix_ms = stmt->ColumnInt64(14);
     p.updated_at_unix_ms = stmt->ColumnInt64(15);
+    p.writes_gated = stmt->ColumnInt64(21) != 0;
     return p;
 }
 
@@ -613,7 +648,7 @@ const char* kPackageColumns =
     "id, name, display_name, description, keywords, version, registry_source, "
     "registry_version, locally_modified, enabled, dispatch_cooldown_ms, "
     "files_quota_mb, state_schema, state, created_at_unix_ms, updated_at_unix_ms, "
-    "egress_hosts, approval_status, content_hash, approved_hash, hash_algo";
+    "egress_hosts, approval_status, content_hash, approved_hash, hash_algo, writes_gated";
 
 ApiPackageCommand RowToCommand(const std::unique_ptr<IStatement>& stmt) {
     ApiPackageCommand c;
@@ -664,8 +699,8 @@ ApiPackage ApiPackageStore::CreatePackage(const ApiPackage& pkg) {
         "version, registry_source, registry_version, locally_modified, enabled, "
         "dispatch_cooldown_ms, files_quota_mb, state_schema, state, "
         "created_at_unix_ms, updated_at_unix_ms, egress_hosts, "
-        "approval_status, content_hash, approved_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        "approval_status, content_hash, approved_hash, writes_gated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!stmt) throw std::runtime_error("api_packages insert prepare failed");
     stmt->BindText(1, id);
     stmt->BindText(2, pkg.name);
@@ -691,6 +726,7 @@ ApiPackage ApiPackageStore::CreatePackage(const ApiPackage& pkg) {
     stmt->BindText(18, pkg.approval_status.empty() ? "pending" : pkg.approval_status);
     stmt->BindText(19, pkg.content_hash);
     stmt->BindText(20, pkg.approved_hash);
+    stmt->BindInt64(21, pkg.writes_gated ? 1 : 0);
     stmt->ExecDML();
     stmt->Finalize();
 
@@ -736,7 +772,7 @@ bool ApiPackageStore::UpdatePackageMeta(const ApiPackage& pkg, bool partOfLarger
         "version = ?, registry_source = ?, registry_version = ?, locally_modified = ?, "
         "dispatch_cooldown_ms = ?, files_quota_mb = ?, state_schema = ?, "
         "egress_hosts = ?, approval_status = ?, content_hash = ?, approved_hash = ?, "
-        "updated_at_unix_ms = ? WHERE id = ?");
+        "writes_gated = ?, updated_at_unix_ms = ? WHERE id = ?");
     if (!stmt) return false;
     stmt->BindText(1, pkg.display_name);
     stmt->BindText(2, pkg.description);
@@ -752,8 +788,9 @@ bool ApiPackageStore::UpdatePackageMeta(const ApiPackage& pkg, bool partOfLarger
     stmt->BindText(12, pkg.approval_status.empty() ? "pending" : pkg.approval_status);
     stmt->BindText(13, pkg.content_hash);
     stmt->BindText(14, pkg.approved_hash);
-    stmt->BindInt64(15, NowUnixMs());
-    stmt->BindText(16, pkg.id);
+    stmt->BindInt64(15, pkg.writes_gated ? 1 : 0);
+    stmt->BindInt64(16, NowUnixMs());
+    stmt->BindText(17, pkg.id);
     stmt->ExecDML();
     stmt->Finalize();
     // Meta carries hash-relevant fields (version, state_schema, egress_hosts):
@@ -1264,6 +1301,13 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
     const int64_t quota = m.get("files_quota_mb", Json::Value(256)).asInt64();
     if (quota <= 0) lint.Add("files_quota_mb must be > 0");
 
+    // #126: per-invocation write gate (sandbox POST/PUT/DELETE require an
+    // approved digest). Opt-in, package-level.
+    const Json::Value jWritesGated = m.get("writes_gated", Json::Value(false));
+    if (!jWritesGated.isBool())
+        lint.Add("writes_gated must be a boolean");
+    const bool writesGated = jWritesGated.asBool();
+
     // state_schema: object; values are {type: string, default?: any, secret?: bool}
     Json::Value stateSchema = m.get("state_schema", Json::Value(Json::objectValue));
     if (!stateSchema.isObject()) {
@@ -1508,6 +1552,7 @@ ApiPackage ApiPackageStore::InstallFromManifest(const std::string& manifestJson,
     pkg.enabled = false;  // install != enable
     pkg.dispatch_cooldown_ms = cooldown;
     pkg.files_quota_mb = quota;
+    pkg.writes_gated = writesGated;
     pkg.state_schema = JsonCompact(stateSchema);
     pkg.egress_hosts = egressDeclared ? JsonCompact(egressArr) : JsonHostArray(derived);
     if (existing) {

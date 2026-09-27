@@ -33,6 +33,9 @@ struct ApiPackage {
     std::string registry_version;    // semver last downloaded; "" if none
     bool locally_modified{false};
     bool enabled{false};             // install != enable; enabling is explicit
+    bool writes_gated{false};        // #126: sandbox POST/PUT/DELETE require
+                                     // per-invocation digest approval (the
+                                     // template path is already #106-bound)
     std::string egress_hosts;        // JSON array of allowed host patterns (#25);
                                      // derived from url templates when undeclared
     std::string approval_status;     // #25 gate: "pending" | "approved" | "rejected";
@@ -148,6 +151,8 @@ public:
     void MigrateEgressScopes();
     void MigrateApprovalGate();
     void MigrateHashV2();
+    void MigrateWritesGateHash();  // #126: re-stamp hashes after the
+                                   // projection gains "writes_gated"
 
     // Single arbitration point for the approval gate: recompute the content
     // hash from STORED rows and reconcile approval_status with it.
