@@ -40,6 +40,13 @@ ctx = {
   http = {                              -- SECONDARY calls only (cap: 5 per invocation)
     get = function(url, opts) end,
     post = function(url, opts) end, put = ..., delete = ...,
+    -- #126 writes gate: on writes_gated packages, post/put/delete return
+    --   { status = 0, approval_required = true, digest = "<64 hex>",
+    --     expires_at_unix_ms = ..., error = "approval_required: ..." }
+    -- instead of performing the request. The owner approves the digest
+    -- (admin route in the error string); the IDENTICAL retry then passes
+    -- (one-shot). Compose writes deterministically — a changed payload
+    -- is a new digest. Reads (get) are never gated.
   },
   fs = {                                -- package-scoped filespace (see Files & bulk payloads)
     write = function(name, data) end,   -- → path | nil, reason; binary-safe; quota-checked

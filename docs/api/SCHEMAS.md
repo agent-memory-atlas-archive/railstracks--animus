@@ -23,6 +23,9 @@ CREATE TABLE api_packages (
   enabled            BOOLEAN NOT NULL DEFAULT FALSE,
   dispatch_cooldown_ms INTEGER NOT NULL DEFAULT 10000,
   files_quota_mb      INTEGER NOT NULL DEFAULT 256,   -- ctx.fs quota (D12)
+  writes_gated        BOOLEAN NOT NULL DEFAULT FALSE, -- #126: sandbox write methods
+                                                       -- require per-invocation digest
+                                                       -- approval (manifest opt-in)
   state_schema       JSONB NOT NULL DEFAULT '{}',
   state              JSONB NOT NULL DEFAULT '{}',
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
