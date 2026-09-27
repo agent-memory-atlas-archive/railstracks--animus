@@ -151,13 +151,16 @@ ToolResult ChannelsTool::Execute(const ToolCall& call) {
     if (adapterType == "irc" && m_channelManager) {
         ToolResult result;
         result.call_id = call.id;
-        if (action == "post") {
+        if (action == "post" || action == "reply") {
+            // Channel: explicit arg wins; the reply-target resolution above
+            // fills it from the latest arrival's peer_id when omitted (the
+            // IRC adapter sets peer_id to the #channel or DM nick).
             std::string target = GetStringField(preArgs, "channel");
             if (target.empty()) target = GetStringField(preArgs, "target");
             std::string content = GetStringField(preArgs, "content");
             if (target.empty() || content.empty()) {
                 result.success = false;
-                result.error = "IRC post requires 'channel' and 'content' parameters";
+                result.error = "IRC " + action + " requires 'channel' (or 'target') and 'content' parameters";
                 result.call_id = call.id;
                 return result;
             }
