@@ -165,6 +165,8 @@ const formData = ref({
   nextcloud_group_mention_trigger: '',
   // Common: message batching (Ticket 114)
   min_response_interval: 0,
+  // Common: pre-chain aggregation window (ms) — burst arrivals batch into one turn
+  aggregation_window_ms: 0,
   // Common: interjection (Ticket 115)
   allow_interjection: true,
 });
@@ -275,6 +277,7 @@ function resetForm(): void {
     nextcloud_respond_in_group_on_mention: true,
     nextcloud_group_mention_trigger: '',
     min_response_interval: 0,
+    aggregation_window_ms: 0,
     allow_interjection: true,
   };
 }
@@ -622,6 +625,7 @@ function openEdit(item: ChannelInfo): void {
 
   // Load common fields (Ticket 114)
   formData.value.min_response_interval = Number(cfg.min_response_interval ?? 0);
+  formData.value.aggregation_window_ms = Number(cfg.aggregation_window_ms ?? 0);
   formData.value.allow_interjection = cfg.allow_interjection !== false; // default true
 
   // Reset WhatsApp QR state
@@ -779,6 +783,7 @@ async function submitForm(): Promise<void> {
     const config = buildConfig();
     // Add common fields that apply to all channel types (Ticket 114)
     config.min_response_interval = Number(formData.value.min_response_interval) || 0;
+    config.aggregation_window_ms = Number(formData.value.aggregation_window_ms) || 0;
     config.allow_interjection = formData.value.allow_interjection === true;
     if (isNew.value) {
       await apiRequest('POST', '/api/v1/channels', {
@@ -1206,6 +1211,16 @@ onMounted(async () => {
               :label="t('channels.form.minResponseInterval')"
               type="number"
               hint="Seconds between responses. 0 = immediate. Incoming messages during the wait are batched."
+              density="comfortable"
+              class="mb-2"
+            />
+
+            <!-- Common: aggregation window (pre-chain debounce) -->
+            <v-text-field
+              v-model="formData.aggregation_window_ms"
+              :label="t('channels.form.aggregationWindow')"
+              type="number"
+              hint="Milliseconds to wait for more arrivals before the agent starts processing. Burst arrivals (e.g. a long IRC reply split into several messages) are batched into one turn. 0 = off. Suggested for IRC: 1000-1500."
               density="comfortable"
               class="mb-2"
             />

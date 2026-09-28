@@ -33,6 +33,7 @@ export const channels = {
       type: 'Channel Type',
       agent: 'Agent',
       minResponseInterval: 'Minimum Response Interval (seconds)',
+      aggregationWindow: 'Aggregation Window (milliseconds)',
       allowInterjection: 'Allow Interjection',
       irc: {
         host: 'IRC Server',
