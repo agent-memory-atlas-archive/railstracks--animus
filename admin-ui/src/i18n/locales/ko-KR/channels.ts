@@ -69,8 +69,10 @@ export const channels = {
         replyToUsers: 'Reply to Users (allowlist)'
       },
       mastodon: {
-        handle: '손잡이',
-        instance: '인스턴스 URL'
+        accessToken: '액세스 토큰',
+        accessTokenHint: '현재 토큰을 유지하려면 비워 두세요',
+        instanceUrl: '인스턴스 URL',
+        pollInterval: '폴링 간격 (초)'
       },
       email: {
         apiKey: 'AgentMail API 키',

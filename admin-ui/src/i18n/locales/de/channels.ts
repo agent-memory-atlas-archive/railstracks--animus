@@ -69,8 +69,10 @@ export const channels = {
         replyToUsers: 'Reply to Users (allowlist)'
       },
       mastodon: {
-        handle: 'Griff',
-        instance: 'Instanz-URL'
+        accessToken: 'Zugriffstoken',
+        accessTokenHint: 'Leer lassen, um den aktuellen Token zu behalten',
+        instanceUrl: 'Instanz-URL',
+        pollInterval: 'Abfrageintervall (Sekunden)'
       },
       email: {
         apiKey: 'AgentMail-API-Schlüssel',

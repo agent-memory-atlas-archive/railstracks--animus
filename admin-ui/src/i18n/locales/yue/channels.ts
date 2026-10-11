@@ -69,8 +69,10 @@ export const channels = {
         replyToUsers: 'Reply to Users (allowlist)'
       },
       mastodon: {
-        handle: '處理',
-        instance: '實例網址'
+        accessToken: '存取權杖',
+        accessTokenHint: '留空以保留現有權杖',
+        instanceUrl: '實例網址',
+        pollInterval: '輪詢間隔（秒）'
       },
       email: {
         apiKey: 'AgentMail API 金鑰',

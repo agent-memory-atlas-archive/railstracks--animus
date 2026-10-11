@@ -123,8 +123,9 @@ const formData = ref({
   bluesky_reply_to_all: true,
   bluesky_reply_to_users: '',
   // Mastodon fields
-  mastodon_handle: '',
-  mastodon_instance: '',
+  mastodon_access_token: '',
+  mastodon_instance_url: '',
+  mastodon_poll_interval: '',
   // Email (AgentMail) fields
   email_api_key: '',
   email_inbox_id: '',
@@ -237,8 +238,9 @@ function resetForm(): void {
     bluesky_auto_reply: true,
     bluesky_reply_to_all: true,
     bluesky_reply_to_users: '',
-    mastodon_handle: '',
-    mastodon_instance: '',
+    mastodon_access_token: '',
+    mastodon_instance_url: '',
+    mastodon_poll_interval: '',
     // Email (AgentMail) fields
     email_api_key: '',
     email_inbox_id: '',
@@ -393,10 +395,13 @@ function buildConfig(): Record<string, unknown> {
   }
   if (type === 'mastodon') {
     cfg = {
-      handle: formData.value.mastodon_handle,
-      instance: formData.value.mastodon_instance,
+      instance_url: formData.value.mastodon_instance_url,
       agent_id: formData.value.agent_id || '',
     };
+    // Never overwrite an existing token with an empty string
+    if (formData.value.mastodon_access_token) cfg.access_token = formData.value.mastodon_access_token;
+    const poll = Number(formData.value.mastodon_poll_interval);
+    if (poll && poll >= 15) cfg.poll_interval = poll;
     return cfg;
   }
   if (type === 'email') {
@@ -558,8 +563,9 @@ function openEdit(item: ChannelInfo): void {
       : '';
     formData.value.agent_id = String(cfg.agent_id ?? '');
   } else if (type === 'mastodon') {
-    formData.value.mastodon_handle = cfg.handle || '';
-    formData.value.mastodon_instance = cfg.instance || '';
+    formData.value.mastodon_access_token = ''; // Never prefill tokens
+    formData.value.mastodon_instance_url = cfg.instance_url || '';
+    formData.value.mastodon_poll_interval = cfg.poll_interval ? String(cfg.poll_interval) : '';
     formData.value.agent_id = String(cfg.agent_id ?? '');
   } else if (type === 'email') {
     formData.value.email_api_key = '';
@@ -999,8 +1005,28 @@ onMounted(async () => {
             <!-- Mastodon fields -->
             <template v-if="formData.type === 'mastodon'">
               <v-select v-model="formData.agent_id" :items="agentItems" :label="t('channels.form.agent')" density="comfortable" class="mb-2" />
-              <v-text-field v-model="formData.mastodon_handle" :label="t('channels.form.mastodon.handle')" density="comfortable" class="mb-2" />
-              <v-text-field v-model="formData.mastodon_instance" :label="t('channels.form.mastodon.instance')" density="comfortable" class="mb-2" />
+              <v-text-field
+                v-model="formData.mastodon_instance_url"
+                :label="t('channels.form.mastodon.instanceUrl')"
+                hint="https://mastodon.social"
+                density="comfortable"
+                class="mb-2"
+              />
+              <v-text-field
+                v-model="formData.mastodon_access_token"
+                :label="t('channels.form.mastodon.accessToken')"
+                :hint="isNew ? '' : t('channels.form.mastodon.accessTokenHint')"
+                :type="isNew ? 'text' : 'password'"
+                density="comfortable"
+                class="mb-2"
+              />
+              <v-text-field
+                v-model="formData.mastodon_poll_interval"
+                :label="t('channels.form.mastodon.pollInterval')"
+                hint="min 15"
+                density="comfortable"
+                class="mb-2"
+              />
             </template>
 
             <!-- Email (AgentMail) fields -->
