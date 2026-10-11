@@ -377,7 +377,6 @@ add_library(animus_kernel
   src/kernel/data/IdRanges.cpp
   src/kernel/data/SyncStore.cpp
   src/kernel/PeerSyncService.cpp
-  src/kernel/social/SocialEventPoller.cpp
   src/kernel/social/TelegramBotApi.cpp
   src/kernel/ChannelManager.cpp
   src/kernel/MessageQueue.cpp
