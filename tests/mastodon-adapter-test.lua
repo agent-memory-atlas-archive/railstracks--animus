@@ -275,7 +275,8 @@ config_store["channels." .. PID .. ".last_notif_id"] = "110"
 local notif_body = json.encode({
     { id = "120", type = "mention", created_at = "2026-10-10T15:00:00.000Z",
       status = { id = "9002", created_at = "2026-10-10T14:59:00.000Z",
-        content = "<p>hello there</p>", url = "https://mastodon.social/@peer/9002",
+        content = "<p><span class=\"h-card\"><a class=\"u-url mention\" href=\"https://mastodon.social/@agent\">@<span>agent</span></a></span> hello there</p>",
+        url = "https://mastodon.social/@peer/9002",
         visibility = "public", in_reply_to_id = nil,
         account = { acct = "peer@inst.example", display_name = "Peer Person",
           url = "https://inst.example/@peer" } } },
@@ -288,12 +289,20 @@ local notif_body = json.encode({
 })
 mock_add({
     matcher = function(url) return url:find("/api/v1/notifications", 1, true) ~= nil end,
-    respond = function() return { status = 200, headers = {}, body = notif_body } end
+    respond = function() return { status = 200, headers = {
+        ["x-ratelimit-limit"] = "300", ["x-ratelimit-remaining"] = "299"
+    }, body = notif_body } end
 })
 local r = call("poll")
 check("poll success", r.success == true, r.error)
+check("rate-limit headers tracked (299/300)",
+    config_store["channels." .. PID .. ".rate_limit_remaining"] == "299",
+    tostring(config_store["channels." .. PID .. ".rate_limit_remaining"]))
 check("request carries types[]=mention filter",
     all_urls[#all_urls]:find("types%[%]=mention", 1, false) ~= nil,
+    all_urls[#all_urls])
+check("min_id server cursor sent when watermark set",
+    all_urls[#all_urls]:find("min_id=110", 1, true) ~= nil,
     all_urls[#all_urls])
 check("poll count 1 (watermark dedupe + type filter)", r.count == 1, tostring(r.count))
 check("watermark advanced to 120",
@@ -305,7 +314,11 @@ check("author_display surfaced", m.author_display == "Peer Person")
 check("created_at surfaced", m.created_at == "2026-10-10T14:59:00.000Z", m.created_at)
 check("status url surfaced", m.status_url == "https://mastodon.social/@peer/9002")
 check("author_url surfaced", m.author_url == "https://inst.example/@peer")
-check("mention text surfaced", m.text == "<p>hello there</p>")
+check("mention text plain (mention span unwrapped to @agent)",
+    m.text == "@agent hello there", m.text)
+check("raw HTML preserved alongside (content_html)",
+    m.content_html ~= nil and m.content_html:find("h-card", 1, true) ~= nil,
+    tostring(m.content_html))
 check("in_reply_to_id empty (top-level)", m.in_reply_to_id == "")
 
 -- Re-poll: same feed → zero new (watermark)

@@ -168,6 +168,27 @@ local function compute_backoff(platform_id, resp, consecutive)
     return seconds
 end
 
+--- Track Mastodon's proactive rate-limit headers (X-RateLimit-Limit /
+--- Remaining / Reset, present on every REST response). Persists the snapshot
+--- and warns loudly when the bucket is nearly exhausted — same pattern as
+--- discord.lua. Mastodon REST limits are generous; this is observability,
+--- not gating (the 429 path gates).
+local function update_rate_limits(platform_id, resp)
+    local h = resp.headers
+    if not h then return end
+    local remaining = tonumber(h["x-ratelimit-remaining"] or "")
+    local limit = tonumber(h["x-ratelimit-limit"] or "")
+    if remaining and limit then
+        config.set(cfg_key(platform_id, "rate_limit_remaining"), tostring(remaining))
+        config.set(cfg_key(platform_id, "rate_limit_limit"), tostring(limit))
+        if remaining <= 2 then
+            log.warn("[mastodon] rate limit bucket nearly exhausted for "
+                .. platform_id .. ": " .. tostring(remaining) .. "/" .. tostring(limit)
+                .. " remaining")
+        end
+    end
+end
+
 -- ---------------------------------------------------------------------------
 -- HTTP primitives
 -- ---------------------------------------------------------------------------
@@ -198,6 +219,8 @@ local function auth_get(platform_id, endpoint, query)
             ["Accept"] = "application/json"
         }
     })
+
+    update_rate_limits(platform_id, resp)
 
     if resp.status == 429 or resp.status == 503 then
         local consecutive = tonumber(config.get(cfg_key(platform_id, "consecutive_errors")) or "0") + 1
@@ -233,6 +256,8 @@ local function auth_post(platform_id, endpoint, body_table, idem_suffix)
         },
         body = json.encode(body_table)
     })
+
+    update_rate_limits(platform_id, resp)
 
     if resp.status == 429 or resp.status == 503 then
         local consecutive = tonumber(config.get(cfg_key(platform_id, "consecutive_errors")) or "0") + 1
@@ -384,6 +409,22 @@ local function get_char_limit(platform_id)
     return 500
 end
 
+--- Convert Mastodon's HTML status content to plain text for agent context.
+--- Mastodon serves content as HTML (<p>, <br>, mention spans); the #133
+--- attribution spine wants the agent reading text, not markup. Raw HTML is
+--- preserved alongside in content_html.
+local function html_to_text(html)
+    if not html or html == "" then return "" end
+    local s = html
+    s = s:gsub("<br%s*/?>", "\n")
+    s = s:gsub("</p>", "\n\n")
+    s = s:gsub("<[^>]+>", "")  -- strip remaining tags; mention spans keep inner text
+    s = s:gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
+    s = s:gsub("&quot;", '"'):gsub("&#39;", "'"):gsub("&nbsp;", " ")
+    s = s:gsub("\n\n\n+", "\n\n")
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
 -- ---------------------------------------------------------------------------
 -- Actions
 -- ---------------------------------------------------------------------------
@@ -396,10 +437,22 @@ end
 local function do_poll(args)
     local platform_id = args.platform_id
 
-    local resp = auth_get(platform_id, "/api/v1/notifications", {
+    -- Watermark read once: drives BOTH the server-side cursor and the
+    -- client-side dedupe (belt-and-suspenders — never trust one dedupe
+    -- mechanism to be the only one).
+    local watermark = tonumber(config.get(cfg_key(platform_id, "last_notif_id")) or "0") or 0
+
+    -- Server-side cursor: min_id asks for items strictly newer than the
+    -- watermark (protocol-native; Mastodon honors it on notifications).
+    local query = {
         ["types[]"] = "mention",
         limit = "40"
-    })
+    }
+    if watermark > 0 then
+        query.min_id = tostring(watermark)
+    end
+
+    local resp = auth_get(platform_id, "/api/v1/notifications", query)
 
     if resp.status ~= 200 then
         return {
@@ -417,7 +470,6 @@ local function do_poll(args)
         return { success = true, output = "no notifications (empty or non-array body)", mentions = {} }
     end
 
-    local watermark = tonumber(config.get(cfg_key(platform_id, "last_notif_id")) or "0") or 0
     local max_id = watermark
     local mentions = {}
 
@@ -442,7 +494,9 @@ local function do_poll(args)
                     author_display = account.display_name or "",
                     author_url = account.url or "",
                     created_at = status.created_at or n.created_at or "",
-                    text = status.content or "",
+                    -- Plain text for agent context; raw HTML preserved alongside
+                    text = html_to_text(status.content),
+                    content_html = status.content or "",
                     status_id = status.id or "",
                     status_url = status.url or "",
                     -- Reply targets (in_reply_to_id may be null for top-level mentions)
@@ -608,7 +662,8 @@ local function do_get_status(args)
             author_display = account.display_name or "",
             author_url = account.url or "",
             created_at = data.created_at or "",
-            text = data.content or "",
+            text = html_to_text(data.content),
+            content_html = data.content or "",
             url = data.url or "",
             visibility = data.visibility or "",
             in_reply_to_id = data.in_reply_to_id or ""
@@ -641,7 +696,8 @@ local function do_get_context(args)
         local disp = s.account and s.account.display_name or ""
         return {
             id = s.id, author = acct, author_display = disp,
-            created_at = s.created_at or "", text = s.content or "", url = s.url or ""
+            created_at = s.created_at or "", text = html_to_text(s.content),
+            content_html = s.content or "", url = s.url or ""
         }
     end
 
