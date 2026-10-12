@@ -596,7 +596,7 @@ std::string AgentArchiveWriter::Write(const std::string& agentId,
                     (std::string)"SELECT t.id, t.session_id, t.turn_id, t.role, t.content, t.unix_ms, "
                     "t.is_summary, t.compacted_from, t.thinking_content, t.tool_calls, "
                     "t.tool_call_id, t.tool_name, t.intake_processed, "
-                    "t.intake_processed_at_unix_ms, t.token_count, t.is_compacted, t.metadata "
+                    "t.intake_processed_at_unix_ms, t.token_count, t.is_compacted, t.metadata, t.author "
                     "FROM session_turns t "
                     "INNER JOIN sessions s ON t.session_id = s.id "
                     "WHERE s.agent_id = ? AND "
@@ -607,7 +607,7 @@ std::string AgentArchiveWriter::Write(const std::string& agentId,
                      "is_summary", "compacted_from", "thinking_content", "tool_calls",
                      "tool_call_id", "tool_name", "intake_processed",
                      "intake_processed_at_unix_ms", "token_count", "is_compacted",
-                     "metadata"})});
+                     "metadata", "author"})});
         } else {
             // Export all sessions + turns
             files.push_back({"sessions/sessions.jsonl",
@@ -620,7 +620,7 @@ std::string AgentArchiveWriter::Write(const std::string& agentId,
                     "SELECT t.id, t.session_id, t.turn_id, t.role, t.content, t.unix_ms, "
                     "t.is_summary, t.compacted_from, t.thinking_content, t.tool_calls, "
                     "t.tool_call_id, t.tool_name, t.intake_processed, "
-                    "t.intake_processed_at_unix_ms, t.token_count, t.is_compacted, t.metadata "
+                    "t.intake_processed_at_unix_ms, t.token_count, t.is_compacted, t.metadata, t.author "
                     "FROM session_turns t "
                     "INNER JOIN sessions s ON t.session_id = s.id "
                     "WHERE s.agent_id = ?", agentId,
@@ -628,7 +628,7 @@ std::string AgentArchiveWriter::Write(const std::string& agentId,
                      "is_summary", "compacted_from", "thinking_content", "tool_calls",
                      "tool_call_id", "tool_name", "intake_processed",
                      "intake_processed_at_unix_ms", "token_count", "is_compacted",
-                     "metadata"})});
+                     "metadata", "author"})});
         }
     }
 

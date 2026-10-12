@@ -27,8 +27,8 @@ static void WriteTurns(IDataStore& store, SessionId sessionId, const std::vector
             "INSERT INTO session_turns "
             "(session_id, turn_id, role, content, unix_ms, is_summary, compacted_from, "
             " thinking_content, tool_calls, tool_call_id, tool_name, "
-            " intake_processed, intake_processed_at_unix_ms, token_count, is_compacted, metadata) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+            " intake_processed, intake_processed_at_unix_ms, token_count, is_compacted, metadata, author) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         if (!stmt) continue;
         stmt->BindInt64(1, sessionId);
         stmt->BindInt64(2, t.turn_id);
@@ -68,6 +68,7 @@ static void WriteTurns(IDataStore& store, SessionId sessionId, const std::vector
         stmt->BindInt64(14, static_cast<int64_t>(t.token_count));
         stmt->BindInt(15, t.is_compacted ? 1 : 0);
         stmt->BindText(16, t.metadata);
+        stmt->BindText(17, t.author);
 
         stmt->ExecDML();
     }
@@ -129,6 +130,7 @@ static SessionTurn HydrateTurnRow(const StmtPtr& stmt) {
         : static_cast<std::size_t>(stmt->ColumnInt64(12));
     turn.is_compacted = !stmt->IsColumnNull(13) && stmt->ColumnInt64(13) != 0;
     turn.metadata = stmt->IsColumnNull(14) ? "{}" : stmt->ColumnText(14);
+    turn.author = stmt->IsColumnNull(15) ? "" : stmt->ColumnText(15);
 
     return turn;
 }
@@ -137,7 +139,7 @@ static void LoadTurns(IDataStore& store, Session& session) {
     auto stmt = store.Prepare(
         "SELECT turn_id, role, content, unix_ms, is_summary, compacted_from, "
         "       thinking_content, tool_calls, tool_call_id, tool_name, "
-        "       intake_processed, intake_processed_at_unix_ms, token_count, is_compacted, metadata "
+        "       intake_processed, intake_processed_at_unix_ms, token_count, is_compacted, metadata, author "
         "FROM session_turns WHERE session_id=? ORDER BY turn_id ASC");
     if (!stmt) return;
     stmt->BindInt64(1, session.Id());
@@ -336,6 +338,12 @@ void SqliteSessionStore::EnsureSchema() {
     // Used for message dedup — query existing metadata to skip already-processed messages.
     if (!HasColumn("session_turns", "metadata"))
         m_store->Exec("ALTER TABLE session_turns ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'");
+    // Migration v7 (#133): add author column to session_turns —
+    // first-class attribution for user turns. Empty for agent-native turns.
+    // (Archive author handled after the archive CREATE below — fresh DBs get
+    // it there; the ALTER covers archives created before the column existed.)
+    if (!HasColumn("session_turns", "author"))
+        m_store->Exec("ALTER TABLE session_turns ADD COLUMN author TEXT NOT NULL DEFAULT ''");
     // Migration v5: fix timestamp columns on PostgreSQL (INTEGER → BIGINT).
     // SQLite stores INTEGER as 64-bit natively, so no migration needed there.
     if (m_store->Dialect() == DataStoreDialect::PostgreSQL) {
@@ -372,12 +380,17 @@ void SqliteSessionStore::EnsureSchema() {
             intake_processed_at_unix_ms INTEGER NOT NULL DEFAULT 0,
             token_count INTEGER NOT NULL DEFAULT 0,
             is_compacted INTEGER NOT NULL DEFAULT 0,
-            metadata TEXT NOT NULL DEFAULT '{}'
+            metadata TEXT NOT NULL DEFAULT '{}',
+            author TEXT NOT NULL DEFAULT ''
         )
     )");
     m_store->Exec(
         "CREATE INDEX IF NOT EXISTS idx_turns_archive_session "
         "ON session_turns_archive(session_id)");
+    // #133: author column for archives created before it existed (fresh DBs
+    // already have it via the CREATE above — HasColumn makes this a no-op).
+    if (!HasColumn("session_turns_archive", "author"))
+        m_store->Exec("ALTER TABLE session_turns_archive ADD COLUMN author TEXT NOT NULL DEFAULT ''");
 }
 
 // ============================================================================
@@ -523,8 +536,8 @@ void SqliteSessionStore::PersistSession(const Session& s) {
             "INSERT INTO session_turns "
             "(session_id, turn_id, role, content, unix_ms, is_summary, compacted_from, "
             " thinking_content, tool_calls, tool_call_id, tool_name, "
-            " intake_processed, intake_processed_at_unix_ms, token_count, is_compacted, metadata) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+            " intake_processed, intake_processed_at_unix_ms, token_count, is_compacted, metadata, author) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         if (!turnStmt) continue;
 
         turnStmt->BindInt64(1, s.Id());
@@ -563,6 +576,7 @@ void SqliteSessionStore::PersistSession(const Session& s) {
         turnStmt->BindInt64(14, static_cast<int64_t>(t.token_count));
         turnStmt->BindInt(15, t.is_compacted ? 1 : 0);
         turnStmt->BindText(16, t.metadata);
+        turnStmt->BindText(17, t.author);
 
         turnStmt->ExecDML();
     }
@@ -660,7 +674,7 @@ ISessionStore::SessionTurnPage SqliteSessionStore::GetSessionTurnsPage(
     auto stmt = m_store->Prepare(
         "SELECT turn_id, role, content, unix_ms, is_summary, compacted_from, "
         "       thinking_content, tool_calls, tool_call_id, tool_name, "
-        "       intake_processed, intake_processed_at_unix_ms, token_count, is_compacted, metadata "
+        "       intake_processed, intake_processed_at_unix_ms, token_count, is_compacted, metadata, author "
         "FROM session_turns WHERE session_id=? ORDER BY turn_id DESC LIMIT ? OFFSET ?");
     if (!stmt) {
         return out;
