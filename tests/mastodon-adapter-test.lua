@@ -1,6 +1,10 @@
 -- ============================================================================
 -- mastodon-adapter-test.lua — fixture test harness for scripts/mastodon.lua
 -- Issue #135. Run with: lua mastodon-adapter-test.lua
+-- Issue #145 — tier 1 discovery: search (v2 + resolve + ES caveat),
+-- account_statuses (numeric-id gate, Link-header pagination, no phantom
+-- cursors), public_timeline (typed 422: timeline_unavailable + fallback
+-- advice; generic 422: unsupported_query), query-value URL encoding.
 --
 -- Mocks the kernel contract (animus.http_get/post, config, json, log) the
 -- same way LuaState provides them, loads the REAL adapter, and drives:
@@ -258,7 +262,7 @@ check("adapter registered", registration ~= nil)
 check("id = mastodon", registration.id == "mastodon")
 check("name present", registration.name == "Mastodon")
 check("capabilities read+write", #registration.capabilities == 2)
-check("actions declared", #registration.actions == 6,
+check("actions declared", #registration.actions == 9,
     table.concat(registration.actions, ","))
 
 local function call(action, args)
@@ -489,6 +493,214 @@ config_store["channels." .. PID .. ".access_token"] = ""
 r = call("verify")
 check("missing token fails loud", r.success == false and r.error:find("access_token") ~= nil, r.error)
 reset_config()
+
+-- ---------------------------------------------------------------------------
+print("== #145: search (v2) ==")
+mock_clear()
+reset_config()
+local search_body = json.encode({
+    accounts = {
+        { id = "1080", acct = "gargron@mastodon.social", display_name = "Eugen",
+          url = "https://mastodon.social/@gargron", followers_count = 1337,
+          note = "<p>Founder <a href=\"#\">of Mastodon</a></p>" }
+    },
+    statuses = {
+        { id = "9005", created_at = "2026-10-11T10:00:00.000Z",
+          content = "<p>hello from search</p>",
+          url = "https://mastodon.social/@peer/9005", visibility = "unlisted",
+          in_reply_to_id = "9004",
+          account = { acct = "peer@inst.example", display_name = "Peer",
+            url = "https://inst.example/@peer" } }
+    },
+    hashtags = { { name = "generativeart", url = "https://mastodon.social/tags/generativeart" } }
+})
+mock_add({
+    matcher = function(url) return url:find("/api/v2/search", 1, true) ~= nil end,
+    respond = function() return { status = 200, headers = {}, body = search_body } end
+})
+r = call("search", { q = "generative art", resolve = true })
+check("search success", r.success == true, r.error)
+check("hit /api/v2/search", all_urls[#all_urls]:find("/api/v2/search", 1, true) ~= nil,
+    all_urls[#all_urls])
+check("q value URL-encoded (space → %20)",
+    all_urls[#all_urls]:find("q=generative%20art", 1, true) ~= nil, all_urls[#all_urls])
+check("resolve=true passed through",
+    all_urls[#all_urls]:find("resolve=true", 1, true) ~= nil, all_urls[#all_urls])
+check("one account shaped", r.accounts[1].id == "1080"
+    and r.accounts[1].acct == "gargron@mastodon.social",
+    tostring(r.accounts[1] and r.accounts[1].acct))
+check("account note html→text", r.accounts[1].note_text == "Founder of Mastodon",
+    tostring(r.accounts[1].note_text))
+check("status attribution spine (author/text/status_url)",
+    r.statuses[1].author == "peer@inst.example"
+    and r.statuses[1].text == "hello from search"
+    and r.statuses[1].status_url == "https://mastodon.social/@peer/9005",
+    tostring(r.statuses[1].text))
+check("in_reply_to_id + visibility surfaced",
+    r.statuses[1].in_reply_to_id == "9004" and r.statuses[1].visibility == "unlisted")
+check("hashtag shaped", r.hashtags[1].name == "generativeart",
+    tostring(r.hashtags[1].name))
+check("no ES caveat when statuses present", r.statuses_note == nil,
+    tostring(r.statuses_note))
+
+-- ES caveat: empty statuses → honest capability note, not a confident empty
+mock_add({
+    matcher = function(url) return url:find("/api/v2/search", 1, true) ~= nil end,
+    respond = function()
+        return { status = 200, headers = {},
+            body = json.encode({ accounts = {}, statuses = {}, hashtags = {} }) }
+    end
+})
+r = call("search", { q = "obscure phrase nobody posted" })
+check("search succeeds on empty", r.success == true, r.error)
+check("ES caveat on empty statuses",
+    r.statuses_note ~= nil and r.statuses_note:find("ElasticSearch", 1, true) ~= nil,
+    tostring(r.statuses_note))
+check("no resolve hint for plain-text q",
+    r.statuses_note:find("resolve=true", 1, true) == nil, tostring(r.statuses_note))
+
+-- Handle-shaped q without resolve → hint appended
+r = call("search", { q = "@someone@remote.example" })
+check("handle-like q gets resolve hint",
+    r.statuses_note ~= nil and r.statuses_note:find("resolve=true", 1, true) ~= nil,
+    tostring(r.statuses_note))
+
+-- Validation
+r = call("search", { q = "x", type = "banana" })
+check("invalid type rejected loud",
+    r.success == false and r.error:find("invalid type") ~= nil, r.error)
+r = call("search", {})
+check("missing q rejected",
+    r.success == false and r.error:find("q is required") ~= nil, r.error)
+r = call("search", { q = "art", type = "accounts", offset = 5 })
+check("type + offset passed through",
+    all_urls[#all_urls]:find("type=accounts", 1, true) ~= nil
+    and all_urls[#all_urls]:find("offset=5", 1, true) ~= nil, all_urls[#all_urls])
+
+-- ---------------------------------------------------------------------------
+print("== #145: account_statuses ==")
+mock_clear()
+reset_config()
+local acct_statuses_body = json.encode({
+    { id = "8100", created_at = "2026-10-12T09:00:00.000Z",
+      content = "<p>latest toot</p>", url = "https://mastodon.social/@peer/8100",
+      visibility = "public",
+      account = { acct = "peer@inst.example", display_name = "Peer",
+        url = "https://inst.example/@peer" } },
+    { id = "8099", created_at = "2026-10-11T09:00:00.000Z",
+      content = "<p>older toot</p>", url = "https://mastodon.social/@peer/8099",
+      visibility = "public",
+      account = { acct = "peer@inst.example", display_name = "Peer",
+        url = "https://inst.example/@peer" } }
+})
+mock_add({
+    matcher = function(url) return url:find("/api/v1/accounts/123/statuses", 1, true) ~= nil end,
+    respond = function()
+        return { status = 200,
+            headers = {
+                ["link"] = '<https://mastodon.social/api/v1/accounts/123/statuses?limit=20&max_id=8098>; rel="next", <https://mastodon.social/api/v1/accounts/123/statuses?limit=20&since_id=8101>; rel="prev"'
+            },
+            body = acct_statuses_body }
+    end
+})
+r = call("account_statuses", { account_id = "123" })
+check("account_statuses success", r.success == true, r.error)
+check("hit per-account endpoint",
+    all_urls[#all_urls]:find("/api/v1/accounts/123/statuses", 1, true) ~= nil,
+    all_urls[#all_urls])
+check("2 statuses shaped", r.count == 2 and r.statuses[1].text == "latest toot",
+    tostring(r.count))
+check("spine fields on account statuses",
+    r.statuses[2].author == "peer@inst.example"
+    and r.statuses[2].status_url == "https://mastodon.social/@peer/8099")
+check("next_max_id parsed from Link header", r.next_max_id == "8098",
+    tostring(r.next_max_id))
+check("has_more true with next page", r.has_more == true)
+
+-- Cursor passthrough + filter flags
+r = call("account_statuses", { account_id = "123", max_id = "8098", exclude_replies = true })
+check("cursor + exclude_replies passed through",
+    all_urls[#all_urls]:find("max_id=8098", 1, true) ~= nil
+    and all_urls[#all_urls]:find("exclude_replies=true", 1, true) ~= nil,
+    all_urls[#all_urls])
+
+-- Last page: prev-only Link header → no phantom next cursor
+mock_add({
+    matcher = function(url) return url:find("/api/v1/accounts/123/statuses", 1, true) ~= nil end,
+    respond = function()
+        return { status = 200,
+            headers = {
+                ["link"] = '<https://mastodon.social/api/v1/accounts/123/statuses?limit=20&since_id=8090>; rel="prev"'
+            },
+            body = acct_statuses_body }
+    end
+})
+r = call("account_statuses", { account_id = "123" })
+check("prev-only Link → has_more false (no phantom cursor)",
+    r.has_more == false and r.next_max_id == nil,
+    tostring(r.next_max_id))
+
+-- Handle passed instead of numeric id → guided error, no HTTP call
+r = call("account_statuses", { account_id = "peer@inst.example" })
+check("handle rejected with resolve guidance",
+    r.success == false and r.error:find("search", 1, true) ~= nil
+    and r.error:find("resolve", 1, true) ~= nil, r.error)
+
+-- 422 → typed classification (generic branch)
+mock_add({
+    matcher = function(url) return url:find("/api/v1/accounts/", 1, true) ~= nil end,
+    respond = function()
+        return { status = 422, headers = {}, body = '{"error":"Validation failed"}' }
+    end
+})
+r = call("account_statuses", { account_id = "123" })
+check("422 typed as unsupported_query",
+    r.success == false and r.error_type == "unsupported_query"
+    and r.http_status == 422, tostring(r.error_type))
+check("422 error is classified advice, not body echo",
+    r.error:find("unsupported on this node", 1, true) ~= nil
+    and r.error:find("Validation failed", 1, true) == nil, r.error)
+
+-- ---------------------------------------------------------------------------
+print("== #145: public_timeline + typed 422 ==")
+mock_clear()
+reset_config()
+mock_add({
+    matcher = function(url) return url:find("/api/v1/timelines/public", 1, true) ~= nil end,
+    respond = function()
+        return { status = 200, headers = {},
+            body = json.encode({
+                { id = "7001", created_at = "2026-10-12T10:00:00.000Z",
+                  content = "<p>federated post</p>", url = "https://other.example/@x/7001",
+                  visibility = "public",
+                  account = { acct = "x@other.example", display_name = "X",
+                    url = "https://other.example/@x" } }
+            }) }
+    end
+})
+r = call("public_timeline", { ["local"] = true })
+check("public_timeline success", r.success == true, r.error)
+check("local=true passed",
+    all_urls[#all_urls]:find("local=true", 1, true) ~= nil, all_urls[#all_urls])
+check("timeline statuses shaped with spine",
+    r.statuses[1].author == "x@other.example" and r.statuses[1].text == "federated post",
+    tostring(r.statuses[1].text))
+check("no Link header → has_more false", r.has_more == false)
+
+-- THE live case from Buffett's node: timeline surface rejected with 422 →
+-- typed error + guided fallback, never a generic failure
+mock_add({
+    matcher = function(url) return url:find("/api/v1/timelines/public", 1, true) ~= nil end,
+    respond = function()
+        return { status = 422, headers = {}, body = '{"error":"Validation failed"}' }
+    end
+})
+r = call("public_timeline", {})
+check("timeline 422 typed as timeline_unavailable",
+    r.success == false and r.error_type == "timeline_unavailable"
+    and r.http_status == 422, tostring(r.error_type))
+check("timeline 422 advice points at account_statuses fallback",
+    r.error:find("account_statuses", 1, true) ~= nil, r.error)
 
 -- ---------------------------------------------------------------------------
 print("== handler contract ==")
