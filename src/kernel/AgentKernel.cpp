@@ -2,7 +2,6 @@
 #include "animus_kernel/SyncStore.h"
 #include "animus_kernel/PeerSyncService.h"
 #include "animus_kernel/AgentKernel.h"
-#include "animus_kernel/lua/SharedScriptHealer.h"
 #include "animus_kernel/Log.h"
 
 #include <cstdlib>
@@ -1507,27 +1506,13 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             }
 
             if ((interval > 0 || aggregationWindowMs > 0) && m_messageQueue) {
-                // Sender label for queued aggregates (#150): derived from the
-                // dispatch metadata the adapter already supplies — same
-                // conventions as the arrival parse in ExecuteChannelDispatch
-                // (top-level author_handle/author, then origin.user). Empty
-                // metadata → empty label → bare concatenation, unchanged for
-                // adapters that don't (yet) emit origin.
-                std::string sender;
-                {
-                    Json::Value qmeta;
-                    Json::CharReaderBuilder qrb;
-                    std::unique_ptr<Json::CharReader> qreader(qrb.newCharReader());
-                    std::string qerrs;
-                    if (qreader->parse(metadata.data(), metadata.data() + metadata.size(),
-                                       &qmeta, &qerrs) && qmeta.isObject()) {
-                        sender = qmeta.get("author_handle",
-                                           qmeta.get("author", "").asString()).asString();
-                        if (sender.empty() && qmeta.isMember("origin")
-                            && qmeta["origin"].isObject())
-                            sender = qmeta["origin"].get("user", "").asString();
-                    }
-                }
+                // Determine sender label — empty for DM channels, populated for community
+                // Heuristic: if sessionType is "chat" and it's a DM channel (IRC nick,
+                // Telegram private, Discord DM), sender is empty. For group channels,
+                // we'd need the sender name from the channel adapter.
+                // For now, use empty sender — channel adapters that want sender labels
+                // can be updated to pass the sender name through the dispatch callback.
+                std::string sender;  // TODO: channel adapters should provide this
 
                 // Check if a chain is currently active on this session
                 std::string queueKey = "channel:" + sessionKey;
@@ -1773,7 +1758,6 @@ void AgentKernel::ExecuteChannelDispatch(
         m_messageQueue->NotifyChainStart("channel:" + sessionKey);
     }
 
-    std::string dispatchAuthor;  // #133: author handle for this trigger, survives the guard block
     // Record the trusted arrival (#14) BEFORE the chain runs — single write
     // point covering both direct dispatch and queue-flush (both funnel here).
     // The provider (#15) renders pending arrivals as the channel-context card.
@@ -1833,7 +1817,6 @@ void AgentKernel::ExecuteChannelDispatch(
             arrival.message_type = (replyTarget.type == ChannelManager::ReplyTarget::Chat)
                                        ? "chat" : "wall";
         }
-        dispatchAuthor = arrival.author_handle;  // #133: capture final value (post origin-fallback)
         m_channelContextStore->AddArrival(arrival);
         m_channelContextStore->Prune(arrival.session_key, arrival.agent_id);
     }
@@ -1856,7 +1839,7 @@ void AgentKernel::ExecuteChannelDispatch(
 
     m_jobs.EnqueueInLane(
         ::animus::jobs::JobLane::Cognition,
-        [this, session, sessionKey, message, identity, registryKey, providerId, model, contextWindow, replyTarget, interval, metadata, autoDeliver, dispatchAuthor]() {
+        [this, session, sessionKey, message, identity, registryKey, providerId, model, contextWindow, replyTarget, interval, metadata, autoDeliver]() {
             // Per-message callback: send each assistant message to the channel
             // immediately rather than only the final response.
             // Only for Chat (DM) targets — Wall (post reply/mention) targets
@@ -1882,8 +1865,7 @@ void AgentKernel::ExecuteChannelDispatch(
                 contextWindow,
                 nullptr,      // thinkingCallback
                 nullptr,      // toolCallCallback
-                assistantCb, // assistantMessageCallback
-                dispatchAuthor); // author (#133)
+                assistantCb); // assistantMessageCallback
 
             if (m_sessionManager) {
                 m_sessionManager->FlushSession(session->Id());
@@ -2295,13 +2277,6 @@ void AgentKernel::LoadLuaScripts() {
 
     // Phase 2: Load filesystem scripts
     if (!m_config.lua_script_dir.empty()) {
-        // #143: volume-heal-on-boot — reconcile image-baked _shared defaults
-        // into the persisted volume BEFORE any discovery/loading happens.
-        // Empty staging dir (dev/bare boot) disables the heal entirely.
-        if (!m_config.lua_staging_dir.empty()) {
-            ReconcileSharedScripts(m_config.lua_staging_dir,
-                                   m_config.lua_script_dir);
-        }
         if (!m_fsScriptLoader) {
             m_fsScriptLoader = std::make_unique<FilesystemScriptLoader>(m_config.lua_script_dir);
         }

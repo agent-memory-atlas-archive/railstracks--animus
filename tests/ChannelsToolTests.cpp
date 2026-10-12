@@ -59,9 +59,7 @@ void TestChannelsToolDefinition() {
     ChannelsTool social;
     auto def = social.GetDefinition();
 
-    // Renamed during the channel-tools consolidation: the composite registers
-    // as "channels" (it fronts social + messaging adapters alike).
-    Assert(def.name == "channels", "tool name should be 'channels', got: " + def.name);
+    Assert(def.name == "social", "tool name should be 'social', got: " + def.name);
     Assert(!def.description.empty(), "description should not be empty");
     Assert(!def.parameters.empty(), "should have parameters");
 
@@ -142,13 +140,6 @@ void TestChannelsToolInstanceRouting() {
         plugin.id = id;
         plugin.name = id;
         plugin.capabilities = {"read", "write"};
-        // Action schemas are required: CompositeTool::Execute authorizes each
-        // action against the plugin's schema — schema-less plugins reject
-        // everything ("does not support action 'post'", empty available list).
-        plugin.actionSchemas["post"] = {
-            {"content", "string", "Post content", true},
-            {"platform_id", "string", "Platform instance", false},
-        };
         plugin.handler = [&lastHandlerId, id](const ToolCall& call) -> ToolResult {
             lastHandlerId = id;
             ToolResult r;
@@ -168,8 +159,7 @@ void TestChannelsToolInstanceRouting() {
     call1.arguments = MakeToolCall("post", "bluesky:personal", "Hello world");
     auto result1 = social.Execute(call1);
 
-    Assert(result1.success,
-           "post via bluesky:personal should succeed, error: " + result1.error);
+    Assert(result1.success, "post via bluesky:personal should succeed");
     Assert(lastHandlerId == "bluesky", "should route to bluesky adapter, got: " + lastHandlerId);
 
     // Test: different instance on same adapter
@@ -178,8 +168,7 @@ void TestChannelsToolInstanceRouting() {
     call2.arguments = MakeToolCall("post", "bluesky:work", "Work post");
     auto result2 = social.Execute(call2);
 
-    Assert(result2.success,
-           "post via bluesky:work should succeed, error: " + result2.error);
+    Assert(result2.success, "post via bluesky:work should succeed");
     Assert(lastHandlerId == "bluesky", "should route to bluesky adapter");
 
     // Test: different adapter entirely
@@ -188,8 +177,7 @@ void TestChannelsToolInstanceRouting() {
     call3.arguments = MakeToolCall("post", "mastodon:default", "Toot");
     auto result3 = social.Execute(call3);
 
-    Assert(result3.success,
-           "post via mastodon:default should succeed, error: " + result3.error);
+    Assert(result3.success, "post via mastodon:default should succeed");
     Assert(lastHandlerId == "mastodon", "should route to mastodon adapter, got: " + lastHandlerId);
 
     // Test: bare adapter name (no colon) should still work
@@ -198,8 +186,7 @@ void TestChannelsToolInstanceRouting() {
     call4.arguments = MakeToolCall("post", "bluesky", "Bare name");
     auto result4 = social.Execute(call4);
 
-    Assert(result4.success,
-           "post via bare 'bluesky' should succeed, error: " + result4.error);
+    Assert(result4.success, "post via bare 'bluesky' should succeed");
     Assert(lastHandlerId == "bluesky", "should route to bluesky adapter");
 
     std::cerr << " done\n";
@@ -303,11 +290,8 @@ return "registered"
     Assert(result.find("registered") != std::string::npos,
            "registration should succeed, got: " + result);
 
-    // Design contract (LuaRegisterSocial): social plugins don't register
-    // standalone tools — the handler is owned by LuaPluginInfo and routes via
-    // the composite. Registry suppression is deliberate; assert it holds.
-    Assert(!tools.Has("social_bluesky"),
-           "social_bluesky must NOT appear as a standalone tool (composite-only design)");
+    // Check that social_bluesky was registered in the tool registry
+    Assert(tools.Has("social_bluesky"), "social_bluesky should be in tool registry");
 
     // Wire the Lua plugin into ChannelsTool composite (simulating AgentKernel Phase 2)
     for (const auto& plugin : lua.GetRegisteredPlugins()) {
@@ -319,39 +303,19 @@ return "registered"
         cp.capabilities = plugin.capabilities;
         cp.actionSchemas = plugin.actionSchemas;
 
-        // Route through the LuaToolHandler owned by LuaPluginInfo — NOT a
-        // ToolRegistry lookup. Mirrors AgentKernel Phase 2 wiring exactly
-        // (handler never enters the registry; args get adapter_id injected).
-        const std::string adapterId = plugin.id;
-        IToolHandler* handlerPtr = plugin.handler.get();
+        const std::string handlerToolName = "social_" + plugin.id;
+        ToolRegistry& reg = tools;
 
-        cp.handler = [adapterId, handlerPtr](const ToolCall& call) -> ToolResult {
-            if (!handlerPtr) {
+        cp.handler = [&reg, handlerToolName](const ToolCall& call) -> ToolResult {
+            auto* handler = reg.Find(handlerToolName);
+            if (!handler) {
                 ToolResult err;
                 err.call_id = call.id;
                 err.success = false;
-                err.error = "social adapter '" + adapterId + "' handler is null";
+                err.error = "adapter not found: " + handlerToolName;
                 return err;
             }
-
-            // Parse args to inject adapter_id (bare type) so the Lua handler
-            // knows which adapter type is handling this, alongside platform_id
-            // (instance) — same as the kernel's Phase 2 lambda.
-            Json::Value args;
-            Json::CharReaderBuilder builder;
-            std::istringstream stream(call.arguments);
-            std::string errors;
-            Json::parseFromStream(builder, stream, &args, &errors);
-
-            args["adapter_id"] = adapterId;
-            Json::StreamWriterBuilder wb;
-            wb.settings_["indentation"] = "";
-            std::string newArgs = Json::writeString(wb, args);
-
-            ToolCall routedCall = call;
-            routedCall.arguments = newArgs;
-
-            return handlerPtr->Execute(routedCall);
+            return handler->Execute(call);
         };
 
         socialPtr->RegisterPlugin(cp);

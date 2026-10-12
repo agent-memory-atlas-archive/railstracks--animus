@@ -1281,11 +1281,6 @@ void ChannelManager::WhatsAppGatewayLoopInner(PollerState* state) {
                 meta["message_type"] = "chat";
                 meta["delivery"] = "tool";
                 Json::Value origin;
-                // #150: `user` feeds author_handle → speaker headers at assembly
-                // (#133). JID fallback keeps the handle non-empty when the
-                // profile name is missing.
-                origin["user"] = decrypted.senderName.empty()
-                                     ? baseSender : decrypted.senderName;
                 if (!decrypted.senderName.empty())
                     origin["user_display"] = decrypted.senderName;
                 origin["user_id"] = baseSender; // stable per-sender jid

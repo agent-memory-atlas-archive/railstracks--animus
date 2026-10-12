@@ -69,10 +69,8 @@ export const channels = {
         replyToUsers: 'Reply to Users (allowlist)'
       },
       mastodon: {
-        accessToken: '访问令牌',
-        accessTokenHint: '留空以保留当前令牌',
-        instanceUrl: '实例网址',
-        pollInterval: '轮询间隔（秒）'
+        handle: '手柄',
+        instance: '实例网址'
       },
       email: {
         apiKey: 'AgentMail API 密钥',

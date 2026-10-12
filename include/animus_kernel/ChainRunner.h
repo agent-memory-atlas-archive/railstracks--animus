@@ -137,8 +137,7 @@ public:
         ChainAssistantMessageCallback assistantMessageCallback = nullptr,
         const std::string& reasoningEffortOverride = "",
         bool reasoningEnabledOverride = false,
-        bool hasReasoningEnabledOverride = false,
-        const std::string& author = "");
+        bool hasReasoningEnabledOverride = false);
 
     ChainResult ExecuteStreamingOnSession(
         SessionAccess& session,

@@ -18,7 +18,6 @@
 #include "animus_kernel/SqliteSessionStore.h"
 #include "animus_kernel/InMemorySessionStore.h"
 #include "animus_kernel/SessionRoutingRule.h"
-#include "animus_kernel/PromptAssembler.h"
 #include "animus_kernel/SessionManager.h"
 
 using namespace animus::kernel;
@@ -504,133 +503,6 @@ int TestSessionsToolSearchRecency() {
     return 0;
 }
 
-int TestAuthorRoundTrip() {
-    namespace fs = std::filesystem;
-    const std::string dbPath = "/tmp/animus_session_tests_133.db";
-    std::error_code ec;
-    fs::remove(dbPath, ec);
-
-    {
-        SqliteDataStore dataStore(dbPath);
-        SessionManager manager(
-            std::make_unique<SqliteSessionStore>(&dataStore),
-            std::make_unique<DefaultSessionRouter>());
-        auto session = manager.GetOrCreate(SessionKey{"test", "author_roundtrip", ""});
-        session->SetAgentId("tester");
-        SessionTurn t1;
-        t1.role = "user";
-        t1.content = "hello from melvin";
-        t1.unix_ms = 1760000000000ULL;
-        t1.author = "melvin";
-        session->AddTurn(std::move(t1));
-        SessionTurn t2;
-        t2.role = "assistant";
-        t2.content = "ack";
-        t2.unix_ms = 1760000060000ULL;
-        session->AddTurn(std::move(t2));
-        SessionTurn t3;
-        t3.role = "user";
-        t3.content = "sofia here";
-        t3.unix_ms = 1760000120000ULL;
-        t3.author = "sofia";
-        session->AddTurn(std::move(t3));
-        manager.GetStore().FlushSession(session->Id());
-    }
-    {
-        SqliteDataStore dataStore(dbPath);
-        SessionManager manager(
-            std::make_unique<SqliteSessionStore>(&dataStore),
-            std::make_unique<DefaultSessionRouter>());
-        auto session = manager.GetOrCreate(SessionKey{"test", "author_roundtrip", ""});
-        if (!session) return Fail(1, "#133 round-trip: session not found on reload");
-        const auto& turns = session->Turns();
-        if (turns.size() != 3) return Fail(2, "#133 round-trip: expected 3 turns");
-        if (turns[0].author != "melvin") return Fail(3, "#133 round-trip: melvin author lost");
-        if (!turns[1].author.empty()) return Fail(4, "#133 round-trip: assistant turn gained an author");
-        if (turns[2].author != "sofia") return Fail(5, "#133 round-trip: sofia author lost");
-    }
-    std::cout << "[ok] #133 author round-trip survives store reload\n";
-    return 0;
-}
-
-int TestAttributionHeaderRendering() {
-    const std::uint64_t T0 = 1760000000000ULL;
-    auto mkturn = [](const std::string& role, const std::string& content,
-                     std::uint64_t ms, const std::string& author) {
-        SessionTurn t;
-        t.role = role;
-        t.content = content;
-        t.unix_ms = ms;
-        t.author = author;
-        return t;
-    };
-    std::vector<SessionTurn> turns;
-    turns.push_back(mkturn("user", "first message", T0, "melvin"));
-    turns.push_back(mkturn("user", "second message", T0 + 60'000, "melvin"));
-    turns.push_back(mkturn("assistant", "assistant reply", T0 + 120'000, ""));
-    turns.push_back(mkturn("user", "sofia chimes in", T0 + 180'000, "sofia"));
-    turns.push_back(mkturn("user", "melvin returns", T0 + 20 * 60'000, "melvin"));
-    turns.push_back(mkturn("user", "melvin continues", T0 + 21 * 60'000, "melvin"));
-    turns.push_back(mkturn("assistant", "much later reply", T0 + 45 * 60'000, ""));
-
-    PromptAssembler assembler;
-    const auto result = assembler.Build(turns, nullptr, "current message",
-                                        "system", "test-model", 128000);
-    const auto& msgs = result.request.messages;
-    auto findContent = [&](const std::string& needle) -> const llm::LLMMessage* {
-        for (const auto& m : msgs)
-            if (m.content.find(needle) != std::string::npos) return &m;
-        return nullptr;
-    };
-
-    const auto* m0 = findContent("first message");
-    if (!m0) return Fail(1, "#133 render: first message missing");
-    if (m0->content.find("melvin:") == std::string::npos ||
-        m0->content.rfind("[", 0) != 0)
-        return Fail(2, "#133 render: speaker header missing on first attributed turn");
-
-    const auto* m1 = findContent("second message");
-    if (!m1 || m1->content != "second message")
-        return Fail(3, "#133 render: same-speaker turn must render bare");
-
-    const auto* m2 = findContent("assistant reply");
-    if (!m2 || m2->content != "assistant reply")
-        return Fail(4, "#133 render: short-gap assistant turn must render bare");
-
-    const auto* m3 = findContent("sofia chimes in");
-    if (!m3 || m3->content.find(" sofia:") == std::string::npos)
-        return Fail(5, "#133 render: speaker-change header missing (sofia)");
-
-    const auto* m4 = findContent("melvin returns");
-    if (!m4 || m4->content.find(" melvin:") == std::string::npos)
-        return Fail(6, "#133 render: speaker-change header missing (melvin)");
-
-    const auto* m5 = findContent("melvin continues");
-    if (!m5 || m5->content != "melvin continues")
-        return Fail(7, "#133 render: consecutive same-speaker must render bare");
-
-    const auto* m6 = findContent("much later reply");
-    if (!m6 || m6->content.rfind("[", 0) != 0 ||
-        m6->content.find("sofia:") != std::string::npos ||
-        m6->content.find("melvin:") != std::string::npos)
-        return Fail(8, "#133 render: gap threshold must fire timestamp-only header");
-
-    // Token overhead (#133 acceptance: measured, not assumed). The bare
-    // variant keeps timestamps (gap headers still fire without authors) —
-    // the delta isolates the marginal speaker-header cost.
-    std::vector<SessionTurn> bare = turns;
-    for (auto& t : bare) t.author.clear();
-    const auto bareResult = assembler.Build(bare, nullptr, "current message",
-                                            "system", "test-model", 128000);
-    std::cout << "[ok] #133 headers: attributed=" << result.session_turns_tokens
-              << " bare=" << bareResult.session_turns_tokens
-              << " delta=" << (result.session_turns_tokens - bareResult.session_turns_tokens)
-              << " tokens over " << turns.size() << " turns\n";
-    if (result.session_turns_tokens <= bareResult.session_turns_tokens)
-        return Fail(9, "#133 render: attributed assembly must cost >= bare");
-    return 0;
-}
-
 int main() {
     if (const int rc = TestSessionRoutingAndAccess(); rc != 0) {
         return rc;
@@ -653,14 +525,6 @@ int main() {
     }
 
     if (const int rc = TestSessionsToolSearchRecency(); rc != 0) {
-        return rc;
-    }
-
-    if (const int rc = TestAuthorRoundTrip(); rc != 0) {
-        return rc;
-    }
-
-    if (const int rc = TestAttributionHeaderRendering(); rc != 0) {
         return rc;
     }
 

@@ -252,7 +252,6 @@ ChainResult ChainRunner::ExecuteOnSession(
     userTurn.role = "user";
     userTurn.content = userMessage;
     userTurn.unix_ms = NowUnixMs();
-    userTurn.author = req.author;  // #133
     session.AddTurn(std::move(userTurn));
     m_sessions.FlushSession(session.Id());
 
@@ -456,14 +455,12 @@ ChainResult ChainRunner::ExecuteOnSession(
     ChainAssistantMessageCallback assistantMessageCallback,
     const std::string& reasoningEffortOverride,
     bool reasoningEnabledOverride,
-    bool hasReasoningEnabledOverride,
-    const std::string& author) {
+    bool hasReasoningEnabledOverride) {
 
     ExecutionRequest req;
     ResolveAgentOverrides(session, systemPrompt, providerId, configId, model,
                           contextWindowTokens, hasReasoningEnabledOverride,
                           reasoningEnabledOverride, reasoningEffortOverride, req);
-    req.author = author;  // #133: attribution onto the stored user turn
     return ExecuteOnSession(session, userMessage, req,
                             thinkingCallback, toolCallCallback, assistantMessageCallback);
 }
@@ -491,7 +488,6 @@ ChainResult ChainRunner::ExecuteStreamingOnSession(
     userTurn.role = "user";
     userTurn.content = userMessage;
     userTurn.unix_ms = NowUnixMs();
-    userTurn.author = req.author;  // #133
     session.AddTurn(std::move(userTurn));
     m_sessions.FlushSession(session.Id());
 

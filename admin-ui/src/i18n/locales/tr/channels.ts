@@ -69,10 +69,8 @@ export const channels = {
         replyToUsers: 'Reply to Users (allowlist)'
       },
       mastodon: {
-        accessToken: 'Erişim Belirteci',
-        accessTokenHint: 'Mevcut belirteci korumak için boş bırakın',
-        instanceUrl: 'Örnek URL',
-        pollInterval: 'Yoklama Aralığı (saniye)'
+        handle: 'Kolu',
+        instance: 'Örnek URL\'si'
       },
       email: {
         apiKey: 'AgentMail API Anahtarı',

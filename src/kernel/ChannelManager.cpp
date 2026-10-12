@@ -1048,8 +1048,6 @@ void ChannelManager::SyncChannelCredentialsToConfigStore(
         "agent_name",
         // Email
         "inbox_id", "backend",
-        // Mastodon
-        "instance_url", "poll_interval",
         // Nextcloud Talk
         "server_url", "username", "app_password",
     };

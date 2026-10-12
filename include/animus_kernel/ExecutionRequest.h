@@ -29,12 +29,6 @@ struct ExecutionRequest {
     // --- Prompt ---
     std::string systemPrompt;     // Base system prompt (before context provider blocks)
 
-    // --- Attribution (#133) ---
-    // Author handle of the message triggering this run ("" when none —
-    // API runs, scheduler turns, agent-native paths). Copied onto the
-    // stored user turn and rendered block-level at prompt assembly.
-    std::string author;
-
     // --- Reasoning ---
     bool reasoningEnabled = false;
     std::string reasoningEffort;

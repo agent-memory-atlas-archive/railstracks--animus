@@ -69,10 +69,8 @@ export const channels = {
         replyToUsers: 'Reply to Users (allowlist)'
       },
       mastodon: {
-        accessToken: 'ថូខឹនចូលដំណើរការ',
-        accessTokenHint: 'ទុកឲ្យទំនេរដើម្បីរក្សាថូខឹនបច្ចុប្បន្ន',
-        instanceUrl: 'URL របស់ instance',
-        pollInterval: 'ចន្លោះពេល poll (វិនាទី)'
+        handle: 'ដៃ',
+        instance: 'URL គំរូ'
       },
       email: {
         apiKey: 'AgentMail API Key',
