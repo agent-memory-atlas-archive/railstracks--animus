@@ -815,6 +815,15 @@ if(ANIMUS_BUILD_TESTS)
     )
     add_test(NAME ApiPackageStoreTests COMMAND animus_api_package_store_tests)
 
+    add_executable(animus_database_config_tests
+      tests/DatabaseConfigTests.cpp
+    )
+    target_link_libraries(animus_database_config_tests PRIVATE animus_kernel)
+    set_target_properties(animus_database_config_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME DatabaseConfigTests COMMAND animus_database_config_tests)
+
     add_executable(animus_registry_client_tests
       tests/RegistryClientTests.cpp
     )
