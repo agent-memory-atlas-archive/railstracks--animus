@@ -216,9 +216,11 @@ local TYPED_422 = {
     {
         pattern = "^/api/v1/timelines/",
         error_type = "timeline_unavailable",
-        advice = "public timelines are unavailable on this node "
-            .. "(server-compatibility divergence, e.g. Akkoma/GoToSocial, "
-            .. "or instance policy); use account_statuses for per-account reads"
+        advice = "public timelines are unavailable on this node — commonly "
+            .. "the endpoint is auth-gated (flagship Mastodon 422s "
+            .. "unauthenticated reads; an invalid token looks the same), or "
+            .. "the server family/policy rejects it (Akkoma/GoToSocial); "
+            .. "use account_statuses for per-account reads"
     }
 }
 
@@ -889,8 +891,9 @@ local function do_search(args)
 
     local statuses_note
     if (not stype or stype == "statuses") and #statuses == 0 then
-        statuses_note = "no status results — this node may lack full-text status "
-            .. "search (server-side ElasticSearch required); account and hashtag "
+        statuses_note = "no status results — this node may not serve full-text "
+            .. "status search (server-side ElasticSearch required, and often "
+            .. "auth-gated even where present); account and hashtag "
             .. "search always work"
         if args.resolve ~= true and args.resolve ~= "true"
             and (q:find("@", 1, true) or q:find("http", 1, true)) then
