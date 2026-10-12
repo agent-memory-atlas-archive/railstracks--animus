@@ -2,6 +2,7 @@
 #include "animus_kernel/SyncStore.h"
 #include "animus_kernel/PeerSyncService.h"
 #include "animus_kernel/AgentKernel.h"
+#include "animus_kernel/lua/SharedScriptHealer.h"
 #include "animus_kernel/Log.h"
 
 #include <cstdlib>
@@ -2294,6 +2295,13 @@ void AgentKernel::LoadLuaScripts() {
 
     // Phase 2: Load filesystem scripts
     if (!m_config.lua_script_dir.empty()) {
+        // #143: volume-heal-on-boot — reconcile image-baked _shared defaults
+        // into the persisted volume BEFORE any discovery/loading happens.
+        // Empty staging dir (dev/bare boot) disables the heal entirely.
+        if (!m_config.lua_staging_dir.empty()) {
+            ReconcileSharedScripts(m_config.lua_staging_dir,
+                                   m_config.lua_script_dir);
+        }
         if (!m_fsScriptLoader) {
             m_fsScriptLoader = std::make_unique<FilesystemScriptLoader>(m_config.lua_script_dir);
         }
