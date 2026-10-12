@@ -331,6 +331,7 @@ void EmailAdapter::ProcessMessage(const Json::Value& msg) {
     meta["delivery"] = "tool";
     Json::Value origin;
     if (!sender.empty()) {
+        origin["user"] = sender;               // #150: feeds author_handle
         origin["user_display"] = sender;
         origin["user_id"] = sender;            // address = stable-ish id
     }
@@ -748,6 +749,7 @@ void SlackAdapter::SocketModeLoop() {
                     meta["message_type"] = "chat";
                     meta["delivery"] = "tool";
                     Json::Value origin;
+                    origin["user"] = userName;  // #150: feeds author_handle
                     origin["user_display"] = userName;
                     origin["user_id"] = userId;
                     if (!isDm) {
@@ -1273,7 +1275,23 @@ void NextcloudAdapter::RunLoop() {
                     replyTarget.type = ChannelReplyTarget::Chat;
                     replyTarget.peer_id = token;
 
-                    m_ctx.dispatch(rt->agent_id, "conv:" + token, prompt, "nextcloud", replyTarget, "{}");
+                    // Dispatch metadata (#150): origin feeds author_handle for
+                    // speaker headers at assembly (#133). Actor id is the stable
+                    // Nextcloud identity; conversation display names group chats
+                    // only. Delivery semantics intentionally untouched — Chat
+                    // auto-delivery stays the default.
+                    Json::Value dispatchMeta;
+                    Json::Value origin;
+                    origin["user"] = actorName;
+                    origin["user_id"] = actorId;
+                    if (!isDm(conv.type)) origin["channel"] = conv.displayName;
+                    dispatchMeta["origin"] = origin;
+                    Json::StreamWriterBuilder dwb;
+                    dwb["indentation"] = "";
+                    const std::string dispatchMetadata =
+                        Json::writeString(dwb, dispatchMeta);
+                    m_ctx.dispatch(rt->agent_id, "conv:" + token, prompt, "nextcloud",
+                                   replyTarget, dispatchMetadata);
 
                     ALOG_DEBUG("nextcloud", "Dispatched from " << actorName
                               << " in " << conv.displayName << " (id=" << msgId << ")");
@@ -1432,6 +1450,8 @@ void MoltbookAdapter::ProcessNotification(const Json::Value& n) {
     meta["message_type"] = "wall";
     meta["delivery"] = "tool";
     Json::Value origin;
+    // #150: `user` feeds author_handle → speaker headers at assembly (#133).
+    origin["user"] = from.empty() ? "unknown" : from;
     origin["user_display"] = from.empty() ? "unknown" : from;
     if (n["from_agent"].isObject() && n["from_agent"].isMember("id"))
         origin["user_id"] = n["from_agent"]["id"].asString();

@@ -1506,13 +1506,27 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             }
 
             if ((interval > 0 || aggregationWindowMs > 0) && m_messageQueue) {
-                // Determine sender label — empty for DM channels, populated for community
-                // Heuristic: if sessionType is "chat" and it's a DM channel (IRC nick,
-                // Telegram private, Discord DM), sender is empty. For group channels,
-                // we'd need the sender name from the channel adapter.
-                // For now, use empty sender — channel adapters that want sender labels
-                // can be updated to pass the sender name through the dispatch callback.
-                std::string sender;  // TODO: channel adapters should provide this
+                // Sender label for queued aggregates (#150): derived from the
+                // dispatch metadata the adapter already supplies — same
+                // conventions as the arrival parse in ExecuteChannelDispatch
+                // (top-level author_handle/author, then origin.user). Empty
+                // metadata → empty label → bare concatenation, unchanged for
+                // adapters that don't (yet) emit origin.
+                std::string sender;
+                {
+                    Json::Value qmeta;
+                    Json::CharReaderBuilder qrb;
+                    std::unique_ptr<Json::CharReader> qreader(qrb.newCharReader());
+                    std::string qerrs;
+                    if (qreader->parse(metadata.data(), metadata.data() + metadata.size(),
+                                       &qmeta, &qerrs) && qmeta.isObject()) {
+                        sender = qmeta.get("author_handle",
+                                           qmeta.get("author", "").asString()).asString();
+                        if (sender.empty() && qmeta.isMember("origin")
+                            && qmeta["origin"].isObject())
+                            sender = qmeta["origin"].get("user", "").asString();
+                    }
+                }
 
                 // Check if a chain is currently active on this session
                 std::string queueKey = "channel:" + sessionKey;
