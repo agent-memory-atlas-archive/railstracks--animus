@@ -1758,6 +1758,7 @@ void AgentKernel::ExecuteChannelDispatch(
         m_messageQueue->NotifyChainStart("channel:" + sessionKey);
     }
 
+    std::string dispatchAuthor;  // #133: author handle for this trigger, survives the guard block
     // Record the trusted arrival (#14) BEFORE the chain runs — single write
     // point covering both direct dispatch and queue-flush (both funnel here).
     // The provider (#15) renders pending arrivals as the channel-context card.
@@ -1817,6 +1818,7 @@ void AgentKernel::ExecuteChannelDispatch(
             arrival.message_type = (replyTarget.type == ChannelManager::ReplyTarget::Chat)
                                        ? "chat" : "wall";
         }
+        dispatchAuthor = arrival.author_handle;  // #133: capture final value (post origin-fallback)
         m_channelContextStore->AddArrival(arrival);
         m_channelContextStore->Prune(arrival.session_key, arrival.agent_id);
     }
@@ -1839,7 +1841,7 @@ void AgentKernel::ExecuteChannelDispatch(
 
     m_jobs.EnqueueInLane(
         ::animus::jobs::JobLane::Cognition,
-        [this, session, sessionKey, message, identity, registryKey, providerId, model, contextWindow, replyTarget, interval, metadata, autoDeliver]() {
+        [this, session, sessionKey, message, identity, registryKey, providerId, model, contextWindow, replyTarget, interval, metadata, autoDeliver, dispatchAuthor]() {
             // Per-message callback: send each assistant message to the channel
             // immediately rather than only the final response.
             // Only for Chat (DM) targets — Wall (post reply/mention) targets
@@ -1865,7 +1867,8 @@ void AgentKernel::ExecuteChannelDispatch(
                 contextWindow,
                 nullptr,      // thinkingCallback
                 nullptr,      // toolCallCallback
-                assistantCb); // assistantMessageCallback
+                assistantCb, // assistantMessageCallback
+                dispatchAuthor); // author (#133)
 
             if (m_sessionManager) {
                 m_sessionManager->FlushSession(session->Id());

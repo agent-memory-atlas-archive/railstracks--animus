@@ -26,6 +26,10 @@ struct SessionTurn {
     std::string role;     // "user" / "assistant" / "system" / "tool"
     std::string content;
     std::uint64_t unix_ms{0};
+    // Author handle for the external speaker of this turn (#133).
+    // Empty for agent-native turns (assistant/tool/system). Populated on
+    // user turns from channel dispatch metadata (arrival.author_handle).
+    std::string author;
     bool is_summary{false};
     std::vector<SessionTurnId> compacted_from;
     bool is_compacted{false};  // True if this turn has been folded into a compaction summary (kept in DB, excluded from prompts)
