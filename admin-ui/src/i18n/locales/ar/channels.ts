@@ -69,8 +69,10 @@ export const channels = {
         replyToUsers: 'Reply to Users (allowlist)'
       },
       mastodon: {
-        handle: 'مقبض',
-        instance: 'عنوان URL للمثيل'
+        accessToken: 'رمز الوصول',
+        accessTokenHint: 'اتركه فارغًا للاحتفاظ بالرمز الحالي',
+        instanceUrl: 'رابط المثيل',
+        pollInterval: 'فاصل الاستقصاء (ثوانٍ)'
       },
       email: {
         apiKey: 'مفتاح واجهة برمجة تطبيقات AgentMail',

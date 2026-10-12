@@ -70,13 +70,20 @@ bool DatabaseConfig::LoadFromFile(const std::string& path) {
 }
 
 void DatabaseConfig::ApplyTo(KernelConfig& config) const {
-    // Only apply if the config still has defaults — CLI args take precedence.
-    // We detect "unset" by checking if the value still matches the KernelConfig default.
-    // For backend: default is "sqlite"
-    if (config.storage_backend == "sqlite" && backend != "sqlite") {
+    // Only apply values that were not explicitly set — CLI args take
+    // precedence. #96: "unset" detection is the *_explicit flags set by the
+    // CLI parser. The previous sentinel compared sqlite_path against the
+    // literal "state/memory.db", which ResolvePaths (main.cpp) had already
+    // replaced with the resolved <dataDir>/memory.db path before ApplyTo
+    // ran — the guard could never match, so db.json's sqlite.path was
+    // silently ignored. The db.json-side comparison (sqlitePath !=
+    // "state/memory.db") remains: LoadFromFile only overwrites the field
+    // when the key exists, so a differing value means "the file actually
+    // specified a path".
+    if (!config.storage_backend_explicit && backend != "sqlite") {
         config.storage_backend = backend;
     }
-    if (config.sqlite_path == "state/memory.db" && sqlitePath != "state/memory.db") {
+    if (!config.sqlite_path_explicit && sqlitePath != "state/memory.db") {
         config.sqlite_path = sqlitePath;
     }
     if (config.pg_host == "localhost" && pgHost != "localhost") {

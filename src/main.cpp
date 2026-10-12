@@ -220,6 +220,11 @@ static void ResolvePaths(animus::kernel::KernelConfig& cfg,
   cfg.memory.filePath = (cfg.dataDir / "memory" / "observations.json").string();
   cfg.constitutionStorage.filePath = (cfg.dataDir / "constitution.json").string();
   cfg.lua_script_dir = (cfg.dataDir / "lua").string();
+  // #143: optional image-baked staging root for the boot-time _shared volume
+  // heal (unset/empty = heal disabled — dev and bare builds unchanged)
+  if (const char* luaStaging = std::getenv("ANIMUS_LUA_STAGING_DIR")) {
+    cfg.lua_staging_dir = luaStaging;
+  }
 
   if (cfg.embedding_model_path.empty()) {
     cfg.embedding_model_path = (cfg.dataDir / "models" / "embeddinggemma-300m-qat-Q8_0.gguf").string();
@@ -402,6 +407,7 @@ static bool ParseArg(int argc, char** argv, int& i,
       std::exit(2);
     }
     cfg.storage_backend = argv[++i];
+    cfg.storage_backend_explicit = true;  // #96: db.json must not override
     wantsKernel = true;
     return true;
   }
@@ -411,6 +417,7 @@ static bool ParseArg(int argc, char** argv, int& i,
       std::exit(2);
     }
     cfg.sqlite_path = argv[++i];
+    cfg.sqlite_path_explicit = true;  // #96: db.json must not override
     wantsKernel = true;
     return true;
   }
