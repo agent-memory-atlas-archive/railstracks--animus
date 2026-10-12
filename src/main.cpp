@@ -407,6 +407,7 @@ static bool ParseArg(int argc, char** argv, int& i,
       std::exit(2);
     }
     cfg.storage_backend = argv[++i];
+    cfg.storage_backend_explicit = true;  // #96: db.json must not override
     wantsKernel = true;
     return true;
   }
@@ -416,6 +417,7 @@ static bool ParseArg(int argc, char** argv, int& i,
       std::exit(2);
     }
     cfg.sqlite_path = argv[++i];
+    cfg.sqlite_path_explicit = true;  // #96: db.json must not override
     wantsKernel = true;
     return true;
   }

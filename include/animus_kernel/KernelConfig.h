@@ -268,6 +268,14 @@ struct AgentModelConfig {
     // Storage backend configuration
     std::string storage_backend{"sqlite"};  // "sqlite" or "postgresql"
     std::string sqlite_path;  // resolved from dataDir / "memory.db"
+    // #96: real "explicitly set" detection. CLI flags set these;
+    // DatabaseConfig::ApplyTo (db.json) never overrides an explicit value.
+    // Replaces sentinel comparison — the old check compared sqlite_path
+    // against "state/memory.db", a literal ResolvePaths had already
+    // replaced with <dataDir>/memory.db, so db.json's sqlite.path was
+    // silently ignored.
+    bool storage_backend_explicit{false};
+    bool sqlite_path_explicit{false};
 
     // PostgreSQL configuration (used when storage_backend == "postgresql")
     std::string pg_host{"localhost"};
