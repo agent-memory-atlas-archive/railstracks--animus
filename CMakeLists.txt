@@ -410,6 +410,7 @@ add_library(animus_kernel
   src/kernel/lua/LuaToolHandler.cpp
   src/kernel/lua/ScriptStore.cpp
   src/kernel/lua/FilesystemScriptLoader.cpp
+  src/kernel/lua/SharedScriptHealer.cpp
   src/kernel/AgentConfigStore.cpp
   src/kernel/llm/CohereToolCallAccumulator.cpp
   src/kernel/llm/SSEToolCallAccumulator.cpp
@@ -909,6 +910,19 @@ if(ANIMUS_BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
     )
     add_test(NAME LuaTests COMMAND animus_lua_tests)
+
+    add_executable(animus_healer_tests
+      tests/SharedScriptHealerTests.cpp
+    )
+    target_link_libraries(animus_healer_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_healer_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_healer_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME SharedScriptHealerTests COMMAND animus_healer_tests)
 
     add_executable(animus_social_tool_tests
       tests/ChannelsToolTests.cpp

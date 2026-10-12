@@ -287,6 +287,9 @@ struct AgentModelConfig {
 
     // Lua filesystem loading
     std::string lua_script_dir;  // resolved from dataDir / "lua"
+    // #143: image-baked pristine defaults root (env ANIMUS_LUA_STAGING_DIR).
+    // Empty = boot-time _shared volume heal disabled (dev/bare builds).
+    std::string lua_staging_dir;
     bool lua_load_from_db{true};               // also load from DB (backward compat)
     bool lua_filesystem_overrides_db{true};    // filesystem scripts override DB on name conflict
 
