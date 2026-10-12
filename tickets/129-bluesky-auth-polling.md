@@ -16,8 +16,6 @@ The access JWT and refresh JWT expire with no proactive renewal. Tokens are only
 ### Gap 2: RestPollLoop is a TODO stub
 `SocialEventPoller::RestPollLoop` (line 527 of SocialEventPoller.cpp) is an empty stub for Bluesky. The comment says `// TODO: Implement REST polling for Bluesky notifications`. No notification polling means no inbound messages from Bluesky beyond the initial setup.
 
-> **Correction (2026-10-11, #135/#140 recon):** This gap was stale. Post-056 channels refactor, `SocialEventPoller` (including `RestPollLoop`) was never constructed anywhere — Bluesky notification polling actually runs via `ChannelManager::BlueskyPollLoop`. The dead class is removed in PR #140. Gap 2 closes as obsolete.
-
 ### Gap 3: Bluesky missing from SendReply
 `ChannelManager::SendReply()` has no Bluesky case. Auto-replies fall through to `"unsupported type"`. When Animus generates a reply for a Bluesky message, it can't actually send it back.
 

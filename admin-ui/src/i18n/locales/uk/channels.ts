@@ -69,10 +69,8 @@ export const channels = {
         replyToUsers: 'Reply to Users (allowlist)'
       },
       mastodon: {
-        accessToken: 'Токен доступу',
-        accessTokenHint: 'Залиште порожнім, щоб зберегти поточний токен',
-        instanceUrl: 'URL інстансу',
-        pollInterval: 'Інтервал опитування (секунди)'
+        handle: 'Ручка',
+        instance: 'URL екземпляра'
       },
       email: {
         apiKey: 'Ключ API AgentMail',

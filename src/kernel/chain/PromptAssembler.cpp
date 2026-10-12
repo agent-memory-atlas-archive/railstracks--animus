@@ -1,7 +1,4 @@
 #include "animus_kernel/PromptAssembler.h"
-#include <ctime>
-#include <cstdio>
-#include <cstdint>
 #include "animus_kernel/Session.h"
 #include "animus_kernel/TokenEstimate.h"
 
@@ -82,25 +79,6 @@ PromptAssemblyResult PromptAssembler::Build(
     }
 
     // 3. Session history
-    // #133: block-level attribution headers — speaker header fires when a
-    // user turn's author differs from the previous rendered turn's speaker;
-    // timestamp header fires when the time gap exceeds the threshold
-    // (10 min). Assistant/tool/system turns are agent-native: no speaker
-    // header, but they still anchor time on long gaps.
-    auto stampMs = [](std::uint64_t ms) -> std::string {
-        std::time_t secs = static_cast<std::time_t>(ms / 1000);
-        std::tm tm{};
-        gmtime_r(&secs, &tm);
-        char buf[24];
-        std::snprintf(buf, sizeof(buf), "[%04d-%02d-%02d %02d:%02d]",
-                      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                      tm.tm_hour, tm.tm_min);
-        return std::string(buf);
-    };
-    std::string lastSpeaker;
-    std::uint64_t lastRenderedMs = 0;
-    std::size_t headerTokens = 0;  // #133: header cost, folded into accounting below
-    constexpr std::uint64_t kAttributionGapMs = 600'000;  // 10 min
     for (const auto& turn : turns) {
         if (turn.is_summary) continue;
         if (turn.is_compacted) continue;
@@ -109,26 +87,9 @@ PromptAssemblyResult PromptAssembler::Build(
         // thinking_content is a display-only property — never sent to the LLM.
         if (turn.content.empty() && turn.tool_calls.empty()) continue;
 
-        // #133: attribution header (speaker on change, timestamp on gap)
-        const bool attributedUser =
-            (turn.role == "user" && !turn.author.empty());
-        std::string header;
-        if (attributedUser && turn.author != lastSpeaker) {
-            header = stampMs(turn.unix_ms) + " " + turn.author + ":";
-        } else if (lastRenderedMs != 0 && turn.unix_ms != 0 &&
-                   turn.unix_ms > lastRenderedMs + kAttributionGapMs) {
-            header = stampMs(turn.unix_ms);
-        }
-        if (!header.empty()) {
-            header += "\n";
-            headerTokens += m_estimator.Estimate(header);
-        }
-        if (attributedUser) lastSpeaker = turn.author;
-        if (turn.unix_ms != 0) lastRenderedMs = turn.unix_ms;
-
         llm::LLMMessage msg;
         msg.role = turn.role;
-        msg.content = header + turn.content;
+        msg.content = turn.content;
 
         // Carry tool result metadata for proper API formatting
         if (turn.role == "tool") {
@@ -165,9 +126,6 @@ PromptAssemblyResult PromptAssembler::Build(
             result.session_turns_tokens += m_estimator.Estimate(turn.content) + 4;
         }
     }
-    // #133: attribution headers ride inside message content — cached
-    // token_count and raw-content estimates both exclude them.
-    result.session_turns_tokens += headerTokens;
 
     // Token budget check
     result.total_tokens = result.system_prompt_tokens

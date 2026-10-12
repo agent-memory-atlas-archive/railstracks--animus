@@ -69,10 +69,8 @@ export const channels = {
         replyToUsers: 'Reply to Users (allowlist)'
       },
       mastodon: {
-        accessToken: 'Alamar Shiga',
-        accessTokenHint: 'Bari babu don kiyaye alamar yanzu',
-        instanceUrl: 'URL ɗin Instance',
-        pollInterval: 'Dakin Bincika (daƙiƙa)'
+        handle: 'Hannu',
+        instance: 'Misali URL'
       },
       email: {
         apiKey: 'Maɓallin API AgentMail',
