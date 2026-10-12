@@ -129,6 +129,12 @@ RUN ldconfig
 # Copy Lua scripts to default data dir
 COPY --chown=animus:animus lua/_shared/ /data/data/lua/_shared/
 
+# #143: pristine staging copy, OUTSIDE the data dir — persisted volumes shadow
+# /data/data, so this second copy feeds the boot-time _shared volume heal
+# (kernel reads ANIMUS_LUA_STAGING_DIR below). Keep both: fresh volumes use
+# the direct COPY; persisted ones reconcile from staging at boot.
+COPY --chown=animus:animus lua/_shared/ /opt/animus/lua-defaults/lua/_shared/
+
 # Model directory — empty by default, populated when WITH_MODEL=1
 COPY --chown=animus:animus models/ /data/data/models/
 
@@ -153,6 +159,8 @@ ENV DB_PORT="5432"
 ENV ADMIN_HOST="0.0.0.0"
 ENV ADMIN_PORT="8080"
 ENV ANIMUS_SKIP_MODEL_DOWNLOAD=""
+# #143: boot-time _shared volume heal reads pristine defaults from here
+ENV ANIMUS_LUA_STAGING_DIR="/opt/animus/lua-defaults/lua"
 ENV HOME="/home/animus"
 
 # Write entrypoint script
