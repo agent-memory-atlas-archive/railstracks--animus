@@ -128,6 +128,20 @@ const markdown = new MarkdownIt({
   breaks: true
 });
 
+// #132: outbound links open in a new tab — clicking a link in /chat must not
+// navigate this SPA away (session, scroll, input stay intact). Applies to every
+// render through this instance (message bodies, thinking, compaction) and to
+// linkify'd raw URLs, which produce the same link_open tokens.
+const defaultLinkOpen = markdown.renderer.rules.link_open;
+markdown.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  tokens[idx].attrSet('target', '_blank');
+  tokens[idx].attrSet('rel', 'noopener noreferrer');
+  if (defaultLinkOpen) {
+    return defaultLinkOpen(tokens, idx, options, env, self);
+  }
+  return self.renderToken(tokens, idx, options);
+};
+
 const socket = ref<WebSocket | null>(null);
 const reconnectTimer = ref<number | null>(null);
 const wsState = ref<WsConnectionState>('closed');
