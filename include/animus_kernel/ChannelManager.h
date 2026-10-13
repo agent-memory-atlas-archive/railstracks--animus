@@ -124,6 +124,16 @@ public:
         m_sendFailureCb = std::move(cb);
     }
 
+    // #144: live probe for Lua-registered social adapters, checked at channel
+    // start. Lets StartChannel distinguish "type owned by a Lua plugin"
+    // (normal — mastodon/twitter-style channels register via
+    // animus.register_channel) from "type with no implementation anywhere",
+    // and WARN loudly on the latter — a config error that must not
+    // masquerade as silence (Oct 11 Mastodon trial postmortem).
+    void SetSocialPluginProbe(std::function<bool(const std::string&)> probe) {
+        m_socialPluginProbe = std::move(probe);
+    }
+
     // --- Channel CRUD ---
     std::vector<ChannelState> ListChannels() const;
     std::optional<ChannelState> GetChannel(const std::string& name) const;
@@ -302,6 +312,7 @@ private:
     LogCallback m_logCallback;
     SessionQueryCallback m_sessionQuery;
     ChannelSendFailureCallback m_sendFailureCb;
+    std::function<bool(const std::string&)> m_socialPluginProbe;  // #144
 
     // All channel states (loaded from config store)
     std::unordered_map<std::string, ChannelState> m_channels;

@@ -914,7 +914,25 @@ void ChannelManager::StartChannel(const ChannelState& state) {
         return;
     }
 
-    ALOG_DEBUG("channels", "Unknown channel type: " << state.type);
+    // #144: unknown to every C++ connector path. Either a Lua-registered
+    // social adapter owns this type (normal — plugin channels register via
+    // animus.register_channel and never pass through the C++ paths above),
+    // or the channel is configured with a type that has no implementation
+    // anywhere. The latter is a config error that must not masquerade as
+    // silence: in the Oct 11 Mastodon trial it surfaced only later as
+    // adapter_registered:false and "unknown platform" dispatch errors, with
+    // zero boot-time indication of why.
+    if (m_socialPluginProbe && m_socialPluginProbe(state.type)) {
+        ALOG_INFO("channels", "Channel '" << state.name << "' (type '"
+                  << state.type << "') is handled by a registered Lua plugin");
+    } else {
+        ALOG_WARNING("channels", "Channel '" << state.name << "' has type '"
+                  << state.type << "' with no implementation: no built-in "
+                  << "C++ connector and no registered Lua plugin — the "
+                  << "channel will not start. Check the channel's 'type' in "
+                  << "your configuration, or install/load the Lua adapter "
+                  << "script for this platform.");
+    }
 }
 
 void ChannelManager::StopChannel(const std::string& name) {
