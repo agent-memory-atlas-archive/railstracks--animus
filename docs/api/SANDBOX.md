@@ -143,6 +143,13 @@ Not available: `io`, `require`, `os.execute`, `loadfile`, `dofile`, raw `json.de
 or filesystem access. The chunk is loaded under the existing LuaState sandbox with the
 instruction-count hook active (long-running scripts are terminated, not hung).
 
+**`os.date` contract** (#119): formats are restricted to the deterministic subset —
+`%Y %m %d %H %M %S %F %T %j`, `%%`, and literal runs of `[A-Za-z0-9_.:/+-]` (space included).
+A leading `!` (UTC flag) is accepted and stripped; output is **always UTC**. `os.date(fmt, t)`
+formats epoch `t`; omit it for wall-clock. Anything outside the subset — locale-dependent
+specifiers (`%a %A %b %B %c %x %X %p %Z`), the `*t` table form — returns the ISO-8601 default
+`%Y-%m-%dT%H:%M:%SZ`. Slug-safe compact stamps: `os.date('!%Y%m%d-%H%M%S')` → `20260926-025553`.
+
 ## State & secrets
 
 - Read via `ctx.package.state` (secrets masked — for display/branching) or `get_state(k)` (real
