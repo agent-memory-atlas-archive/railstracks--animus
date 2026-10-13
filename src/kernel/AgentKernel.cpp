@@ -1648,6 +1648,23 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             m_channelsTool->SetChannelManager(m_channelManager);
         }
 
+        // #144: live view of the Lua plugin registry so channel start can
+        // distinguish plugin-owned types from types with no implementation
+        // anywhere and WARN on the latter. Read at channel-start time, so
+        // agents whose Lua state registers later are seen on their channels'
+        // next start/restart.
+        m_channelManager->SetSocialPluginProbe(
+            [this](const std::string& type) {
+                for (auto& [agentId, luaState] : m_luaStates) {
+                    for (const auto& plugin : luaState->GetRegisteredPlugins()) {
+                        if (plugin.type == "social" && plugin.id == type) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            });
+
         m_channelManager->Initialize();
     }
 
