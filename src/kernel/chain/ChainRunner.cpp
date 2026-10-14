@@ -762,13 +762,15 @@ ChainResult ChainRunner::ExecuteStreamingOnSession(
     const std::string& reasoningEffortOverride,
     bool reasoningEnabledOverride,
     bool hasReasoningEnabledOverride,
-    std::shared_ptr<std::atomic<bool>> stopSignal) {
+    std::shared_ptr<std::atomic<bool>> stopSignal,
+    const std::string& author) {
 
     ExecutionRequest req;
     ResolveAgentOverrides(session, systemPrompt, providerId, configId, model,
                           contextWindowTokens, hasReasoningEnabledOverride,
                           reasoningEnabledOverride, reasoningEffortOverride, req);
     req.stopSignal = stopSignal;
+    req.author = author;  // #172: attribution onto the stored user turn
     return ExecuteStreamingOnSession(session, userMessage, req,
                                      tokenCallback, textCallback, toolEventCallback,
                                      thinkingCallback, toolCallCallback,
