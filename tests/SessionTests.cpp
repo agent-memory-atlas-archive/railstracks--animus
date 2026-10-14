@@ -584,10 +584,11 @@ int TestAttributionHeaderRendering() {
     };
 
     const auto* m0 = findContent("first message");
-    if (!m0) return Fail(1, "#133 render: first message missing");
-    if (m0->content.find("melvin:") == std::string::npos ||
-        m0->content.rfind("[", 0) != 0)
-        return Fail(2, "#133 render: speaker header missing on first attributed turn");
+    if (!m0) return Fail(1, "#179 render: first message missing");
+    if (m0->content.find("Author: melvin\n") == std::string::npos ||
+        m0->content.find("Timestamp: ") == std::string::npos ||
+        m0->content.find("\n====\nfirst message") == std::string::npos)
+        return Fail(2, "#179 render: metadata block missing on first attributed turn");
 
     const auto* m1 = findContent("second message");
     if (!m1 || m1->content != "second message")
@@ -598,22 +599,21 @@ int TestAttributionHeaderRendering() {
         return Fail(4, "#133 render: short-gap assistant turn must render bare");
 
     const auto* m3 = findContent("sofia chimes in");
-    if (!m3 || m3->content.find(" sofia:") == std::string::npos)
-        return Fail(5, "#133 render: speaker-change header missing (sofia)");
+    if (!m3 || m3->content.find("Author: sofia\n") == std::string::npos)
+        return Fail(5, "#179 render: speaker-change block missing (sofia)");
 
     const auto* m4 = findContent("melvin returns");
-    if (!m4 || m4->content.find(" melvin:") == std::string::npos)
-        return Fail(6, "#133 render: speaker-change header missing (melvin)");
+    if (!m4 || m4->content.find("Author: melvin\n") == std::string::npos)
+        return Fail(6, "#179 render: speaker-change block missing (melvin)");
 
     const auto* m5 = findContent("melvin continues");
     if (!m5 || m5->content != "melvin continues")
         return Fail(7, "#133 render: consecutive same-speaker must render bare");
 
     const auto* m6 = findContent("much later reply");
-    if (!m6 || m6->content.rfind("[", 0) != 0 ||
-        m6->content.find("sofia:") != std::string::npos ||
-        m6->content.find("melvin:") != std::string::npos)
-        return Fail(8, "#133 render: gap threshold must fire timestamp-only header");
+    if (!m6 || m6->content.rfind("Timestamp: ", 0) != 0 ||
+        m6->content.find("Author:") != std::string::npos)
+        return Fail(8, "#179 render: gap threshold must fire timestamp-only block");
 
     // Token overhead (#133 acceptance: measured, not assumed). The bare
     // variant keeps timestamps (gap headers still fire without authors) —
