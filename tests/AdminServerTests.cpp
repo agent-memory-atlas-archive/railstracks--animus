@@ -2,6 +2,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <cstdlib>
 
 #include <array>
 #include <chrono>
@@ -2515,11 +2516,218 @@ int TestAdminServerAndAgentApi() {
         }
     }
 
+    // ===================================================================
+    // #95: the WS gate matrix needs a token-less kernel. A second
+    // in-process kernel boot segfaults (boot proceeds past provider load
+    // then dies — global/drogon lifecycle with two kernel instances), so
+    // the matrix runs as a child process of this very binary: one kernel
+    // per process, matching real deployment topology.
+    // ===================================================================
+    {
+        char exeBuf[4096];
+        const ssize_t exeLen = readlink("/proc/self/exe", exeBuf, sizeof(exeBuf) - 1);
+        if (exeLen <= 0) {
+            return Fail(966, "failed to resolve test binary path for #95 child");
+        }
+        exeBuf[exeLen] = '\0';
+        const int rc = std::system((std::string(exeBuf) + " --ws-gate-only").c_str());
+        if (rc != 0) {
+            return Fail(967, "#95 ws gate child process failed (rc=" + std::to_string(rc) + ")");
+        }
+    }
+
     return 0;
 }
 
+// #95 child-process entry (spawned via --ws-gate-only): boots ONE
+// token-less kernel and walks the WS auth gate matrix. See the spawn
+// site at the end of TestAdminServerAndAgentApi.
+int TestWsAuthGate() {
+    // ===================================================================
+    // #95: the WS gate must honor user auth when no static token is set.
+    // Boots a second, token-less kernel (loopback opt-in OFF — the flag
+    // defaults true and would mask the rejection path) and walks the
+    // matrix: open-admit control → first-user setup (must close the
+    // instance LIVE, not just at boot) → REST 401, WS reject, login,
+    // WS admit via session token.
+    // ===================================================================
+    {
+        auto closeIfOpen = [](int fd) {
+            if (fd >= 0) {
+                ::close(fd);
+            }
+        };
+
+        // Reset the CWD-relative shared datastore exactly like the parent
+        // suite's fixture cleanup: a previous child run persisted the
+        // 'wsgate' user (auth/setup), which would make this boot user-auth
+        // instead of open and fail the control step deterministically.
+        {
+            std::error_code ec;
+            std::filesystem::remove("memory.db", ec);
+            std::filesystem::remove("memory.db-wal", ec);
+            std::filesystem::remove("memory.db-shm", ec);
+        }
+
+        const std::uint16_t port2 = ReserveFreePort();
+        if (port2 == 0) {
+            return Fail(950, "failed to reserve port for #95 ws gate test");
+        }
+
+        animus::kernel::KernelConfig config2;
+        config2.admin.enabled = true;
+        config2.admin.host = "127.0.0.1";
+        config2.admin.port = port2;
+        config2.admin.authToken = "";  // #95's exact scenario: token-less
+        config2.admin.allowUnauthenticatedLocalhost = false;
+        config2.admin.websocketMaxMessageBytes = 1024;
+        // Persistence validates every storage path; mirror the main
+        // kernel's config shape with throwaway ws_gate files (absent files
+        // boot as defaults — the fresh-install path).
+        const std::filesystem::path dataDir = std::filesystem::path("build") / "test_data";
+        const std::string suffix = "_ws_gate_test.json";
+        {
+            std::error_code ec;
+            for (const auto* stem :
+                 {"agent_config", "interface", "memory", "constitution",
+                  "providers", "auth"}) {
+                std::filesystem::remove(dataDir / (std::string(stem) + suffix), ec);
+            }
+        }
+        config2.agentStorage.persistToDisk = true;
+        config2.agentStorage.filePath = (dataDir / ("agent_config" + suffix)).string();
+        config2.interfaceStorage.persistToDisk = true;
+        config2.interfaceStorage.filePath = (dataDir / ("interface" + suffix)).string();
+        config2.memory.persistToDisk = true;
+        config2.memory.filePath = (dataDir / ("memory" + suffix)).string();
+        config2.constitutionStorage.persistToDisk = true;
+        config2.constitutionStorage.filePath = (dataDir / ("constitution" + suffix)).string();
+        config2.providerStorage.persistToDisk = true;
+        config2.providerStorage.providersFilePath = (dataDir / ("providers" + suffix)).string();
+        config2.providerStorage.authFilePath = (dataDir / ("auth" + suffix)).string();
+
+        animus::kernel::AgentKernel kernel2;
+        std::string error2;
+        if (!kernel2.Start(config2, &error2)) {
+            return Fail(951, "second kernel failed to start: " + error2);
+        }
+        if (!WaitForStatusReady(config2.admin.host, config2.admin.port)) {
+            kernel2.Stop();
+            return Fail(952, "second kernel status never became ready");
+        }
+
+        // Control: a token-less instance with no users is open (no
+        // regression for genuinely open instances).
+        int fdCtl = -1;
+        std::string upgradeCtl;
+        if (!ConnectWebSocket(config2.admin.host, config2.admin.port,
+                              "/ws/chat", &fdCtl, &upgradeCtl)) {
+            kernel2.Stop();
+            return Fail(953, "open-instance ws/chat connect unexpectedly failed");
+        }
+        if (!SendWebSocketText(fdCtl, R"({"type":"list_sessions"})")
+            || !WaitForWebSocketPayloadContaining(fdCtl, "\"type\":\"sessions\"", 3000, nullptr)) {
+            closeIfOpen(fdCtl);
+            kernel2.Stop();
+            return Fail(954, "open-instance ws/chat did not answer list_sessions");
+        }
+
+        // First-run setup: creates the first user on the open instance
+        // (reachable pre-auth by design — no user exists yet).
+        int setupCode = 0;
+        std::string setupBody;
+        if (!HttpRequest(config2.admin.host, config2.admin.port, "POST",
+                         "/api/v1/auth/setup",
+                         R"({"username":"wsgate","password":"wsgate-pass-1","role":"admin"})",
+                         &setupCode, &setupBody)) {
+            kernel2.Stop();
+            return Fail(955, "auth/setup request failed: " + setupBody);
+        }
+        if (setupCode != 200) {
+            kernel2.Stop();
+            return Fail(956, "auth/setup did not return 200: " + setupBody);
+        }
+
+        // The latch must flip LIVE: a token-less REST call now 401s.
+        int probeCode = 0;
+        std::string probeBody;
+        if (!HttpRequest(config2.admin.host, config2.admin.port, "GET",
+                         "/api/v1/agents", "", &probeCode, &probeBody)) {
+            kernel2.Stop();
+            return Fail(957, "post-setup agents probe failed");
+        }
+        if (probeCode != 401) {
+            kernel2.Stop();
+            return Fail(958, "post-setup REST probe without token should 401, got "
+                        + std::to_string(probeCode) + ": " + probeBody);
+        }
+
+        // And the WS gate must reject an unauthenticated connection.
+        int fdReject = -1;
+        std::string upgradeReject;
+        if (!ConnectWebSocket(config2.admin.host, config2.admin.port,
+                              "/ws/chat", &fdReject, &upgradeReject)) {
+            kernel2.Stop();
+            return Fail(959, "post-setup ws/chat upgrade failed");
+        }
+        const bool sawUnauthorized =
+            WaitForWebSocketPayloadContaining(fdReject, "unauthorized", 3000, nullptr);
+        if (!sawUnauthorized) {
+            closeIfOpen(fdReject);
+            kernel2.Stop();
+            return Fail(960, "post-setup unauthenticated ws/chat was not rejected with 'unauthorized'");
+        }
+
+        // Login and prove session-token admission over WS.
+        int loginCode = 0;
+        std::string loginBody;
+        if (!HttpRequest(config2.admin.host, config2.admin.port, "POST",
+                         "/api/v1/auth/login",
+                         R"({"username":"wsgate","password":"wsgate-pass-1"})",
+                         &loginCode, &loginBody)) {
+            kernel2.Stop();
+            return Fail(961, "auth/login request failed: " + loginBody);
+        }
+        if (loginCode != 200) {
+            kernel2.Stop();
+            return Fail(962, "auth/login did not return 200: " + loginBody);
+        }
+        std::smatch tokenMatch;
+        const std::regex tokenPattern("\"token\"[: ]*\"([^\"]+)\"");
+        if (!std::regex_search(loginBody, tokenMatch, tokenPattern)) {
+            kernel2.Stop();
+            return Fail(963, "auth/login response missing token: " + loginBody);
+        }
+        const std::string wsPath = std::string("/ws/chat?token=") + tokenMatch[1].str();
+        int fdAuth = -1;
+        std::string upgradeAuth;
+        if (!ConnectWebSocket(config2.admin.host, config2.admin.port, wsPath, &fdAuth, &upgradeAuth)) {
+            kernel2.Stop();
+            return Fail(964, "session-token ws/chat upgrade failed");
+        }
+        if (!SendWebSocketText(fdAuth, R"({"type":"list_sessions"})")
+            || !WaitForWebSocketPayloadContaining(fdAuth, "\"type\":\"sessions\"", 3000, nullptr)) {
+            closeIfOpen(fdAuth);
+            kernel2.Stop();
+            return Fail(965, "session-token ws/chat did not answer list_sessions");
+        }
+
+        kernel2.Stop();
+        // Close client sockets only after server teardown: peer-closed
+        // sockets made the server's shutdownWrite hit ENOTCONN (muduo
+        // LOG_FATAL) racing exit(0) — don't rely on winning that race.
+        closeIfOpen(fdCtl);
+        closeIfOpen(fdReject);
+        closeIfOpen(fdAuth);
+    }
+
+    return 0;
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--ws-gate-only") {
+        return TestWsAuthGate();
+    }
     return TestAdminServerAndAgentApi();
 }
