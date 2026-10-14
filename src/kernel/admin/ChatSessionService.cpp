@@ -418,7 +418,11 @@ bool ChatSessionService::EnqueueStreamingResponse(const Request& request) const 
                 requestedReasoningEffort,
                 requestedReasoningEnabled,
                 hasReasoningOverride,
-                stopSignal);  // new param
+                stopSignal,
+                // #172: authenticated username rides the turn → speaker
+                // headers at assembly (#133). Unauthenticated stays empty
+                // (honest absence — same convention as the #73 arrival gate).
+                isUserAuth ? authUsername : std::string());
 
             // Always flush — even on failure, turns added during the chain
             // (user message, partial responses, tool results) must be persisted.
