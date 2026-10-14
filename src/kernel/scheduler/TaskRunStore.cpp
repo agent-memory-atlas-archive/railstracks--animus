@@ -238,21 +238,21 @@ std::optional<TaskRun> TaskRunStore::GetByUuid(const std::string& runUuid) const
 
 std::vector<TaskRun> TaskRunStore::ListForSchedule(const std::string& scheduleId, int limit) const {
     std::vector<TaskRun> runs;
-    if (limit <= 0) limit = 50;
+    if (limit < 0) limit = m_defaultListLimit;  // #176: caller default
     auto stmt = m_store->Prepare(
         std::string("SELECT ") + kTaskRunCols +
         " FROM task_runs WHERE schedule_id=? ORDER BY started_at_unix_ms DESC LIMIT ?");
     if (!stmt) return runs;
     stmt->BindText(1, scheduleId);
-    stmt->BindInt64(2, limit);
+    stmt->BindInt64(2, limit > 0 ? limit : -1);  // #176: <=0 = unlimited
     while (stmt->Step()) runs.push_back(RowFromStatement(stmt.get()));
     return runs;
 }
 
 std::vector<TaskRun> TaskRunStore::ListRecent(const std::string& agentId, int limit) const {
     std::vector<TaskRun> runs;
-    if (limit <= 0) limit = 50;
-    if (limit > 500) limit = 500;
+    if (limit < 0) limit = m_defaultListLimit;  // #176: caller default
+    // #176: the old 500 hard clamp is removed — explicit limits bind as-is
     std::string sql = std::string("SELECT ") + kTaskRunCols + " FROM task_runs";
     if (!agentId.empty()) sql += " WHERE agent_id=?";
     sql += " ORDER BY started_at_unix_ms DESC LIMIT ?";
@@ -260,7 +260,7 @@ std::vector<TaskRun> TaskRunStore::ListRecent(const std::string& agentId, int li
     if (!stmt) return runs;
     int bind = 1;
     if (!agentId.empty()) stmt->BindText(bind++, agentId);
-    stmt->BindInt64(bind, limit);
+    stmt->BindInt64(bind, limit > 0 ? limit : -1);  // #176: <=0 = unlimited
     while (stmt->Step()) runs.push_back(RowFromStatement(stmt.get()));
     return runs;
 }

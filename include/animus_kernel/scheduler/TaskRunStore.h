@@ -51,6 +51,10 @@ class TaskRunStore {
 public:
     explicit TaskRunStore(IDataStore* store);
 
+    // #176: default page size for listings when callers pass limit < 0.
+    // Fed from kernel config scheduler.task_run_list_limit (0 = unlimited).
+    void SetDefaultListLimit(int limit) { m_defaultListLimit = limit; }
+
     void EnsureSchema();
 
     // Atomically claim a fire window. Returns true iff THIS call inserted the
@@ -91,14 +95,15 @@ public:
     int FenceRunUuid(const std::string& runUuid);
 
     std::optional<TaskRun> GetByUuid(const std::string& runUuid) const;
-    std::vector<TaskRun> ListForSchedule(const std::string& scheduleId, int limit) const;
+    std::vector<TaskRun> ListForSchedule(const std::string& scheduleId, int limit = -1) const;
     // agent_id "" = all agents. Newest first.
-    std::vector<TaskRun> ListRecent(const std::string& agentId, int limit) const;
+    std::vector<TaskRun> ListRecent(const std::string& agentId, int limit = -1) const;
 
 private:
     TaskRun RowFromStatement(IStatement* stmt) const;
 
     IDataStore* m_store;
+    int m_defaultListLimit{0};  // #176: 0 = unlimited
 };
 
 } // namespace animus::kernel

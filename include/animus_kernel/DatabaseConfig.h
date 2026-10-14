@@ -28,6 +28,9 @@ struct DatabaseConfig {
     std::uint64_t leaseTtlMs{60000};      // #78 P2b schedule lease TTL
     std::uint64_t leaseGraceMs{30000};    // #78 P2b takeover grace window
 
+    // #176 scheduler section (db.json "scheduler")
+    int schedulerTaskRunListLimit{-1};    // -1 = key absent; 0 = unlimited
+
     /// Load from a JSON file. Returns true on success, false if file not found.
     /// Missing fields use defaults. CLI args override loaded values.
     bool LoadFromFile(const std::string& path);
