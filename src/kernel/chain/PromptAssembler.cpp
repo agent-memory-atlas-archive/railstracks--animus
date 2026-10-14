@@ -82,17 +82,19 @@ PromptAssemblyResult PromptAssembler::Build(
     }
 
     // 3. Session history
-    // #133: block-level attribution headers — speaker header fires when a
+    // #133/#179: block-level attribution — speaker block fires when a
     // user turn's author differs from the previous rendered turn's speaker;
-    // timestamp header fires when the time gap exceeds the threshold
+    // timestamp block fires when the time gap exceeds the threshold
     // (10 min). Assistant/tool/system turns are agent-native: no speaker
-    // header, but they still anchor time on long gaps.
+    // block, but they still anchor time on long gaps. Metadata renders as a
+    // delimited block (Author/Timestamp/====) so channel metadata never
+    // shares a line with message text.
     auto stampMs = [](std::uint64_t ms) -> std::string {
         std::time_t secs = static_cast<std::time_t>(ms / 1000);
         std::tm tm{};
         gmtime_r(&secs, &tm);
-        char buf[24];
-        std::snprintf(buf, sizeof(buf), "[%04d-%02d-%02d %02d:%02d]",
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d",
                       tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                       tm.tm_hour, tm.tm_min);
         return std::string(buf);
@@ -109,15 +111,18 @@ PromptAssemblyResult PromptAssembler::Build(
         // thinking_content is a display-only property — never sent to the LLM.
         if (turn.content.empty() && turn.tool_calls.empty()) continue;
 
-        // #133: attribution header (speaker on change, timestamp on gap)
+        // #179: attribution metadata block (speaker on change, timestamp on
+        // gap). Author line only on attributed turns — no empty Author line
+        // for author-less gap anchors (honest absence, #73/#133 convention).
         const bool attributedUser =
             (turn.role == "user" && !turn.author.empty());
         std::string header;
         if (attributedUser && turn.author != lastSpeaker) {
-            header = stampMs(turn.unix_ms) + " " + turn.author + ":";
+            header = "Author: " + turn.author + "\nTimestamp: " +
+                     stampMs(turn.unix_ms) + "\n====";
         } else if (lastRenderedMs != 0 && turn.unix_ms != 0 &&
                    turn.unix_ms > lastRenderedMs + kAttributionGapMs) {
-            header = stampMs(turn.unix_ms);
+            header = "Timestamp: " + stampMs(turn.unix_ms) + "\n====";
         }
         if (!header.empty()) {
             header += "\n";
