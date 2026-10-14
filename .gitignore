@@ -53,3 +53,5 @@ models/
 memory.db
 state/sops/
 .dev-admin-token
+api-vault.key
+/sops/
