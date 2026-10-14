@@ -149,6 +149,15 @@ struct AgentModelConfig {
         std::string modelContextSizesPath;  // static fallback table (configDir/model_context_sizes.json)
     };
 
+    // #176: task-run listing defaults. taskRunListLimit governs the page
+    // size for TaskRunStore listings when a caller passes no explicit
+    // limit (admin runs route). 0 = no limit (unlimited); > 0 = default
+    // page size. Explicit caller limits are always honored (the former
+    // 500 hard cap is removed).
+    struct SchedulerConfig {
+        int taskRunListLimit{0};
+    };
+
     struct WebConfig {
         // URL allowlist for HTTP tool (glob patterns).
         // If non-empty, only URLs matching these patterns are allowed.
@@ -261,6 +270,7 @@ struct AgentModelConfig {
     FileConfig file{};
     ShellConfig shell{};
     SearchConfig search{};
+    SchedulerConfig scheduler{};  // #176 task-run list default (0 = unlimited)
     std::vector<StoredLinkConfig> stored_links{};
     std::vector<RssFeedConfig> rss_feeds{};
     std::vector<InterfaceModuleInfo> interfaceModules{};
@@ -268,6 +278,14 @@ struct AgentModelConfig {
     // Storage backend configuration
     std::string storage_backend{"sqlite"};  // "sqlite" or "postgresql"
     std::string sqlite_path;  // resolved from dataDir / "memory.db"
+    // #96: real "explicitly set" detection. CLI flags set these;
+    // DatabaseConfig::ApplyTo (db.json) never overrides an explicit value.
+    // Replaces sentinel comparison — the old check compared sqlite_path
+    // against "state/memory.db", a literal ResolvePaths had already
+    // replaced with <dataDir>/memory.db, so db.json's sqlite.path was
+    // silently ignored.
+    bool storage_backend_explicit{false};
+    bool sqlite_path_explicit{false};
 
     // PostgreSQL configuration (used when storage_backend == "postgresql")
     std::string pg_host{"localhost"};
@@ -287,6 +305,9 @@ struct AgentModelConfig {
 
     // Lua filesystem loading
     std::string lua_script_dir;  // resolved from dataDir / "lua"
+    // #143: image-baked pristine defaults root (env ANIMUS_LUA_STAGING_DIR).
+    // Empty = boot-time _shared volume heal disabled (dev/bare builds).
+    std::string lua_staging_dir;
     bool lua_load_from_db{true};               // also load from DB (backward compat)
     bool lua_filesystem_overrides_db{true};    // filesystem scripts override DB on name conflict
 

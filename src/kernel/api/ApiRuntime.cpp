@@ -700,18 +700,49 @@ int OsTime(lua_State* L) {
 }
 
 int OsDate(lua_State* L) {
-    time_t t = ::time(nullptr);
+    // #119: stock os.date(fmt [, t]) semantics — the optional numeric time
+    // argument is the instant to format (default: now). Previously ignored;
+    // every call formatted wall-clock.
+    time_t t = static_cast<time_t>(luaL_optinteger(
+        L, 2, static_cast<lua_Integer>(::time(nullptr))));
     struct tm tmv{};
-    gmtime_r(&t, &tmv);
+    gmtime_r(&t, &tmv);  // sandbox os.date is always UTC
     char buf[64];
     const char* fmt = luaL_optstring(L, 1, "%Y-%m-%dT%H:%M:%SZ");
-    // support the common subset; anything else falls back to ISO
-    if (std::strpbrk(fmt, "%aAbBcCxXeFgGHIjklmnOpPrRsStTuUvVwWyYzZ+") != nullptr &&
-        std::strcmp(fmt, "%Y-%m-%dT%H:%M:%SZ") != 0 &&
-        std::strcmp(fmt, "!%Y-%m-%dT%H:%M:%SZ") != 0) {
-        fmt = "%Y-%m-%dT%H:%M:%SZ";
+
+    // Leading '!' is Lua's UTC flag — accept and strip it (we are always
+    // UTC), never pass it through to strftime, which would emit it literally.
+    std::string f = fmt;
+    if (!f.empty() && f.front() == '!') f.erase(0, 1);
+    if (f.empty()) f = "%Y-%m-%dT%H:%M:%SZ";
+
+    // Deterministic-output contract (docs/api/SANDBOX.md): allow the
+    // locale-independent subset %Y %m %d %H %M %S %F %T %j, %%, and literal
+    // runs of [A-Za-z0-9_.:/+-] plus space. Anything locale-dependent or
+    // exotic (%a %A %b %B %c %x %X %p %Z, the *t table form, unsafe
+    // literals) falls back to the ISO default — safe formats are no longer
+    // silently rewritten (#119, pixellab field report).
+    bool safe = true;
+    for (std::size_t i = 0; i < f.size(); ++i) {
+        const char c = f[i];
+        if (c == '%') {
+            if (i + 1 >= f.size()) { safe = false; break; }
+            const char s = f[++i];
+            if (s != '%' && std::strchr("YmdHMSTFj", s) == nullptr) {
+                safe = false;
+                break;
+            }
+        } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                     (c >= 'A' && c <= 'Z') || c == '-' || c == '_' ||
+                     c == '.' || c == ':' || c == '/' || c == '+' ||
+                     c == ' ')) {
+            safe = false;
+            break;
+        }
     }
-    strftime(buf, sizeof(buf), fmt, &tmv);
+    if (!safe) f = "%Y-%m-%dT%H:%M:%SZ";
+
+    strftime(buf, sizeof(buf), f.c_str(), &tmv);
     lua_pushstring(L, buf);
     return 1;
 }

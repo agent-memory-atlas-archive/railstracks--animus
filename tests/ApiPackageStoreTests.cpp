@@ -261,6 +261,53 @@ const char* kAlpacaManifest = R"({
   ]
 })";
 
+// #97: changed-manifest variant — version bump + a fourth command, so the
+// upgrade-in-place path is asserted against real row replacement (commands
+// 3 -> 4, meta v0.1.0 -> v0.2.0), not just identical re-install.
+const char* kAlpacaManifestV2 = R"({
+  "kind": "api_package",
+  "name": "alpaca",
+  "version": "0.2.0",
+  "description": "Alpaca paper + live trading API v2",
+  "keywords": ["trading", "stocks"],
+  "state_schema": {
+    "token":    {"type": "string", "secret": true},
+    "base_url": {"type": "string", "default": "https://api.alpaca.markets"}
+  },
+  "commands": [
+    {
+      "name": "token set", "kind": "action",
+      "description": "Store the Alpaca API token",
+      "parameters": {"token": {"type": "string", "required": true, "secret": true}},
+      "script": "function run(ctx) ctx.package.set_state('token', ctx.args.token) return {output='Token stored.'} end"
+    },
+    {
+      "name": "portfolio list", "kind": "action",
+      "description": "List current positions",
+      "request": {"method": "GET", "url": "{{state.base_url}}/v2/positions"},
+      "script": "function run(ctx) return {output='ok'} end"
+    },
+    {
+      "name": "account get", "kind": "action",
+      "description": "Fetch account details",
+      "request": {"method": "GET", "url": "{{state.base_url}}/v2/account"},
+      "script": "function run(ctx) return {output='ok'} end"
+    },
+    {
+      "name": "on ticker", "kind": "hook", "event": "on_message",
+      "description": "Handle stream ticks",
+      "script": "function run(ctx) return {output='tick'} end"
+    }
+  ],
+  "connections": [
+    {
+      "name": "stream", "type": "websocket",
+      "url_template": "wss://stream.data.alpaca.markets/v2/iex",
+      "hooks": {"on_connect": "token set", "on_message": "on ticker"}
+    }
+  ]
+})";
+
 int TestManifestInstall() {
     std::cerr << "  [store] manifest v1 install (happy path + lint rejects)...\n";
     const std::string path = MakeTempDbPath();
@@ -286,6 +333,35 @@ int TestManifestInstall() {
             ApiPackage again = store.InstallFromManifest(kAlpacaManifest);
             Assert(again.id == p.id, "identical reinstall upgrades in place");
             Assert(again.enabled, "enabled flag survives reinstall");
+        }
+
+        // #97: changed-manifest upgrade — meta/commands replaced, operator
+        // state + enabled flag preserved (the db84ef3 contract end to end).
+        {
+            store.SetPackageState(p.id, "{\"token\":\"op-owned\"}");
+            ApiPackage up = store.InstallFromManifest(kAlpacaManifestV2);
+            Assert(up.version == "0.2.0", "upgrade replaces meta (version)");
+            Assert(store.ListCommands(up.id).size() == 4, "upgrade replaces commands (3 -> 4)");
+            Assert(up.enabled, "enabled survives upgrade");
+            Assert(store.GetPackage(up.id)->state.find("op-owned") != std::string::npos,
+                   "operator state survives upgrade");
+        }
+
+        // #97: local modifications refuse registry upgrade — actionable
+        // error, package left intact (never clobbered silently).
+        {
+            auto got = store.GetPackage(p.id);
+            got->locally_modified = true;
+            Assert(store.UpdatePackageMeta(*got), "flag local modifications");
+            bool refused = false;
+            try { store.InstallFromManifest(kAlpacaManifest); }
+            catch (const std::runtime_error& e) {
+                const std::string what = e.what();
+                refused = what.find("local modifications") != std::string::npos
+                          && what.find("delete and reinstall") != std::string::npos;
+            }
+            Assert(refused, "locally-modified upgrade refused with actionable error");
+            Assert(store.GetPackage(p.id).has_value(), "refusal does not clobber the package");
         }
 
         // #126: writes_gated manifest field — bool lint + row round-trip

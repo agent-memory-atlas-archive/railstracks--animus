@@ -893,6 +893,36 @@ int TestSandboxGlobals() {
     return 0;
 }
 
+int TestOsDate() {
+    std::cerr << "  [runtime] os.date format subset, time arg, '!' handling (#119)...\n";
+    Fixture fx;
+    // t=0 (epoch) makes every expectation hand-checkable: 1970-01-01T00:00:00Z.
+    std::string extra = R"({"name": "osdate", "kind": "action", "description": "d",
+        "script": "function run(ctx) local r = {} r.iso = os.date('%Y-%m-%dT%H:%M:%SZ', 0) r.utc = os.date('!%Y-%m-%dT%H:%M:%SZ', 0) r.compact = os.date('!%Y%m%d-%H%M%S', 0) r.dateonly = os.date('%F', 0) r.mixed = os.date('run_%F-%H', 0) r.year = os.date('%Y', 0) r.locale = os.date('%A', 0) r.table = os.date('*t', 0) r.space = os.date('%Y %j', 0) return {output='ok', data=r} end"})";
+    InstallFixturePkg(fx, extra);
+    auto r = fx.runtime->ExecuteAction("testpkg", "osdate", "agent", Json::Value());
+    Assert(r["success"].asBool(), "osdate script runs");
+    Assert(r["data"]["iso"].asString() == "1970-01-01T00:00:00Z",
+           "blessed ISO format formats the given instant");
+    Assert(r["data"]["utc"].asString() == "1970-01-01T00:00:00Z",
+           "leading ! stripped, never emitted");
+    Assert(r["data"]["compact"].asString() == "19700101-000000",
+           "compact format passes through (the pixellab case)");
+    Assert(r["data"]["compact"].asString().find(":") == std::string::npos,
+           "no colons when not asked for");
+    Assert(r["data"]["dateonly"].asString() == "1970-01-01", "%F passes through");
+    Assert(r["data"]["mixed"].asString() == "run_1970-01-01-00",
+           "literal runs mix with specifiers");
+    Assert(r["data"]["year"].asString() == "1970", "%Y honors the time arg");
+    Assert(r["data"]["locale"].asString() == "1970-01-01T00:00:00Z",
+           "locale-dependent %A falls back to ISO");
+    Assert(r["data"]["table"].asString() == "1970-01-01T00:00:00Z",
+           "table form *t falls back to ISO (unsupported)");
+    Assert(r["data"]["space"].asString() == "1970 001",
+           "space literal allowed, %j zero-padded day-of-year");
+    return 0;
+}
+
 int TestFsAndHttpBudget() {
     std::cerr << "  [runtime] ctx.fs quota + http budget cap...\n";
     Fixture fx;
@@ -1254,6 +1284,7 @@ int main() {
     TestSandboxStateAndSecrets();
     TestEgressControl();
     TestSandboxGlobals();
+    TestOsDate();
     TestFsAndHttpBudget();
     TestHookContext();
     TestFilesResultPaths();

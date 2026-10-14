@@ -377,7 +377,6 @@ add_library(animus_kernel
   src/kernel/data/IdRanges.cpp
   src/kernel/data/SyncStore.cpp
   src/kernel/PeerSyncService.cpp
-  src/kernel/social/SocialEventPoller.cpp
   src/kernel/social/TelegramBotApi.cpp
   src/kernel/ChannelManager.cpp
   src/kernel/MessageQueue.cpp
@@ -411,6 +410,7 @@ add_library(animus_kernel
   src/kernel/lua/LuaToolHandler.cpp
   src/kernel/lua/ScriptStore.cpp
   src/kernel/lua/FilesystemScriptLoader.cpp
+  src/kernel/lua/SharedScriptHealer.cpp
   src/kernel/AgentConfigStore.cpp
   src/kernel/llm/CohereToolCallAccumulator.cpp
   src/kernel/llm/SSEToolCallAccumulator.cpp
@@ -815,6 +815,15 @@ if(ANIMUS_BUILD_TESTS)
     )
     add_test(NAME ApiPackageStoreTests COMMAND animus_api_package_store_tests)
 
+    add_executable(animus_database_config_tests
+      tests/DatabaseConfigTests.cpp
+    )
+    target_link_libraries(animus_database_config_tests PRIVATE animus_kernel)
+    set_target_properties(animus_database_config_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME DatabaseConfigTests COMMAND animus_database_config_tests)
+
     add_executable(animus_registry_client_tests
       tests/RegistryClientTests.cpp
     )
@@ -911,6 +920,19 @@ if(ANIMUS_BUILD_TESTS)
     )
     add_test(NAME LuaTests COMMAND animus_lua_tests)
 
+    add_executable(animus_healer_tests
+      tests/SharedScriptHealerTests.cpp
+    )
+    target_link_libraries(animus_healer_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_healer_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_healer_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME SharedScriptHealerTests COMMAND animus_healer_tests)
+
     add_executable(animus_social_tool_tests
       tests/ChannelsToolTests.cpp
     )
@@ -949,6 +971,19 @@ if(ANIMUS_BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
     )
     add_test(NAME ChannelHelpersTests COMMAND animus_channel_helpers_tests)
+
+    add_executable(animus_channel_manager_tests
+      tests/ChannelManagerTests.cpp
+    )
+    target_link_libraries(animus_channel_manager_tests PRIVATE animus_kernel jsoncpp_lib)
+    target_include_directories(animus_channel_manager_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${JSONCPP_INCLUDE_DIRS}
+    )
+    set_target_properties(animus_channel_manager_tests PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    )
+    add_test(NAME ChannelManagerTests COMMAND animus_channel_manager_tests)
 
     add_executable(animus_signal_protocol_tests
       tests/SignalProtocolTests.cpp

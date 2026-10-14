@@ -306,6 +306,13 @@ bool ScheduleStore::Delete(const std::string& id, std::string* error) {
     }
     stmt->BindText(1, id);
     stmt->ExecDML();
+    // #164: deleting a nonexistent schedule is a failure, not a silent
+    // no-op success — unconditional true hid typos in ids and made the
+    // tool-level cancel path report success for unknown schedules.
+    if (m_store->Changes() == 0) {
+        if (error) *error = "schedule not found: " + id;
+        return false;
+    }
     return true;
 }
 

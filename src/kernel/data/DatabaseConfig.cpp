@@ -54,6 +54,12 @@ bool DatabaseConfig::LoadFromFile(const std::string& path) {
             leaseGraceMs = nd["lease_grace_ms"].asUInt64();
         }
     }
+    if (root.isMember("scheduler")) {
+        const Json::Value& sc = root["scheduler"];
+        if (sc.isMember("task_run_list_limit")) {
+            schedulerTaskRunListLimit = sc["task_run_list_limit"].asInt();
+        }
+    }
     if (root.isMember("postgresql")) {
         const auto& pg = root["postgresql"];
         if (pg.isMember("host"))      pgHost = pg["host"].asString();
@@ -70,13 +76,20 @@ bool DatabaseConfig::LoadFromFile(const std::string& path) {
 }
 
 void DatabaseConfig::ApplyTo(KernelConfig& config) const {
-    // Only apply if the config still has defaults — CLI args take precedence.
-    // We detect "unset" by checking if the value still matches the KernelConfig default.
-    // For backend: default is "sqlite"
-    if (config.storage_backend == "sqlite" && backend != "sqlite") {
+    // Only apply values that were not explicitly set — CLI args take
+    // precedence. #96: "unset" detection is the *_explicit flags set by the
+    // CLI parser. The previous sentinel compared sqlite_path against the
+    // literal "state/memory.db", which ResolvePaths (main.cpp) had already
+    // replaced with the resolved <dataDir>/memory.db path before ApplyTo
+    // ran — the guard could never match, so db.json's sqlite.path was
+    // silently ignored. The db.json-side comparison (sqlitePath !=
+    // "state/memory.db") remains: LoadFromFile only overwrites the field
+    // when the key exists, so a differing value means "the file actually
+    // specified a path".
+    if (!config.storage_backend_explicit && backend != "sqlite") {
         config.storage_backend = backend;
     }
-    if (config.sqlite_path == "state/memory.db" && sqlitePath != "state/memory.db") {
+    if (!config.sqlite_path_explicit && sqlitePath != "state/memory.db") {
         config.sqlite_path = sqlitePath;
     }
     if (config.pg_host == "localhost" && pgHost != "localhost") {
@@ -109,6 +122,11 @@ void DatabaseConfig::ApplyTo(KernelConfig& config) const {
         if (config.node.leaseGraceMs == 30000 && leaseGraceMs != 30000) {
             config.node.leaseGraceMs = leaseGraceMs;
         }
+    }
+    // #176: -1 sentinel = key absent (0 is a valid value = unlimited);
+    // KernelConfig default stands when the key is missing.
+    if (schedulerTaskRunListLimit >= 0) {
+        config.scheduler.taskRunListLimit = schedulerTaskRunListLimit;
     }
 }
 

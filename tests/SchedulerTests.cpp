@@ -72,7 +72,7 @@ int TestStoreCreateAndGet() {
 
     auto sched = MakeOneShot("agent1", "2026-05-10T09:00:00Z", "wake up");
     std::string err;
-    Assert(store.Create(sched, &err), "Create failed: " + err);
+    Assert(!store.CreateAndReturnId(sched, &err).empty(), "Create failed: " + err);
 
     // Verify ID was generated
     Assert(!sched.id.empty(), "ID should be auto-generated");
@@ -127,7 +127,7 @@ int TestStoreDelete() {
 
     auto sched = MakeOneShot("agent1", "2026-05-10T09:00:00Z");
     std::string err;
-    store.Create(sched, &err);
+    store.CreateAndReturnId(sched, &err);
 
     Assert(store.Delete(sched.id, &err), "Delete should succeed");
     Assert(!store.Get(sched.id).has_value(), "Get after delete should return nullopt");
@@ -145,7 +145,7 @@ int TestStoreUpdate() {
 
     auto sched = MakeOneShot("agent1", "2026-05-10T09:00:00Z", "original");
     std::string err;
-    store.Create(sched, &err);
+    store.CreateAndReturnId(sched, &err);
 
     // Update: disable it and change message
     sched.message = "updated";
@@ -476,6 +476,54 @@ int TestTaskRunStoreBasics() {
     return 0;
 }
 
+int TestTaskRunListLimits() {
+    std::cerr << "  [TaskRun] #176 configurable list limits...\n";
+    auto dbPath = MakeTempDbPath();
+    SqliteDataStore dataStore(dbPath);
+    TaskRunStore runs(&dataStore);
+    runs.EnsureSchema();
+
+    // 60 for sched-a (old default capped at 50), 20 for sched-b,
+    // 505 for sched-c (old hard clamp capped ListRecent at 500).
+    for (int i = 0; i < 60; ++i)
+        Assert(runs.TryClaim("a@" + std::to_string(i), "sched-a", "agent1",
+                             "w" + std::to_string(i), 1000 + i), "claim a");
+    for (int i = 0; i < 20; ++i)
+        Assert(runs.TryClaim("b@" + std::to_string(i), "sched-b", "agent2",
+                             "w" + std::to_string(i), 2000 + i), "claim b");
+    for (int i = 0; i < 505; ++i)
+        Assert(runs.TryClaim("c@" + std::to_string(i), "sched-c", "agent3",
+                             "w" + std::to_string(i), 3000 + i), "claim c");
+
+    // Default config (0): omitted limit (-1) = unlimited
+    Assert(runs.ListForSchedule("sched-a", -1).size() == 60,
+           "default 0 = no limit");
+    Assert(runs.ListRecent("", -1).size() == 585,
+           "recent default 0 = no limit");
+    Assert(runs.ListForSchedule("sched-a", 0).size() == 60,
+           "explicit 0 = unlimited");
+
+    // Configured default binds when the caller omits a limit
+    runs.SetDefaultListLimit(25);
+    Assert(runs.ListForSchedule("sched-a", -1).size() == 25,
+           "configured default binds");
+    Assert(runs.ListRecent("", -1).size() == 25,
+           "configured default binds (recent)");
+
+    // Explicit limits always win over the configured default
+    Assert(runs.ListForSchedule("sched-a", 10).size() == 10,
+           "explicit beats configured default");
+    Assert(runs.ListForSchedule("sched-a", 0).size() == 60,
+           "explicit 0 stays unlimited with config set");
+
+    // Old 500 hard clamp is gone
+    Assert(runs.ListRecent("", 1000).size() == 585,
+           "hard clamp removed: explicit 1000 returns all 585");
+
+    std::filesystem::remove(dbPath);
+    return 0;
+}
+
 int TestSchedulerTaskRunRecording() {
     std::cerr << "  [TaskRun] Scheduler records fire outcomes...\n";
     auto dbPath = MakeTempDbPath();
@@ -779,6 +827,7 @@ int main() {
     // TaskRun tests (#78)
     std::cerr << "\n-- TaskRun (#78) --\n";
     TestTaskRunStoreBasics();
+    TestTaskRunListLimits();
     TestSchedulerTaskRunRecording();
     TestSchedulerCrashReplayNoDoubleFire();
 

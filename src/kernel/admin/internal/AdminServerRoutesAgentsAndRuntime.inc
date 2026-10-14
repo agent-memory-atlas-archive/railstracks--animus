@@ -345,7 +345,9 @@
 
                 const std::string scheduleId = std::string(req->getParameter("schedule_id"));
                 const std::string agentId = std::string(req->getParameter("agent_id"));
-                int limit = 50;
+                // #176: -1 = scheduler default (scheduler.task_run_list_limit,
+                // where 0 = unlimited); an explicit ?limit= always wins.
+                int limit = -1;
                 try {
                     const std::string limitParam = std::string(req->getParameter("limit"));
                     if (!limitParam.empty()) limit = std::stoi(limitParam);

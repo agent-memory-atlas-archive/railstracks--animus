@@ -346,6 +346,102 @@ end
 -- Action implementations
 -- ---------------------------------------------------------------------------
 
+--- Split text into chunks of at most `limit` bytes, breaking at natural
+--- boundaries (paragraph > line > word > hard cut). When a break lands
+--- inside an open ``` fence, the chunk closes it and the next chunk reopens
+--- it, so rendered code blocks survive reassembly (#30).
+local function split_for_limit(text, limit)
+    limit = limit or 2000
+    if limit < 16 then limit = 16 end
+    if #text <= limit then return { text } end
+
+    local budget = limit - 8  -- reserve ``` close+reopen headroom
+    local chunks, pos, fence_open = {}, 1, false
+
+    local function count_fences(s)
+        local n, i = 0, 1
+        while true do
+            local f = s:find("```", i, true)
+            if not f then break end
+            n = n + 1
+            i = f + 3
+        end
+        return n
+    end
+
+    while pos <= #text do
+        local cap = fence_open and (budget - 4) or budget
+        local endp = pos + cap - 1
+        if endp > #text then endp = #text end
+
+        local brk
+        if endp >= #text then
+            brk = #text + 1
+        else
+            -- +2 so a paragraph boundary straddling the window edge is found
+            local window = text:sub(pos, endp + 2)
+            local m = window:match(".*\n\n") or window:match(".*\n") or window:match(".* ")
+            if m and #m > 0 then
+                brk = pos + #m
+            else
+                brk = endp + 1
+            end
+            if brk > endp + 3 then brk = endp + 1 end
+        end
+        if brk <= pos then brk = pos + 1 end
+
+        local body = text:sub(pos, brk - 1)
+        local fences = count_fences(body)
+        local open_after = (fences % 2 == 1) ~= fence_open
+        local is_last = brk > #text
+
+        -- Opener-straddle guard: if the body ends with a fence opener line
+        -- (``` plus optional language tag plus newline, no content after it),
+        -- pull the break back so the fence starts whole in the next chunk; if
+        -- the opener sits at the body start, extend to the full cap instead.
+        local function opener_tail(s)
+            local f = s:match("```([^`]*)$")
+            if f == nil then return false end
+            return f == "" or (f:sub(-1) == "\n" and f:sub(1, -2):find("\n") == nil)
+        end
+
+        if open_after and not is_last and opener_tail(body) then
+            local ms, me = body:find("```[^`]*$")
+            if ms then
+                if ms > 1 then
+                    local before = body:sub(1, ms - 1)
+                    local nl = before:match(".*\n")
+                    local cutpos = nl and #nl or 0
+                    if cutpos > 0 then
+                        brk = pos + cutpos
+                        body = text:sub(pos, brk - 1)
+                    else
+                        brk = endp + 1
+                        body = text:sub(pos, brk - 1)
+                    end
+                else
+                    brk = endp + 1
+                    body = text:sub(pos, brk - 1)
+                end
+                fences = count_fences(body)
+                open_after = (fences % 2 == 1) ~= fence_open
+            end
+        end
+        pos = brk
+
+        local chunk = fence_open and ("```\n" .. body) or body
+        is_last = pos > #text
+        if open_after and not is_last then
+            chunk = chunk .. "\n```"
+            fence_open = true
+        else
+            fence_open = open_after
+        end
+        chunks[#chunks + 1] = chunk
+    end
+    return chunks
+end
+
 --- POST /channels/{channel_id}/messages
 local function do_post(args)
     local platform_id = args.platform_id
@@ -358,29 +454,41 @@ local function do_post(args)
     if not content or content == "" then
         return { success = false, error = "content is required" }
     end
-    if #content > 2000 then
-        content = content:sub(1, 1997) .. "..."
-        log.warn("[discord] message truncated to 2000 chars for channel " .. channel_id)
+
+    -- Auto-split at natural boundaries instead of truncating: the yielded
+    -- text is the contract with the reader (#30).
+    local chunks = split_for_limit(content, 2000)
+    local first_id
+    for idx, chunk in ipairs(chunks) do
+        local body = { content = chunk }
+        if args.embeds and idx == 1 then body.embeds = args.embeds end
+
+        local resp = auth_post(platform_id, "/channels/" .. channel_id .. "/messages", body)
+
+        if resp.status ~= 200 and resp.status ~= 201 then
+            return {
+                success = false,
+                error = "post failed (" .. tostring(resp.status) .. ") on chunk "
+                    .. tostring(idx) .. "/" .. tostring(#chunks) .. ": "
+                    .. truncate(tostring(resp.body), 500)
+                    .. (idx > 1 and (" (" .. tostring(idx - 1) .. " chunk(s) already delivered)") or "")
+            }
+        end
+
+        local data = json_decode_safe(resp.body)
+        if not first_id and data and data.id then first_id = data.id end
     end
 
-    local body = { content = content }
-    if args.embeds then body.embeds = args.embeds end
-
-    local resp = auth_post(platform_id, "/channels/" .. channel_id .. "/messages", body)
-
-    if resp.status == 200 or resp.status == 201 then
-        local data = json_decode_safe(resp.body)
-        return {
-            success = true,
-            message_id = data and data.id,
-            channel_id = channel_id,
-            output = "Message sent to channel " .. channel_id
-        }
+    if #chunks > 1 then
+        log.info("[discord] message auto-split into " .. tostring(#chunks) .. " chunks for channel " .. channel_id)
     end
 
     return {
-        success = false,
-        error = "post failed (" .. tostring(resp.status) .. "): " .. truncate(tostring(resp.body), 500)
+        success = true,
+        message_id = first_id,
+        channel_id = channel_id,
+        output = "Message sent to channel " .. channel_id
+            .. (#chunks > 1 and (" (" .. tostring(#chunks) .. " chunks)") or "")
     }
 end
 
@@ -400,33 +508,46 @@ local function do_reply(args)
     if not content or content == "" then
         return { success = false, error = "content is required" }
     end
-    if #content > 2000 then
-        content = content:sub(1, 1997) .. "..."
+
+    -- Auto-split at natural boundaries instead of truncating (#30). The
+    -- first chunk carries the reply reference; the rest follow in-channel.
+    local chunks = split_for_limit(content, 2000)
+    local first_id
+    for idx, chunk in ipairs(chunks) do
+        local body = { content = chunk }
+        if idx == 1 then
+            body.message_reference = {
+                message_id = message_id,
+                channel_id = channel_id
+            }
+        end
+
+        local resp = auth_post(platform_id, "/channels/" .. channel_id .. "/messages", body)
+
+        if resp.status ~= 200 and resp.status ~= 201 then
+            return {
+                success = false,
+                error = "reply failed (" .. tostring(resp.status) .. ") on chunk "
+                    .. tostring(idx) .. "/" .. tostring(#chunks) .. ": "
+                    .. truncate(tostring(resp.body), 500)
+                    .. (idx > 1 and (" (" .. tostring(idx - 1) .. " chunk(s) already delivered)") or "")
+            }
+        end
+
+        local data = json_decode_safe(resp.body)
+        if not first_id and data and data.id then first_id = data.id end
     end
 
-    local body = {
-        content = content,
-        message_reference = {
-            message_id = message_id,
-            channel_id = channel_id
-        }
-    }
-
-    local resp = auth_post(platform_id, "/channels/" .. channel_id .. "/messages", body)
-
-    if resp.status == 200 or resp.status == 201 then
-        local data = json_decode_safe(resp.body)
-        return {
-            success = true,
-            message_id = data and data.id,
-            channel_id = channel_id,
-            output = "Reply sent to message " .. message_id
-        }
+    if #chunks > 1 then
+        log.info("[discord] reply auto-split into " .. tostring(#chunks) .. " chunks for channel " .. channel_id)
     end
 
     return {
-        success = false,
-        error = "reply failed (" .. tostring(resp.status) .. "): " .. truncate(tostring(resp.body), 500)
+        success = true,
+        message_id = first_id,
+        channel_id = channel_id,
+        output = "Reply sent to message " .. message_id
+            .. (#chunks > 1 and (" (" .. tostring(#chunks) .. " chunks)") or "")
     }
 end
 
