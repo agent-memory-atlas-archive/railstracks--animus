@@ -274,9 +274,10 @@ public:
         // the auth layer so the context card can name the user. The
         // static-token and loopback paths above authorized the connection
         // without a user identity — those stay permitted (no regression)
-        // and simply carry an unauthenticated identity. When auth IS
-        // required and no user resolved, this is the loud-absence case the
-        // ticket asks to make visible.
+        // and simply carry an unauthenticated identity. Since #95 the
+        // gate rejects unauthenticated connections outright; when the
+        // warning below fires the connection IS authorized, just anonymous
+        // (static token or loopback opt-in).
         const std::string identityToken =
             ResolveIdentityToken(req, server->m_config.authToken);
         if (!identityToken.empty()) {
@@ -398,29 +399,53 @@ private:
     }
 
     static bool IsAuthorizedConnection(
-        const AdminServer& server,
+        AdminServer& server,
         const drogon::HttpRequestPtr& req,
         const drogon::WebSocketConnectionPtr& conn) {
-        if (server.m_config.authToken.empty()) {
+        auto& authManager = server.GetAuthManager();
+
+        // Open instance: neither a static token nor user auth is
+        // configured. Mirrors the REST middleware's early-out on
+        // !IsAuthRequired().
+        if (!authManager.IsAuthRequired()) {
             return true;
         }
 
-        const std::string providedToken = req->getParameter("token");
-        if (!providedToken.empty() && providedToken == server.m_config.authToken) {
+        // Token extraction — the same forms the REST path and the admin
+        // UI use: ?token= query param first (browser WS clients cannot set
+        // headers), then the Authorization: Bearer form.
+        std::string token = req->getParameter("token");
+        if (token.empty()) {
+            const std::string authHeader = req->getHeader("Authorization");
+            static const std::string kBearerPrefix = "Bearer ";
+            if (authHeader.rfind(kBearerPrefix, 0) == 0) {
+                token = authHeader.substr(kBearerPrefix.size());
+            }
+        }
+
+        // Single validation gate, identical to REST: ValidateToken accepts
+        // BOTH the static token and user session tokens, constant-time.
+        // (#95: the old gate admitted every connection whenever the static
+        // token was unset — including user-auth instances where the REST
+        // middleware would 401 — and compared tokens with ==.)
+        const auto [result, userId] = authManager.ValidateToken(token);
+        if (result == AuthResult::Ok || result == AuthResult::AuthNotRequired) {
+            if (conn) {
+                authManager.RecordSuccess(conn->peerAddr().toIp());
+            }
             return true;
         }
 
-        const std::string authHeader = req->getHeader("Authorization");
-        static const std::string kBearerPrefix = "Bearer ";
-        if (authHeader.rfind(kBearerPrefix, 0) == 0) {
-            const std::string token = authHeader.substr(kBearerPrefix.size());
-            if (!token.empty() && token == server.m_config.authToken) {
+        // Explicit operator opt-in for local tooling. Checked after token
+        // validation so permitted loopback clients never feed the limiter.
+        if (server.m_config.allowUnauthenticatedLocalhost && conn) {
+            if (IsLoopbackIp(conn->peerAddr().toIp())) {
                 return true;
             }
         }
 
-        if (server.m_config.allowUnauthenticatedLocalhost && conn) {
-            return IsLoopbackIp(conn->peerAddr().toIp());
+        if (conn) {
+            authManager.RecordFailure(conn->peerAddr().toIp());
         }
         return false;
     }

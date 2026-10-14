@@ -226,6 +226,12 @@
                     return;
                 }
 
+                // #95: the first user now exists — close the instance live.
+                // ConfigureAuth decides requireAuth at boot only; without
+                // this, first-run bootstrap on a token-less instance leaves
+                // the whole admin API (REST and WS) open after setup.
+                m_authManager.SetRequireAuth(true);
+
                 Json::Value body;
                 body["status"] = "ok";
                 body["username"] = username;
