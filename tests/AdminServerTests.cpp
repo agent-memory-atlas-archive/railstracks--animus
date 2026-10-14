@@ -504,6 +504,13 @@ int TestAdminServerAndAgentApi() {
         std::filesystem::remove("build/state/memory.db", ec);
         std::filesystem::remove("build/state/sessions.json", ec);
         std::filesystem::remove("build/state/sessions.json.migrated", ec);
+        // #163: the kernel's default datastore is CWD-relative "memory.db"
+        // (repo root when run from the build tree) — neither state/ nor
+        // build/state/. Unremoved, it persists across runs and shifts every
+        // session id / count assertion.
+        std::filesystem::remove("memory.db", ec);
+        std::filesystem::remove("memory.db-wal", ec);
+        std::filesystem::remove("memory.db-shm", ec);
     }
     std::filesystem::create_directories(cfgPath.parent_path());
 
@@ -620,7 +627,10 @@ int TestAdminServerAndAgentApi() {
       "default_model": "gpt-4.1-mini",
       "default_context_window": 128000,
       "auth_type": "api_key",
-      "concurrency": 1
+      "concurrency": 1,
+      "extra": {
+        "retry_max_attempts": "1"
+      }
     }
   }
 }
@@ -1556,6 +1566,12 @@ int TestAdminServerAndAgentApi() {
     s2t1.unix_ms = 1700000002000ULL;
     session2->AddTurn(s2t1);
 
+    // #163: AddTurn is in-memory; the DB-backed admin history endpoint
+    // only sees turns after a flush (same contract as production
+    // ChainRunner, which flushes after every chain run).
+    kernel.Sessions().FlushSession(session1->Id());
+    kernel.Sessions().FlushSession(session2->Id());
+
     {
         std::string body;
         int code = 0;
@@ -1574,9 +1590,23 @@ int TestAdminServerAndAgentApi() {
             kernel.Stop();
             return Fail(19, "GET /api/v1/sessions did not return 200");
         }
-        if (body.find("\"total\":2") == std::string::npos) {
+        // #163: the endpoint's contract is {"sessions":[...]} (consumed by
+        // admin-ui ActiveMemoryView) — there is no "total" field. Assert
+        // membership of the two sessions created above; exact-count
+        // assertions are fragile against background session creation
+        // (observed: ws_chat sessions from admin WS connections appear
+        // with message_count 0).
+        if (body.find("\"sessions\"") == std::string::npos) {
             kernel.Stop();
-            return Fail(20, "GET /api/v1/sessions total count mismatch");
+            return Fail(20, "GET /api/v1/sessions missing sessions array");
+        }
+        if (body.find("\"conversation_id\":\"C123\"") == std::string::npos) {
+            kernel.Stop();
+            return Fail(20, "GET /api/v1/sessions missing slack C123 session");
+        }
+        if (body.find("\"conversation_id\":\"global\"") == std::string::npos) {
+            kernel.Stop();
+            return Fail(20, "GET /api/v1/sessions missing cli global session");
         }
     }
 
@@ -1629,9 +1659,19 @@ int TestAdminServerAndAgentApi() {
             kernel.Stop();
             return Fail(26, "GET /api/v1/sessions/:id/history did not return 200");
         }
-        if (body.find("\"total\":2") == std::string::npos) {
+        // #163: sessions-history contract is {items:[...]} — no "total"
+        // field (that pattern belongs to the memory endpoints, whose
+        // handlers emit it). With limit=1, page 1 must contain ONLY the
+        // most-recent turn; the older turn must be absent. Check 28 below
+        // pins the content itself, so together they assert shape, limit,
+        // and ordering.
+        if (body.find("\"items\"") == std::string::npos) {
             kernel.Stop();
-            return Fail(27, "history total mismatch");
+            return Fail(27, "history response missing items array");
+        }
+        if (body.find("\"content\":\"hello from user\"") != std::string::npos) {
+            kernel.Stop();
+            return Fail(27, "history limit=1 returned both turns");
         }
         if (body.find("\"content\":\"assistant reply\"") == std::string::npos) {
             kernel.Stop();
@@ -1658,7 +1698,14 @@ int TestAdminServerAndAgentApi() {
             kernel.Stop();
             return Fail(30, "GET /api/v1/sessions/:id/context did not return 200");
         }
-        if (body.find("\"configured_token_budget_per_prompt\":200000") == std::string::npos) {
+        // #163: the context payload's budget block is token_budget_state
+        // (context_window / consumed_tokens / remaining_tokens), as consumed
+        // by admin-ui ChatView — configured_token_budget_per_prompt no
+        // longer exists anywhere in the kernel. context_window here is the
+        // kernel fallback (AgentKernel.cpp:1953, 128000) — this test kernel
+        // resolves no provider window.
+        if (body.find("\"token_budget_state\"") == std::string::npos
+            || body.find("\"context_window\":128000") == std::string::npos) {
             kernel.Stop();
             return Fail(31, "session context token budget payload mismatch");
         }
@@ -2057,7 +2104,41 @@ int TestAdminServerAndAgentApi() {
         }
     }
 
+    std::string chatAgentId;  // #163: id of the agent created for WS chat turns
     {
+        // #163: the WS chat turn resolves its target agent against the agent
+        // store ("default" when the payload carries no agent_id). This kernel
+        // boots with an empty agent store, so the turn died at resolution
+        // ("agent_id not found: default") with an error frame and no terminal
+        // done. Create an agent first and pass its generated id explicitly
+        // so the turn dispatches to the chain (loopback-refusal provider
+        // fixture) and the deterministic error/done flow this block asserts
+        // actually executes.
+        int agentCode = 0;
+        std::string agentBody;
+        if (!HttpRequest(
+                config.admin.host,
+                config.admin.port,
+                "POST",
+                "/api/v1/agents",
+                R"({"name":"ws-test","default_provider":"openai","default_model":"gpt-4.1-mini"})",
+                &agentCode,
+                &agentBody)) {
+            kernel.Stop();
+            return Fail(151, "failed to create agent for WS turn");
+        }
+        if (agentCode != 201) {
+            kernel.Stop();
+            return Fail(151, "POST /api/v1/agents did not return 201: " + agentBody);
+        }
+        std::smatch agentIdMatch;
+        const std::regex agentIdPattern("\"id\":\"([^\"]+)\"");
+        if (!std::regex_search(agentBody, agentIdMatch, agentIdPattern)) {
+            kernel.Stop();
+            return Fail(151, "agent create response missing id: " + agentBody);
+        }
+        chatAgentId = agentIdMatch[1].str();
+
         int wsFd = -1;
         std::string upgradeResponse;
         if (!ConnectWebSocket(
@@ -2082,17 +2163,33 @@ int TestAdminServerAndAgentApi() {
             return Fail(149, "did not receive sessions response over websocket");
         }
 
-        if (!SendWebSocketText(wsFd, R"({"type":"message","content":"Hello via websocket"})")) {
+        const std::string messagePayload =
+            std::string(R"({"type":"message","agent_id":")") + chatAgentId +
+            R"(","content":"Hello via websocket"})";
+        if (!SendWebSocketText(wsFd, messagePayload)) {
             ::close(wsFd);
             kernel.Stop();
             return Fail(150, "failed sending websocket message payload");
         }
 
+        // #163 correction: the WS context preamble IS emitted — assembled
+        // field-by-field at AdminServerWebSocketControllers.inc:217
+        // (contextMsg["type"] = "context"), which is why adjacent-literal
+        // source grep missed it. Runtime frame observation is the ground
+        // truth for protocol-emission claims. The HTTP context endpoint
+        // (check 31 above) carries the richer token_budget_state schema;
+        // this preamble carries layers/tools/session_id.
         std::string contextPayload;
         if (!WaitForWebSocketPayloadContaining(wsFd, "\"type\":\"context\"", 3000, &contextPayload)) {
             ::close(wsFd);
             kernel.Stop();
             return Fail(151, "did not receive context payload for websocket message");
+        }
+        if (contextPayload.find("\"layers\"") == std::string::npos
+            || contextPayload.find("\"session_id\"") == std::string::npos) {
+            ::close(wsFd);
+            kernel.Stop();
+            return Fail(151, "context payload missing layers/session_id: " + contextPayload);
         }
 
         std::string donePayload;
@@ -2288,7 +2385,8 @@ int TestAdminServerAndAgentApi() {
 
         const std::string triggerContent = "Obs-stream trigger message";
         const std::string triggerPayload =
-            std::string("{\"type\":\"message\",\"content\":\"") + triggerContent + "\"}";
+            std::string("{\"type\":\"message\",\"agent_id\":\"") + chatAgentId
+            + "\",\"content\":\"" + triggerContent + "\"}";
         if (!SendWebSocketText(wsTriggerFd, triggerPayload)) {
             closeIfOpen(obsFd1);
             closeIfOpen(obsFd2);
