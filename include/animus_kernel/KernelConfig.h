@@ -149,6 +149,15 @@ struct AgentModelConfig {
         std::string modelContextSizesPath;  // static fallback table (configDir/model_context_sizes.json)
     };
 
+    // #176: task-run listing defaults. taskRunListLimit governs the page
+    // size for TaskRunStore listings when a caller passes no explicit
+    // limit (admin runs route). 0 = no limit (unlimited); > 0 = default
+    // page size. Explicit caller limits are always honored (the former
+    // 500 hard cap is removed).
+    struct SchedulerConfig {
+        int taskRunListLimit{0};
+    };
+
     struct WebConfig {
         // URL allowlist for HTTP tool (glob patterns).
         // If non-empty, only URLs matching these patterns are allowed.
@@ -261,6 +270,7 @@ struct AgentModelConfig {
     FileConfig file{};
     ShellConfig shell{};
     SearchConfig search{};
+    SchedulerConfig scheduler{};  // #176 task-run list default (0 = unlimited)
     std::vector<StoredLinkConfig> stored_links{};
     std::vector<RssFeedConfig> rss_feeds{};
     std::vector<InterfaceModuleInfo> interfaceModules{};

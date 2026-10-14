@@ -54,6 +54,12 @@ bool DatabaseConfig::LoadFromFile(const std::string& path) {
             leaseGraceMs = nd["lease_grace_ms"].asUInt64();
         }
     }
+    if (root.isMember("scheduler")) {
+        const Json::Value& sc = root["scheduler"];
+        if (sc.isMember("task_run_list_limit")) {
+            schedulerTaskRunListLimit = sc["task_run_list_limit"].asInt();
+        }
+    }
     if (root.isMember("postgresql")) {
         const auto& pg = root["postgresql"];
         if (pg.isMember("host"))      pgHost = pg["host"].asString();
@@ -116,6 +122,11 @@ void DatabaseConfig::ApplyTo(KernelConfig& config) const {
         if (config.node.leaseGraceMs == 30000 && leaseGraceMs != 30000) {
             config.node.leaseGraceMs = leaseGraceMs;
         }
+    }
+    // #176: -1 sentinel = key absent (0 is a valid value = unlimited);
+    // KernelConfig default stands when the key is missing.
+    if (schedulerTaskRunListLimit >= 0) {
+        config.scheduler.taskRunListLimit = schedulerTaskRunListLimit;
     }
 }
 

@@ -90,6 +90,9 @@ public:
     // #78 P2a: identity recorded on every task_run claim row (who ran it).
     // Empty = single-node/legacy (stays '').
     void SetNodeId(const std::string& id) { m_nodeId = id; }
+    // #176: default page size for RunStore() listings (limit < 0 callers).
+    // 0 = unlimited. Fed from kernel config scheduler.task_run_list_limit.
+    void SetRunListDefaultLimit(int limit) { m_runStore.SetDefaultListLimit(limit); }
     void SetMaxSchedulesPerAgent(uint32_t limit);
     void SetFireCallback(FireCallback cb);
 

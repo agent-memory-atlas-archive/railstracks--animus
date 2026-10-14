@@ -728,6 +728,8 @@ bool AgentKernel::Start(const KernelConfig& config, std::string* error) {
             static_cast<int64_t>(m_config.node.leaseTtlMs));
         m_scheduler->SetLeaseGraceMs(
             static_cast<int64_t>(m_config.node.leaseGraceMs));
+        // #176: task-run listing default (0 = unlimited)
+        m_scheduler->SetRunListDefaultLimit(m_config.scheduler.taskRunListLimit);
         // #78 P2b: wire the lease acker to the peer layer (no-op when
         // single-node — PeerSyncService won't exist).
         if (m_peerSyncService) {
