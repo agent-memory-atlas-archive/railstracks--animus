@@ -72,7 +72,7 @@ int TestStoreCreateAndGet() {
 
     auto sched = MakeOneShot("agent1", "2026-05-10T09:00:00Z", "wake up");
     std::string err;
-    Assert(store.Create(sched, &err), "Create failed: " + err);
+    Assert(!store.CreateAndReturnId(sched, &err).empty(), "Create failed: " + err);
 
     // Verify ID was generated
     Assert(!sched.id.empty(), "ID should be auto-generated");
@@ -127,7 +127,7 @@ int TestStoreDelete() {
 
     auto sched = MakeOneShot("agent1", "2026-05-10T09:00:00Z");
     std::string err;
-    store.Create(sched, &err);
+    store.CreateAndReturnId(sched, &err);
 
     Assert(store.Delete(sched.id, &err), "Delete should succeed");
     Assert(!store.Get(sched.id).has_value(), "Get after delete should return nullopt");
@@ -145,7 +145,7 @@ int TestStoreUpdate() {
 
     auto sched = MakeOneShot("agent1", "2026-05-10T09:00:00Z", "original");
     std::string err;
-    store.Create(sched, &err);
+    store.CreateAndReturnId(sched, &err);
 
     // Update: disable it and change message
     sched.message = "updated";
