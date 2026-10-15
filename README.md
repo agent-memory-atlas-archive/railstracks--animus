@@ -8,7 +8,8 @@ Animus is a **C++ agent framework** — a modular, efficient runtime for AI agen
 
 **🌐 Website:** [animus.steadyfort.com](https://animus.steadyfort.com/)  
 **💬 Discord:** [Join the community](https://discord.gg/ruRk76M93n)  
-**🧩 VSCode Extension:** [Animus IDE](https://marketplace.visualstudio.com/items?itemName=artificers.animus-ide)
+**🧩 VSCode Extension:** [Animus IDE](https://marketplace.visualstudio.com/items?itemName=artificers.animus-ide)  
+**🐳 Docker Images:** [animus](https://hub.docker.com/r/mrsommer/animus) · [animus-sudo](https://hub.docker.com/r/mrsommer/animus-sudo) · [animus-node](https://hub.docker.com/r/mrsommer/animus-node)
 
 ## Why Animus
 
@@ -24,7 +25,7 @@ Animus is a **C++ agent framework** — a modular, efficient runtime for AI agen
 
 ## Current Status
 
-**v0.4.1** — Active development. Core kernel, admin server, LLM pipeline, tool system, **API packages**, **verified-node federation** (multi-master config replication), **secrets vault**, egress control, multi-tenant architecture, channel system, Lua scripting, memory system, social adapters, authentication, scheduled tasks, external nodes, agent export/import, and diffusion are all operational.
+**v0.4.6** — Active development. Core kernel, admin server, LLM pipeline, tool system, **API packages**, **verified-node federation** (multi-master config replication), **secrets vault**, egress control, multi-tenant architecture, channel system, Lua scripting, memory system, social adapters, **attribution** (author metadata across channels and sessions), authentication, scheduled tasks, external nodes, agent export/import, and diffusion are all operational.
 
 | Area | Status |
 |------|--------|
@@ -317,7 +318,15 @@ See the `scripts/start-daemon.sh` helper for daemon lifecycle management with PI
 
 ### Docker Deployment
 
-The production Docker image supports database configuration via environment variables. When `DB_HOST` is set, the entrypoint generates a `db.json` pointing at PostgreSQL. Without it, SQLite is used.
+The production Docker images are published on Docker Hub:
+
+| Image | Purpose |
+|-------|---------|
+| [`mrsommer/animus`](https://hub.docker.com/r/mrsommer/animus) | Standard daemon — kernel, admin server, embedded admin UI |
+| [`mrsommer/animus-sudo`](https://hub.docker.com/r/mrsommer/animus-sudo) | Same as the standard image, but the `animus` user has passwordless sudo — for API packages and tools that need privileged host operations |
+| [`mrsommer/animus-node`](https://hub.docker.com/r/mrsommer/animus-node) | External node runner — connects to a central Animus server and executes tool calls on the host (see [External Node Deployment](#external-node-deployment) below) |
+
+The daemon image supports database configuration via environment variables. When `DB_HOST` is set, the entrypoint generates a `db.json` pointing at PostgreSQL. Without it, SQLite is used.
 
 ```yaml
 # docker-compose.yml
